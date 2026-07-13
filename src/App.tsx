@@ -1274,42 +1274,60 @@ export default function App() {
 
                 {rangeMode === 'percent' ? (
                   <>
-                    <div className="chip-row" style={{ marginBottom: 10 }}>
-                      <button
-                        type="button"
-                        className="chip"
-                        onClick={() => {
-                          const eth0 = isEthLikeCurrency(pool.token0.address)
-                          // 只要 ETH：ETH 为 token0 → 币价低于市价；ETH 为 token1 → 币价高于市价
-                          if (eth0) { setPercentLower(-10); setPercentUp(-1) }
-                          else { setPercentLower(1); setPercentUp(10) }
-                          setRangeMode('percent')
-                        }}
-                      >
-                        单边 ETH
-                      </button>
-                      <button
-                        type="button"
-                        className="chip"
-                        onClick={() => {
-                          const eth0 = isEthLikeCurrency(pool.token0.address)
-                          if (eth0) { setPercentLower(1); setPercentUp(10) }
-                          else { setPercentLower(-10); setPercentUp(-1) }
-                          setRangeMode('percent')
-                        }}
-                      >
-                        单边币
-                      </button>
-                      <button
-                        type="button"
-                        className="chip"
-                        onClick={() => {
-                          setPercentLower(-5)
-                          setPercentUp(5)
-                        }}
-                      >
-                        双边 ±5%
-                      </button>
+                    <div className="mint-presets">
+                      <div className="chip-row">
+                        <button
+                          type="button"
+                          className={`chip ${percentLower === -75 && percentUp === -1 ? 'on' : ''}`}
+                          onClick={() => {
+                            const eth0 = isEthLikeCurrency(pool.token0.address)
+                            // 单边 ETH：默认币价 -75% ~ -1%
+                            if (eth0) { setPercentLower(-75); setPercentUp(-1) }
+                            else { setPercentLower(1); setPercentUp(75) }
+                            setRangeMode('percent')
+                          }}
+                        >
+                          单边 ETH
+                        </button>
+                      </div>
+                      <div className="mint-preset-row">
+                        <span className="mint-preset-label">双边</span>
+                        <div className="chip-row">
+                          {[5, 10, 20, 30, 40, 50].map((n) => (
+                            <button
+                              key={`bi-${n}`}
+                              type="button"
+                              className={`chip ${percentLower === -n && percentUp === n ? 'on' : ''}`}
+                              onClick={() => {
+                                setPercentLower(-n)
+                                setPercentUp(n)
+                                setRangeMode('percent')
+                              }}
+                            >
+                              ±{n}%
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="mint-preset-row">
+                        <span className="mint-preset-label">单边</span>
+                        <div className="chip-row">
+                          {[100, 200, 300, 500].map((up) => (
+                            <button
+                              key={`side-${up}`}
+                              type="button"
+                              className={`chip ${percentLower === -50 && percentUp === up ? 'on' : ''}`}
+                              onClick={() => {
+                                setPercentLower(-50)
+                                setPercentUp(up)
+                                setRangeMode('percent')
+                              }}
+                            >
+                              -50%/+{up}%
+                            </button>
+                          ))}
+                        </div>
+                      </div>
                     </div>
                     <div className="mint-pct-grid">
                       <label className="mint-pct-field">
