@@ -15,13 +15,29 @@ export function tickToPrice(tick: number, decimals0: number, decimals1: number):
   return Math.pow(1.0001, tick) * Math.pow(10, decimals0 - decimals1)
 }
 
-/** Human price of token1 per token0 */
+/** 去掉小数尾部多余 0，保留真实有效数字 */
+function trimPriceZeros(s: string): string {
+  if (!s.includes('.')) return s
+  const trimmed = s.replace(/0+$/, '').replace(/\.$/, '')
+  return trimmed.length ? trimmed : '0'
+}
+
+/** Human price — 一律用小数展示，不用科学计数法 */
 export function formatPrice(price: number, _digits = 6): string {
   if (!Number.isFinite(price) || price <= 0) return '—'
-  if (price >= 1000) return price.toLocaleString('en-US', { maximumFractionDigits: 2 })
-  if (price >= 1) return price.toLocaleString('en-US', { maximumFractionDigits: 4 })
-  if (price >= 0.0001) return price.toPrecision(4)
-  return price.toExponential(3)
+  if (price >= 1_000_000) {
+    return price.toLocaleString('en-US', { maximumFractionDigits: 0 })
+  }
+  if (price >= 1000) {
+    return price.toLocaleString('en-US', { maximumFractionDigits: 2 })
+  }
+  if (price >= 1) {
+    return trimPriceZeros(price.toFixed(6))
+  }
+  // < 1：保证约 4 位有效数字的固定小数，例如 0.00008495
+  const exp = Math.floor(Math.log10(price))
+  const decimals = Math.min(18, Math.max(4, -exp + 3))
+  return trimPriceZeros(price.toFixed(decimals))
 }
 
 export function priceToClosestTick(price: number, decimals0: number, decimals1: number): number {
@@ -43,6 +59,15 @@ export function nearestUsableTick(tick: number, tickSpacing: number): number {
   if (rounded < -887272) return Math.ceil(-887272 / tickSpacing) * tickSpacing
   if (rounded > 887272) return Math.floor(887272 / tickSpacing) * tickSpacing
   return rounded
+}
+
+/** Uniswap V3/V4 全区间（按 tickSpacing 对齐的最小/最大可用 tick） */
+export function fullRangeTicks(tickSpacing: number): { tickLower: number; tickUpper: number } {
+  const spacing = Math.max(1, Math.floor(Number(tickSpacing) || 1))
+  const tickLower = nearestUsableTick(-887272, spacing)
+  const tickUpper = nearestUsableTick(887272, spacing)
+  if (tickLower >= tickUpper) throw new Error('tickSpacing 无效，无法构成全区间')
+  return { tickLower, tickUpper }
 }
 
 /**
@@ -210,6 +235,12 @@ export function decodeV4PositionInfo(info: bigint): { tickLower: number; tickUpp
   return { tickLower: toSigned(tickLower), tickUpper: toSigned(tickUpper) }
 }
 
+/** NFT info 高 25 字节与 poolId 前缀一致，用于校验池子是否配对 */
+export function poolIdPrefixFromV4Info(info: bigint): `0x${string}` {
+  const hex = info.toString(16).padStart(64, '0').slice(0, 50)
+  return `0x${hex}` as `0x${string}`
+}
+
 export function formatAmount(raw: bigint, decimals: number, digits = 6): string {
   if (raw === 0n) return '0'
   const neg = raw < 0n
@@ -237,10 +268,13 @@ export function formatAmountExact(raw: bigint, decimals: number): string {
 
 export function rawToNumber(raw: bigint, decimals: number): number {
   if (raw === 0n) return 0
+  if (raw < 0n) return -rawToNumber(-raw, decimals)
   const base = 10n ** BigInt(decimals)
-  const whole = Number(raw / base)
+  const whole = raw / base
+  // 超过 Number 安全整数的数量按异常值处理，避免天价 USD
+  if (whole > 10n ** 15n) return Number.NaN
   const frac = Number(raw % base) / Number(base)
-  return whole + frac
+  return Number(whole) + frac
 }
 
 export function parseAmount(input: string, decimals: number): bigint {
@@ -252,7 +286,9 @@ export function parseAmount(input: string, decimals: number): bigint {
 }
 
 export function formatUsd(n: number): string {
-  if (!Number.isFinite(n)) return '—'
+  if (!Number.isFinite(n) || n < 0) return '—'
+  // 明显异常的天文数字（fee growth 算炸）不展示
+  if (n > 1e11) return '—'
   return `US$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 

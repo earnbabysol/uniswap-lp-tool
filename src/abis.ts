@@ -253,6 +253,30 @@ export const v4StateViewAbi = [
     inputs: [{ name: 'poolId', type: 'bytes32' }],
     outputs: [{ type: 'uint128' }],
   },
+  {
+    type: 'function', name: 'getPositionInfo', stateMutability: 'view',
+    inputs: [
+      { name: 'poolId', type: 'bytes32' },
+      { name: 'positionId', type: 'bytes32' },
+    ],
+    outputs: [
+      { name: 'liquidity', type: 'uint128' },
+      { name: 'feeGrowthInside0LastX128', type: 'uint256' },
+      { name: 'feeGrowthInside1LastX128', type: 'uint256' },
+    ],
+  },
+  {
+    type: 'function', name: 'getFeeGrowthInside', stateMutability: 'view',
+    inputs: [
+      { name: 'poolId', type: 'bytes32' },
+      { name: 'tickLower', type: 'int24' },
+      { name: 'tickUpper', type: 'int24' },
+    ],
+    outputs: [
+      { name: 'feeGrowthInside0X128', type: 'uint256' },
+      { name: 'feeGrowthInside1X128', type: 'uint256' },
+    ],
+  },
 ] as const
 
 export const permit2Abi = [
@@ -268,10 +292,26 @@ export const permit2Abi = [
     ],
     outputs: [],
   },
+  {
+    type: 'function',
+    name: 'allowance',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'user', type: 'address' },
+      { name: 'token', type: 'address' },
+      { name: 'spender', type: 'address' },
+    ],
+    outputs: [
+      { name: 'amount', type: 'uint160' },
+      { name: 'expiration', type: 'uint48' },
+      { name: 'nonce', type: 'uint48' },
+    ],
+  },
 ] as const
 
 export const v4PositionManagerAbi = [
   { type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ name: 'owner', type: 'address' }], outputs: [{ type: 'uint256' }] },
+  { type: 'function', name: 'ownerOf', stateMutability: 'view', inputs: [{ name: 'id', type: 'uint256' }], outputs: [{ type: 'address' }] },
   { type: 'function', name: 'tokenOfOwnerByIndex', stateMutability: 'view', inputs: [{ name: 'owner', type: 'address' }, { name: 'index', type: 'uint256' }], outputs: [{ type: 'uint256' }] },
   { type: 'function', name: 'nextTokenId', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
   {
@@ -295,6 +335,28 @@ export const v4PositionManagerAbi = [
     type: 'function', name: 'getPositionLiquidity', stateMutability: 'view',
     inputs: [{ name: 'tokenId', type: 'uint256' }],
     outputs: [{ type: 'uint128' }],
+  },
+  {
+    type: 'function', name: 'initializePool', stateMutability: 'payable',
+    inputs: [
+      {
+        name: 'key', type: 'tuple',
+        components: [
+          { name: 'currency0', type: 'address' },
+          { name: 'currency1', type: 'address' },
+          { name: 'fee', type: 'uint24' },
+          { name: 'tickSpacing', type: 'int24' },
+          { name: 'hooks', type: 'address' },
+        ],
+      },
+      { name: 'sqrtPriceX96', type: 'uint160' },
+    ],
+    outputs: [{ type: 'int24' }],
+  },
+  {
+    type: 'function', name: 'multicall', stateMutability: 'payable',
+    inputs: [{ name: 'data', type: 'bytes[]' }],
+    outputs: [{ type: 'bytes[]' }],
   },
   {
     type: 'function', name: 'modifyLiquidities', stateMutability: 'payable',

@@ -91,6 +91,7 @@ h1 {
 }
 .wallet-link:hover { color: var(--accent); }
 .wallet-bals { display: block; margin-top: 4px; font-size: 12px; color: var(--muted); }
+.wallet-refresh-note { margin: 6px 0 0; font-size: 11px; line-height: 1.35; max-width: 280px; text-align: right; }
 .btn-row.tight { margin-top: 0; gap: 6px; }
 .btn.ghost {
   padding: 6px 10px;
@@ -820,4 +821,11 @@ footer code { font-family: var(--mono); font-size: 11px; word-break: break-all; 
   .mint-pct-grid { grid-template-columns: 1fr; }
   .summary-strip { grid-template-columns: 1fr 1fr; }
   .wallet-box { text-align: left; }
+}
+
+.mint-full-hint {
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 1.45;
+  opacity: 0.85;
 }

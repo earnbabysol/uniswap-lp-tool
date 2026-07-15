@@ -43,3 +43,10 @@ export const KNOWN_TOKENS: Record<string, { symbol: string; decimals: number }> 
 }
 
 export const FEE_TIERS = [100, 500, 3000, 10000] as const
+
+/** V4 常用费率（百分之一 bp，100 = 0.01%）；也可在 UI 自填 */
+export const V4_FEE_PRESETS = [100, 500, 2500, 3000, 5000, 7500, 10000, 20000] as const
+
+/** Uniswap V3 Pool CREATE2 init code hash（本链已验证） */
+export const V3_POOL_INIT_CODE_HASH =
+  '0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54' as const

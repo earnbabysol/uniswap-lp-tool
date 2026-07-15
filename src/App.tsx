@@ -1,11 +1,13 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Address, WalletClient } from 'viem'
 import { isAddress } from 'viem'
-import { CONTRACTS, FEE_TIERS, KNOWN_TOKENS } from './chain'
+import { CONTRACTS, FEE_TIERS, V4_FEE_PRESETS, KNOWN_TOKENS } from './chain'
 import {
   claimV3,
   claimV4,
-  createV3Pool,
+  createV3PoolAndSeed,
+  createV4PoolAndSeed,
+  describeFullRange,
   describeRange,
   findV3Pool,
   findV4Pool,
@@ -16,9 +18,14 @@ import {
   increaseV4Liquidity,
   isEthLikeCurrency,
   isNativeCurrency,
+  loadPoolFromInput,
   loadV3Pool,
+  loadV4Pool,
+  burnVacantV3Nfts,
+  listVacantV3TokenIds,
   loadV3Positions,
   loadV4Positions,
+  enrichPositionsLifetimeFees,
   mintV3Position,
   mintV4Position,
   pairHasWeth,
@@ -29,12 +36,16 @@ import {
   scanV4Pools,
   ticksFromCoinPrices,
   getCoinQuote,
+  getPositionCoinPrices,
+  oneSidedEthPercents,
+  suggestV4TickSpacing,
   unwrapWeth,
   wrapEth,
   type PoolInfo,
   type PositionRow,
 } from './lp'
-import { parseAmount, formatPrice, formatUsd, pairAmountForRange, formatAmountExact } from './math'
+import { parseAmount, formatPrice, formatUsd, pairAmountForRange, formatAmountExact, priceToClosestTick, priceToSqrtPriceX96, tickToPrice } from './math'
+import { withTimeout } from './async'
 import {
   connectWallet,
   explorerAddress,
@@ -47,12 +58,13 @@ import './App.css'
 
 type SortKey = 'value' | 'fees' | 'pnl' | 'pair'
 type FilterKey = 'all' | 'in' | 'out' | 'v3' | 'v4'
-type RangeMode = 'percent' | 'custom'
+type RangeMode = 'percent' | 'custom' | 'full'
 
 function formatPnl(n: number): string {
-  if (!Number.isFinite(n)) return '-'
-  const sign = n > 0 ? '+' : ''
-  return `${sign}${formatUsd(n)}`
+  if (!Number.isFinite(n) || Math.abs(n) > 1e11) return '—'
+  const sign = n > 0 ? '+' : n < 0 ? '−' : ''
+  const abs = Math.abs(n)
+  return `${sign}US$${abs.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
 function extractHash(r: unknown): string | null {
@@ -143,7 +155,10 @@ export default function App() {
   const [wallet, setWallet] = useState<WalletClient | null>(null)
   const [status, setStatus] = useState('')
   const [statusHash, setStatusHash] = useState<string | null>(null)
+  const [refreshStatus, setRefreshStatus] = useState('')
   const [busy, setBusy] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
+  const [lastRefreshAt, setLastRefreshAt] = useState<number | null>(null)
   const [ethBal, setEthBal] = useState<bigint>(0n)
   const [wethBal, setWethBal] = useState<bigint>(0n)
 
@@ -163,8 +178,8 @@ export default function App() {
   const [autoRefresh, setAutoRefresh] = useState(false)
   const [txHistory, setTxHistory] = useState<TxRecord[]>(() => loadTxHistory())
 
-  const [tokenA, setTokenA] = useState<Address>(CONTRACTS.weth)
-  const [tokenB, setTokenB] = useState<Address>(CONTRACTS.usdg)
+  const [tokenA, setTokenA] = useState<Address>(CONTRACTS.usdg)
+  const [tokenB, setTokenB] = useState<Address>(CONTRACTS.weth)
   const [customToken, setCustomToken] = useState('')
   const [fee, setFee] = useState(500)
   const [pool, setPool] = useState<PoolInfo | null>(null)
@@ -181,8 +196,23 @@ export default function App() {
   const [mintProtocol, setMintProtocol] = useState<'v3' | 'v4'>('v3')
   const [initPrice, setInitPrice] = useState('')
   const [showCreatePool, setShowCreatePool] = useState(false)
+  const [v4TickSpacing, setV4TickSpacing] = useState(200)
+  const [customFeeInput, setCustomFeeInput] = useState('')
+  const [seedOnCreate, setSeedOnCreate] = useState(true)
+  const [seedAmtA, setSeedAmtA] = useState('')
+  const [seedAmtB, setSeedAmtB] = useState('')
+  const [createSeedBalA, setCreateSeedBalA] = useState<bigint>(0n)
+  const [createSeedBalB, setCreateSeedBalB] = useState<bigint>(0n)
+  /** 创建时初仓区间预设 */
+  const [createRangePreset, setCreateRangePreset] = useState<'onesided-eth' | 'full' | number>('onesided-eth')
 
   const [wrapAmt, setWrapAmt] = useState('')
+  const [vacantV3Ids, setVacantV3Ids] = useState<bigint[] | null>(null)
+
+  const tabRef = useRef(tab)
+  useEffect(() => {
+    tabRef.current = tab
+  }, [tab])
 
   const selected = useMemo(
     () => positions.find((p) => `${p.version}-${p.tokenId}` === selectedId) ?? null,
@@ -253,30 +283,124 @@ export default function App() {
     setStatusHash(null)
   }
 
-  const refreshPositions = useCallback(async () => {
+  const refreshingRef = useRef(false)
+  const refreshPositions = useCallback(async (opts?: { silent?: boolean; deep?: boolean }) => {
     if (!address) return
-    setBusy(true)
-    setStatus('刷新仓位中…')
-    setStatusHash(null)
+    const silent = opts?.silent ?? tabRef.current !== 'positions'
+    const deep = Boolean(opts?.deep)
+    if (refreshingRef.current) {
+      if (!silent) setRefreshStatus('仍在刷新中，请稍候…')
+      return
+    }
+    refreshingRef.current = true
+    setRefreshing(true)
+    if (!silent) {
+      setRefreshStatus(deep ? '深度扫描仓位…' : '刷新 V3 仓位…')
+    }
+    const started = Date.now()
+    const partial: string[] = []
+    let v3: PositionRow[] | null = null
+    let v4: PositionRow[] | null = null
     try {
-      const [v3, v4] = await Promise.all([loadV3Positions(address), loadV4Positions(address)])
-      const all = [...v3, ...v4]
-      setPositions(all)
-      setStatus(`共 ${all.length} 个仓位（V3 ${v3.length} / V4 ${v4.length}）`)
-      setSelectedId((prev) => {
-        if (prev && all.some((p) => `${p.version}-${p.tokenId}` === prev)) return prev
-        return all.length ? `${all[0].version}-${all[0].tokenId}` : null
+      try {
+        v3 = await withTimeout(loadV3Positions(address), deep ? 90_000 : 45_000, 'V3 仓位')
+      } catch (e) {
+        partial.push(e instanceof Error ? e.message : String(e))
+        console.warn('loadV3Positions failed', e)
+      }
+      if (v3) {
+        setPositions((prev) => {
+          const keepV4 = prev.filter((p) => p.version === 'v4')
+          return [...v3!, ...keepV4]
+        })
+      }
+      if (!silent) setRefreshStatus(deep ? '深度扫描 V4…' : '刷新 V4 仓位…')
+
+      try {
+        v4 = await withTimeout(
+          loadV4Positions(address, {
+            deep,
+            skipPnl: true,
+            onStatus: silent ? undefined : setRefreshStatus,
+          }),
+          deep ? 120_000 : 55_000,
+          'V4 仓位',
+        )
+      } catch (e) {
+        partial.push(e instanceof Error ? e.message : String(e))
+        console.warn('loadV4Positions failed', e)
+      }
+
+      setPositions((prev) => {
+        const nextV3 = v3 ?? prev.filter((p) => p.version === 'v3')
+        const nextV4 = v4 ?? prev.filter((p) => p.version === 'v4')
+        return [...nextV3, ...nextV4]
       })
-      await refreshBalances(address)
+      const at = Date.now()
+      setLastRefreshAt(at)
+      const stamp = new Date(at).toLocaleTimeString()
+      const n3 = v3?.length
+      const n4 = v4?.length
+      const keepNote = partial.length ? ' · 失败侧保留旧列表' : ''
+      const msg = partial.length
+        ? `${stamp} · V3 ${n3 ?? '旧'} / V4 ${n4 ?? '旧'}${keepNote} · ${partial.join('；')}`
+        : `${stamp} · 共 ${(n3 ?? 0) + (n4 ?? 0)} 个仓位（V3 ${n3} / V4 ${n4}）${deep ? ' · 深度扫描' : ''} · ${((at - started) / 1000).toFixed(1)}s`
+      if (!silent || tabRef.current === 'positions') setRefreshStatus(msg)
+      setSelectedId((prev) => {
+        const mergedHint = [...(v3 ?? []), ...(v4 ?? [])]
+        if (prev && (mergedHint.some((p) => `${p.version}-${p.tokenId}` === prev) || partial.length > 0)) {
+          return prev
+        }
+        return mergedHint.length ? `${mergedHint[0].version}-${mergedHint[0].tokenId}` : prev
+      })
+      void refreshBalances(address)
+
+      // 后台补齐历史已领手续费（含复投），不挡列表；逐条写回 UI
+      const feeBase = [
+        ...(v3 ?? []),
+        ...(v4 ?? []),
+      ]
+      if (feeBase.length && address) {
+        if (!silent) setRefreshStatus((s) => `${s} · 补扫历史手续费…`)
+        void enrichPositionsLifetimeFees(feeBase, address, {
+          onRow: (row) => {
+            setPositions((prev) => {
+              const i = prev.findIndex(
+                (p) => p.version === row.version && p.tokenId === row.tokenId,
+              )
+              if (i < 0) return prev
+              const copy = [...prev]
+              copy[i] = row
+              return copy
+            })
+          },
+        }).then((rows) => {
+          setPositions((prev) => {
+            const map = new Map(rows.map((r) => [`${r.version}-${r.tokenId}`, r]))
+            return prev.map((p) => map.get(`${p.version}-${p.tokenId}`) ?? p)
+          })
+          if (!silent || tabRef.current === 'positions') {
+            const claimed = rows.reduce((s, p) => s + p.claimedFeesUsd, 0)
+            const total = rows.reduce((s, p) => s + p.totalFeesUsd, 0)
+            setRefreshStatus(
+              (s) =>
+                `${s.split(' · 补扫')[0]} · 手续费已领 ${formatUsd(claimed)} / 合计 ${formatUsd(total)}`,
+            )
+          }
+        }).catch((e) => console.warn('lifetime fees enrich failed', e))
+      }
     } catch (e) {
-      setStatus(e instanceof Error ? e.message : String(e))
+      if (!silent || tabRef.current === 'positions') {
+        setRefreshStatus(e instanceof Error ? e.message : String(e))
+      }
     } finally {
-      setBusy(false)
+      refreshingRef.current = false
+      setRefreshing(false)
     }
   }, [address, refreshBalances])
 
   useEffect(() => {
-    if (address) void refreshPositions()
+    if (address) void refreshPositions({ silent: true })
   }, [address]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -310,7 +434,7 @@ export default function App() {
 
   useEffect(() => {
     if (!autoRefresh || !address) return
-    const t = setInterval(() => void refreshPositions(), 60_000)
+    const t = setInterval(() => void refreshPositions({ silent: true }), 60_000)
     return () => clearInterval(t)
   }, [autoRefresh, address, refreshPositions])
 
@@ -346,12 +470,14 @@ export default function App() {
         const info = await findV4Pool(tokenA, tokenB, fee)
         if (!info) {
           setPool(null)
-          setShowCreatePool(false)
-          setStatus('该 fee 无 V4 池（已试 WETH/原生 ETH + 常见 tickSpacing）')
+          setShowCreatePool(true)
+          setV4TickSpacing(suggestV4TickSpacing(fee))
+          setStatus('该 Fee 尚无 V4 池 — 可在下方创建并注入初仓')
           return
         }
         setPool(info)
         setShowCreatePool(false)
+        setV4TickSpacing(info.tickSpacing)
         applyDefaultCoinRange(info, setPriceLo, setPriceHi)
         setStatus(`已加载 V4 · fee ${(info.fee / 10000).toFixed(2)}% · spacing ${info.tickSpacing} · 币价 ${formatPrice(getCoinQuote(info).spot)}`)
         return
@@ -407,64 +533,25 @@ export default function App() {
     }
   }
 
-  const createPool = async () => {
-    if (mintProtocol !== 'v3') return
-    if (!address || !wallet) {
-      setStatus('请先连接钱包')
-      return
-    }
-    const price = Number(initPrice.replace(/,/g, ''))
-    if (!(price > 0)) {
-      setStatus('请填写有效的初始价格（Token B per Token A）')
-      return
-    }
-    setBusy(true)
-    setStatusHash(null)
-    setStatus('创建 / 初始化 V3 池…')
-    try {
-      const { pool: info, hash, created } = await createV3Pool({
-        walletClient: wallet,
-        owner: address,
-        tokenA,
-        tokenB,
-        fee,
-        initialPriceBPerA: price,
-      })
-      setPool(info)
-      setShowCreatePool(false)
-      applyDefaultCoinRange(info, setPriceLo, setPriceHi)
-      if (hash) {
-        setStatusHash(hash)
-        setTxHistory(pushTxHistory({
-          label: created ? '创建 V3 池' : '初始化 V3 池',
-          hash,
-          pair: `${info.token0.symbol}/${info.token1.symbol}`,
-        }))
-      }
-      const q = getCoinQuote(info)
-      setStatus(
-        created
-          ? `V3 池已创建 · ${shortAddr(info.poolAddress!)} · 币价 ${formatPrice(q.spot)}`
-          : `池已存在，已加载 · ${shortAddr(info.poolAddress!)} · 币价 ${formatPrice(q.spot)}`,
-      )
-    } catch (e) {
-      setStatus(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
   const loadPoolByAddress = async () => {
     if (!poolInput.trim()) return
     setBusy(true)
+    setStatus('解析并加载池子…')
     try {
-      const info = await loadV3Pool(poolInput.trim() as Address)
+      const info = await loadPoolFromInput(poolInput)
       setPool(info)
-      setTokenA(info.token0.address)
-      setTokenB(info.token1.address)
+      {
+        const q = getCoinQuote(info)
+        setTokenA(q.coin.address)
+        setTokenB(q.quote.address)
+      }
       setFee(info.fee)
       applyDefaultCoinRange(info, setPriceLo, setPriceHi)
-      setStatus(`已加载 V3 池，现价 ${formatPrice(info.price)}`)
+      const q = getCoinQuote(info)
+      const tag = info.version === 'v4'
+        ? `V4 · poolId ${info.poolId ? shortAddr(info.poolId) : ''}`
+        : `V3 · ${info.poolAddress ? shortAddr(info.poolAddress) : ''}`
+      setStatus(`已加载 ${tag} · ${q.coin.symbol}/${q.quote.symbol} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`)
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e))
     } finally {
@@ -476,10 +563,18 @@ export default function App() {
     if (pool?.version === 'v4') {
       setBusy(true)
       try {
-        const info = await findV4Pool(pool.token0.address, pool.token1.address, pool.fee)
+        const info = pool.hooks != null && pool.tickSpacing
+          ? await loadV4Pool({
+              currency0: pool.token0.address,
+              currency1: pool.token1.address,
+              fee: pool.fee,
+              tickSpacing: pool.tickSpacing,
+              hooks: pool.hooks,
+            })
+          : await findV4Pool(pool.token0.address, pool.token1.address, pool.fee)
         if (!info) throw new Error('刷新 V4 池失败')
         setPool(info)
-        setStatus(`V4 价格已刷新 · 现价 ${formatPrice(info.price)}`)
+        setStatus(`V4 价格已刷新 · 币价 ${formatPrice(getCoinQuote(info).spot)}`)
       } catch (e) {
         setStatus(e instanceof Error ? e.message : String(e))
       } finally {
@@ -497,7 +592,9 @@ export default function App() {
 
       let ticks: { tickLower: number; tickUpper: number } | null = null
       try {
-        if (rangeMode === 'percent') {
+        if (rangeMode === 'full') {
+          ticks = describeFullRange(info)
+        } else if (rangeMode === 'percent') {
           ticks = describeRange(info, percentLower, percentUp)
         } else {
           const lo = Number(priceLo)
@@ -532,7 +629,8 @@ export default function App() {
         }
       }
 
-      setStatus(`价格已刷新 · 现价 ${formatPrice(info.price)} ${info.token1.symbol}/${info.token0.symbol} · tick ${info.tick}`)
+      const q = getCoinQuote(info)
+      setStatus(`价格已刷新 · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol} · tick ${info.tick}`)
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e))
     } finally {
@@ -548,8 +646,10 @@ export default function App() {
     }
     try {
       const meta = await resolveTokenMeta(raw as Address)
-      setTokenB(meta.address)
-      setStatus(`已设置 Token B = ${meta.symbol} (${shortAddr(meta.address)})`)
+      setTokenA(meta.address)
+      // 报价侧默认保持 / 纠正为 ETH，避免误做成 USDG 对
+      if (!isEthLikeCurrency(tokenB)) setTokenB(CONTRACTS.weth)
+      setStatus(`已设币 = ${meta.symbol}，报价 = ETH`)
       setCustomToken('')
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e))
@@ -571,7 +671,7 @@ export default function App() {
       } else {
         setStatus(`${label} 已完成`)
       }
-      await refreshPositions()
+      await refreshPositions({ silent: true })
       if (address) await refreshBalances(address)
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e))
@@ -583,6 +683,7 @@ export default function App() {
   const rangePreview = useMemo(() => {
     if (!pool) return null
     try {
+      if (rangeMode === 'full') return describeFullRange(pool)
       if (rangeMode === 'percent') return describeRange(pool, percentLower, percentUp)
       const lo = Number(priceLo.replace(/,/g, ''))
       const hi = Number(priceHi.replace(/,/g, ''))
@@ -603,6 +704,7 @@ export default function App() {
 
   const tokenOptions = useMemo(() => {
     const weth = CONTRACTS.weth.toLowerCase()
+    const zero = '0x0000000000000000000000000000000000000000'
     const base = Object.entries(KNOWN_TOKENS).map(([addr, t]) => ({
       addr: addr as Address,
       ...t,
@@ -610,14 +712,381 @@ export default function App() {
       symbol: addr.toLowerCase() === weth ? 'ETH' : t.symbol,
     }))
     const extra: { addr: Address; symbol: string; decimals: number }[] = []
-    if (tokenA && !KNOWN_TOKENS[tokenA.toLowerCase()]) {
-      extra.push({ addr: tokenA, symbol: shortAddr(tokenA), decimals: 18 })
+    const pushExtra = (addr: Address) => {
+      if (!addr || KNOWN_TOKENS[addr.toLowerCase()]) return
+      if (extra.some((e) => e.addr.toLowerCase() === addr.toLowerCase())) return
+      if (addr.toLowerCase() === zero || addr.toLowerCase() === weth) {
+        extra.push({ addr, symbol: 'ETH', decimals: 18 })
+        return
+      }
+      extra.push({ addr, symbol: shortAddr(addr), decimals: 18 })
     }
-    if (tokenB && !KNOWN_TOKENS[tokenB.toLowerCase()]) {
-      extra.push({ addr: tokenB, symbol: shortAddr(tokenB), decimals: 18 })
-    }
+    pushExtra(tokenA)
+    pushExtra(tokenB)
     return [...base, ...extra]
   }, [tokenA, tokenB])
+
+  const tokenLabel = (addr: Address) => {
+    if (isNativeCurrency(addr) || addr.toLowerCase() === CONTRACTS.weth.toLowerCase()) return 'ETH'
+    return tokenOptions.find((x) => x.addr.toLowerCase() === addr.toLowerCase())?.symbol ?? shortAddr(addr)
+  }
+
+  /** V3 链上永远是 WETH；V4 可选原生 ETH */
+  const chainCurrency = (addr: Address) => {
+    if (!isEthLikeCurrency(addr)) return addr
+    if (mintProtocol === 'v3') return CONTRACTS.weth
+    return useNativeEth ? '0x0000000000000000000000000000000000000000' as Address : CONTRACTS.weth
+  }
+
+  /** 根据初始价 + 区间预设，预览创建池（用于初仓数量自动配平） */
+  const createSynth = useMemo(() => {
+    const price = Number(initPrice.replace(/,/g, ''))
+    if (!(price > 0) || !Number.isFinite(price)) return null
+
+    const ethA = isEthLikeCurrency(tokenA)
+    const ethB = isEthLikeCurrency(tokenB)
+    let initialPriceBPerA = price
+    if (ethA && !ethB) initialPriceBPerA = 1 / price
+    else if (ethB && !ethA) initialPriceBPerA = price
+    if (!(initialPriceBPerA > 0) || !Number.isFinite(initialPriceBPerA)) return null
+
+    let useFee = fee
+    if (mintProtocol === 'v4' && customFeeInput.trim()) {
+      const pct = Number(customFeeInput.replace(/%/g, '').trim())
+      if (pct > 0 && Number.isFinite(pct)) useFee = Math.round(pct * 10000)
+    }
+
+    const rawA = chainCurrency(tokenA)
+    const rawB = chainCurrency(tokenB)
+    const sortedAFirst = rawA.toLowerCase() < rawB.toLowerCase()
+    const t0 = sortedAFirst ? rawA : rawB
+    const t1 = sortedAFirst ? rawB : rawA
+    const decA = tokenOptions.find((x) => x.addr === tokenA)?.decimals ?? 18
+    const decB = tokenOptions.find((x) => x.addr === tokenB)?.decimals ?? 18
+    const d0 = sortedAFirst ? decA : decB
+    const d1 = sortedAFirst ? decB : decA
+    const sym0 = sortedAFirst ? tokenLabel(tokenA) : tokenLabel(tokenB)
+    const sym1 = sortedAFirst ? tokenLabel(tokenB) : tokenLabel(tokenA)
+
+    let sortedPrice = initialPriceBPerA
+    if (t0.toLowerCase() !== rawA.toLowerCase()) sortedPrice = 1 / initialPriceBPerA
+
+    const spacing =
+      mintProtocol === 'v4'
+        ? v4TickSpacing
+        : useFee === 100 ? 1 : useFee === 500 ? 10 : useFee === 3000 ? 60 : 200
+
+    const sqrt = priceToSqrtPriceX96(sortedPrice, d0, d1)
+    const tick = priceToClosestTick(sortedPrice, d0, d1)
+    const synth: PoolInfo = {
+      version: mintProtocol,
+      token0: { address: t0, symbol: sym0, decimals: d0 },
+      token1: { address: t1, symbol: sym1, decimals: d1 },
+      fee: useFee,
+      tickSpacing: spacing,
+      tick,
+      sqrtPriceX96: sqrt,
+      price: tickToPrice(tick, d0, d1),
+      liquidity: 0n,
+    }
+
+    const pct =
+      createRangePreset === 'onesided-eth' && (ethA || ethB)
+        ? oneSidedEthPercents()
+        : typeof createRangePreset === 'number'
+          ? { percentLower: -createRangePreset, percentUpper: createRangePreset }
+          : { percentLower, percentUpper: percentUp }
+    const range =
+      createRangePreset === 'full'
+        ? describeFullRange(synth)
+        : describeRange(synth, pct.percentLower, pct.percentUpper)
+
+    return { synth, range, sortedAFirst, rawA, rawB, initialPriceBPerA, useFee, decA, decB }
+  }, [
+    initPrice,
+    tokenA,
+    tokenB,
+    fee,
+    mintProtocol,
+    v4TickSpacing,
+    customFeeInput,
+    useNativeEth,
+    createRangePreset,
+    percentLower,
+    percentUp,
+    tokenOptions,
+  ])
+
+  const onCreateSeedSide = (side: 'A' | 'B', raw: string) => {
+    if (side === 'A') setSeedAmtA(raw)
+    else setSeedAmtB(raw)
+    if (!createSynth || !seedOnCreate) return
+
+    const { synth, range, sortedAFirst, decA, decB } = createSynth
+    const ethA = isEthLikeCurrency(tokenA)
+    const ethB = isEthLikeCurrency(tokenB)
+    if (createRangePreset === 'onesided-eth' && ethA && side === 'B') return
+    if (createRangePreset === 'onesided-eth' && ethB && side === 'A') return
+
+    const dec = side === 'A' ? decA : decB
+    const amount = parseAmount(raw || '0', dec)
+    if (amount <= 0n) {
+      if (side === 'A') setSeedAmtB('')
+      else setSeedAmtA('')
+      return
+    }
+
+    const poolSide: 0 | 1 = (side === 'A') === sortedAFirst ? 0 : 1
+    const paired = pairAmountForRange({
+      sqrtPriceX96: synth.sqrtPriceX96,
+      tickLower: range.tickLower,
+      tickUpper: range.tickUpper,
+      amount,
+      side: poolSide,
+    })
+
+    if (paired.singleSided === 'token0') {
+      if (sortedAFirst) {
+        setSeedAmtA(formatAmountExact(paired.amount0, decA))
+        setSeedAmtB('0')
+      } else {
+        setSeedAmtB(formatAmountExact(paired.amount0, decB))
+        setSeedAmtA('0')
+      }
+      return
+    }
+    if (paired.singleSided === 'token1') {
+      if (sortedAFirst) {
+        setSeedAmtB(formatAmountExact(paired.amount1, decB))
+        setSeedAmtA('0')
+      } else {
+        setSeedAmtA(formatAmountExact(paired.amount1, decA))
+        setSeedAmtB('0')
+      }
+      return
+    }
+
+    if (sortedAFirst) {
+      if (side === 'A') setSeedAmtB(formatAmountExact(paired.amount1, decB))
+      else setSeedAmtA(formatAmountExact(paired.amount0, decA))
+    } else if (side === 'A') {
+      setSeedAmtB(formatAmountExact(paired.amount0, decB))
+    } else {
+      setSeedAmtA(formatAmountExact(paired.amount1, decA))
+    }
+  }
+
+  useEffect(() => {
+    if (!address || !showCreatePool) return
+    void (async () => {
+      const gas = 10n ** 15n
+      const balEth = ethBal > gas ? ethBal - gas : 0n
+      const balA = isEthLikeCurrency(tokenA)
+        ? (useNativeEth ? balEth : wethBal)
+        : await getErc20Balance(tokenA, address)
+      const balB = isEthLikeCurrency(tokenB)
+        ? (useNativeEth ? balEth : wethBal)
+        : await getErc20Balance(tokenB, address)
+      setCreateSeedBalA(balA)
+      setCreateSeedBalB(balB)
+    })()
+  }, [address, showCreatePool, tokenA, tokenB, ethBal, wethBal, useNativeEth])
+
+  const fillCreateSeedBalances = (pct = 100) => {
+    if (!createSynth) return
+    const { synth, range, sortedAFirst, decA, decB } = createSynth
+    const f = BigInt(Math.floor(pct * 100))
+    const availA = (createSeedBalA * f) / 10000n
+    const availB = (createSeedBalB * f) / 10000n
+    const wethA = isEthLikeCurrency(tokenA)
+    const wethB = isEthLikeCurrency(tokenB)
+
+    const apply = (a0: bigint, a1: bigint) => {
+      if (sortedAFirst) {
+        setSeedAmtA(formatAmountExact(a0, decA))
+        setSeedAmtB(formatAmountExact(a1, decB))
+      } else {
+        setSeedAmtA(formatAmountExact(a1, decA))
+        setSeedAmtB(formatAmountExact(a0, decB))
+      }
+    }
+
+    const trySide = (side: 0 | 1, avail: bigint) => {
+      const paired = pairAmountForRange({
+        sqrtPriceX96: synth.sqrtPriceX96,
+        tickLower: range.tickLower,
+        tickUpper: range.tickUpper,
+        amount: avail,
+        side,
+      })
+      apply(paired.amount0, paired.amount1)
+    }
+
+    if (createRangePreset === 'onesided-eth' && (wethA || wethB)) {
+      if (wethA) trySide(sortedAFirst ? 0 : 1, availA)
+      else trySide(sortedAFirst ? 1 : 0, availB)
+      return
+    }
+
+    const from0 = pairAmountForRange({
+      sqrtPriceX96: synth.sqrtPriceX96,
+      tickLower: range.tickLower,
+      tickUpper: range.tickUpper,
+      amount: sortedAFirst ? availA : availB,
+      side: sortedAFirst ? 0 : 1,
+    })
+    if (from0.singleSided === 'token0' || from0.amount1 <= (sortedAFirst ? availB : availA)) {
+      trySide(sortedAFirst ? 0 : 1, sortedAFirst ? availA : availB)
+      return
+    }
+    trySide(sortedAFirst ? 1 : 0, sortedAFirst ? availB : availA)
+  }
+
+  const createPool = async () => {
+    if (!address || !wallet) {
+      setStatus('请先连接钱包')
+      return
+    }
+    if (tokenA.toLowerCase() === tokenB.toLowerCase()) {
+      setStatus('两个 Token 不能相同')
+      return
+    }
+    const price = Number(initPrice.replace(/,/g, ''))
+    if (!(price > 0)) {
+      setStatus('请填写有效的初始币价')
+      return
+    }
+    if (seedOnCreate && !createSynth) {
+      setStatus('初始价格无效，无法计算注入数量')
+      return
+    }
+
+    const ethA = isEthLikeCurrency(tokenA)
+    const ethB = isEthLikeCurrency(tokenB)
+    const initialPriceBPerA = createSynth?.initialPriceBPerA ?? price
+    const useFee = createSynth?.useFee ?? fee
+    const decA = createSynth?.decA ?? tokenOptions.find((x) => x.addr === tokenA)?.decimals ?? 18
+    const decB = createSynth?.decB ?? tokenOptions.find((x) => x.addr === tokenB)?.decimals ?? 18
+
+    let amountA = 0n
+    let amountB = 0n
+    if (seedOnCreate) {
+      amountA = parseAmount(seedAmtA || '0', decA)
+      amountB = parseAmount(seedAmtB || '0', decB)
+      if (createRangePreset === 'onesided-eth' && (ethA || ethB)) {
+        if (ethA) amountB = 0n
+        else amountA = 0n
+      }
+      if (amountA <= 0n && amountB <= 0n) {
+        setStatus('请填写至少一侧注入数量，或取消「同时注入初仓」')
+        return
+      }
+    }
+
+    const rawA = chainCurrency(tokenA)
+    const rawB = chainCurrency(tokenB)
+    const sortedAFirst = rawA.toLowerCase() < rawB.toLowerCase()
+    const amount0 = sortedAFirst ? amountA : amountB
+    const amount1 = sortedAFirst ? amountB : amountA
+
+    let tickLower: number | undefined
+    let tickUpper: number | undefined
+    if (seedOnCreate && createSynth) {
+      tickLower = createSynth.range.tickLower
+      tickUpper = createSynth.range.tickUpper
+    }
+
+    if (mintProtocol === 'v4' && customFeeInput.trim()) {
+      const pct = Number(customFeeInput.replace(/%/g, '').trim())
+      if (!(pct > 0) || !Number.isFinite(pct)) {
+        setStatus('自定义费率无效，例如填 0.3 表示 0.30%')
+        return
+      }
+      const f = Math.round(pct * 10000)
+      if (f < 1 || f > 1_000_000) {
+        setStatus('自定义费率超出范围')
+        return
+      }
+    }
+
+    setBusy(true)
+    setStatusHash(null)
+    setStatus(
+      seedOnCreate
+        ? `创建 ${mintProtocol.toUpperCase()} 池并注入流动性…`
+        : `创建 / 初始化 ${mintProtocol.toUpperCase()} 池…`,
+    )
+    try {
+      if (mintProtocol === 'v4') {
+        const { pool: info, hash, seeded } = await createV4PoolAndSeed({
+          walletClient: wallet,
+          owner: address,
+          tokenA,
+          tokenB,
+          fee: useFee,
+          tickSpacing: v4TickSpacing,
+          initialPriceBPerA,
+          amount0: seedOnCreate ? amount0 : undefined,
+          amount1: seedOnCreate ? amount1 : undefined,
+          tickLower,
+          tickUpper,
+          useNativeEth,
+          slippageBps,
+          onStatus: setStatus,
+        })
+        setPool(info)
+        setFee(useFee)
+        setShowCreatePool(false)
+        applyDefaultCoinRange(info, setPriceLo, setPriceHi)
+        const q = getCoinQuote(info)
+        setStatusHash(hash)
+        setTxHistory(pushTxHistory({
+          label: seeded ? '创建 V4 池+初仓' : '创建 V4 池',
+          hash,
+          pair: `${q.coin.symbol}/${q.quote.symbol}`,
+        }))
+        setStatus(
+          `V4 池已就绪 · fee ${(useFee / 10000).toFixed(2)}% · spacing ${v4TickSpacing} · 币价 ${formatPrice(q.spot)}`,
+        )
+        void refreshPositions({ silent: true })
+      } else {
+        const { pool: info, hash, created, seeded } = await createV3PoolAndSeed({
+          walletClient: wallet,
+          owner: address,
+          tokenA,
+          tokenB,
+          fee: useFee,
+          initialPriceBPerA,
+          amount0: seedOnCreate ? amount0 : undefined,
+          amount1: seedOnCreate ? amount1 : undefined,
+          tickLower,
+          tickUpper,
+          useNativeEth,
+          onStatus: setStatus,
+        })
+        setPool(info)
+        setShowCreatePool(false)
+        applyDefaultCoinRange(info, setPriceLo, setPriceHi)
+        const q = getCoinQuote(info)
+        if (hash) {
+          setStatusHash(hash)
+          setTxHistory(pushTxHistory({
+            label: seeded ? '创建 V3 池+初仓' : created ? '创建 V3 池' : '初始化 V3 池',
+            hash,
+            pair: `${q.coin.symbol}/${q.quote.symbol}`,
+          }))
+        }
+        setStatus(
+          `V3 池已就绪 · ${q.coin.symbol}/${q.quote.symbol} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`,
+        )
+        if (seeded) void refreshPositions({ silent: true })
+      }
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const mintTicks = rangePreview
     ? { tickLower: rangePreview.tickLower, tickUpper: rangePreview.tickUpper }
@@ -752,9 +1221,13 @@ export default function App() {
                 </span>
               </div>
               <div className="btn-row tight">
-                <button className="btn" disabled={busy} onClick={() => void refreshPositions()}>刷新</button>
+                <button className="btn" disabled={refreshing} onClick={() => void refreshPositions({ silent: false })}>{refreshing ? '刷新中…' : '刷新'}</button>
+                <button className="btn" disabled={refreshing || !address} onClick={() => void refreshPositions({ silent: false, deep: true })} title="扩大回溯 + ownerOf 校验，较慢">深度扫描</button>
                 <button className="btn" onClick={disconnect}>断开</button>
               </div>
+              {refreshStatus && (
+                <p className="wallet-refresh-note muted">{refreshStatus}</p>
+              )}
             </>
           ) : (
             <button className="btn primary" disabled={busy} onClick={() => void connect()}>连接钱包</button>
@@ -763,7 +1236,12 @@ export default function App() {
       </header>
 
       <div className={`status-bar ${busy ? 'busy' : ''}`}>
-        <span>{status || '连接钱包（MetaMask/Rabby），切到 Robinhood Chain (4663）'}</span>
+        <span>{status || (tab === 'positions' && refreshStatus) || '连接钱包（MetaMask/Rabby），切到 Robinhood Chain (4663）'}</span>
+        {tab === 'positions' && lastRefreshAt && !refreshing && !refreshStatus && (
+          <span className="muted" style={{ marginLeft: 8 }}>
+            上次 {new Date(lastRefreshAt).toLocaleTimeString()}
+          </span>
+        )}
         {statusHash && (
           <a href={explorerTx(statusHash)} target="_blank" rel="noreferrer">查看交易 ↗</a>
         )}
@@ -799,6 +1277,7 @@ export default function App() {
           <div className="summary-strip">
             <div><span className="sum-label">总价值</span><strong>{formatUsd(summary.totalUsd)}</strong></div>
             <div><span className="sum-label">累计手续费</span><strong className="ok-text">{formatUsd(summary.feesUsd)}</strong></div>
+            <div><span className="sum-label">其中已领/复投</span><strong>{formatUsd(summary.claimedUsd)}</strong></div>
             <div><span className="sum-label">PnL</span><strong className={summary.pnlUsd >= 0 ? 'ok-text' : 'bad-text'}>{formatPnl(summary.pnlUsd)}</strong></div>
             <div><span className="sum-label">In range</span><strong>{summary.inRange}/{summary.n}</strong></div>
           </div>
@@ -829,13 +1308,16 @@ export default function App() {
               {filteredPositions.map((p) => {
                 const id = `${p.version}-${p.tokenId}`
                 const selectedRow = selectedId === id
+                const cq = getPositionCoinPrices(p)
                 const feeUsd = p.fees0Usd + p.fees1Usd
                 const hasFees = p.fees0 > 0n || p.fees1 > 0n
                 const feePct0 = feeUsd > 0 ? (p.fees0Usd / feeUsd) * 100 : hasFees ? 50 : 0
                 const feePct1 = feeUsd > 0 ? (p.fees1Usd / feeUsd) * 100 : hasFees ? 50 : 0
-                const rangeSpan = Math.max(p.priceUpper - p.priceLower, 1e-18)
-                const rangeMarker = Math.max(0, Math.min(100, ((p.price - p.priceLower) / rangeSpan) * 100))
-                const priceUnit = `${p.token1.symbol}/${p.token0.symbol}`
+                const rangeSpan = Math.max(cq.coinPriceUpper - cq.coinPriceLower, 1e-18)
+                const rangeMarker = Math.max(
+                  0,
+                  Math.min(100, ((cq.coinPrice - cq.coinPriceLower) / rangeSpan) * 100),
+                )
                 return (
                   <button
                     type="button"
@@ -847,12 +1329,12 @@ export default function App() {
                       <span className="pos-label">#{p.tokenId.toString()} · {p.version.toUpperCase()} · {(p.fee / 10000).toFixed(2)}%</span>
                       <span className={`pill ${p.inRange ? 'ok' : 'out'}`}>{p.inRange ? 'In range' : 'Out of range'}</span>
                     </div>
-                    <div className="pos-pair">{p.token0.symbol} / {p.token1.symbol}</div>
+                    <div className="pos-pair">{cq.coin.symbol} / {cq.quote.symbol}</div>
                     <div className="pos-total">{formatUsd(p.totalUsd)}</div>
                     <div className={`pos-pnl ${p.pnlUsd >= 0 ? 'up' : 'down'}`}>
                       PnL {formatPnl(p.pnlUsd)}
                       <span className="pos-pnl-sub">
-                        费 {formatUsd(p.totalFeesUsd)} (未领 {formatUsd(p.fees0Usd + p.fees1Usd)} / 已领 {formatUsd(p.claimedFeesUsd)})
+                        费 {formatUsd(p.totalFeesUsd)} (未领 {formatUsd(p.fees0Usd + p.fees1Usd)} / 已领·复投 {formatUsd(p.claimedFeesUsd)})
                       </span>
                     </div>
 
@@ -884,7 +1366,7 @@ export default function App() {
                         <span className="asset-right mono">{formatUsd(feeUsd)}</span>
                       </div>
                       <div className="asset-row fee-row">
-                        <span className="asset-left">已领</span>
+                        <span className="asset-left">已领/复投</span>
                         <span className="asset-right mono">{formatUsd(p.claimedFeesUsd)}</span>
                       </div>
                       {hasFees && (
@@ -908,7 +1390,7 @@ export default function App() {
                     <div className={`range-block ${p.inRange ? 'in' : 'out'}`}>
                       <div className="range-head">
                         <span className="fees-label">价格区间</span>
-                        <span className="range-now">现价 {formatPrice(p.price)}</span>
+                        <span className="range-now">现价 {formatPrice(cq.coinPrice)}</span>
                       </div>
                       <div className="range-track">
                         <div className="range-fill" />
@@ -917,14 +1399,14 @@ export default function App() {
                       <div className="range-ends">
                         <div className="range-end">
                           <span className="range-end-label">下限</span>
-                          <span className="range-end-val">{formatPrice(p.priceLower)}</span>
+                          <span className="range-end-val">{formatPrice(cq.coinPriceLower)}</span>
                         </div>
                         <div className="range-end right">
                           <span className="range-end-label">上限</span>
-                          <span className="range-end-val">{formatPrice(p.priceUpper)}</span>
+                          <span className="range-end-val">{formatPrice(cq.coinPriceUpper)}</span>
                         </div>
                       </div>
-                      <div className="range-unit">{priceUnit}</div>
+                      <div className="range-unit">{cq.priceUnit}</div>
                     </div>
                   </button>
                 )
@@ -1045,6 +1527,7 @@ export default function App() {
                           amount0: parseAmount(add0 || '0', selected.token0.decimals),
                           amount1: parseAmount(add1 || '0', selected.token1.decimals),
                           useNativeEth: addUseEth,
+                          slippageBps,
                         })
                         : increaseV3Liquidity({
                           walletClient: wallet!,
@@ -1128,83 +1611,298 @@ export default function App() {
           </div>
           <p className="muted" style={{ marginTop: 0 }}>
             {mintProtocol === 'v4'
-              ? 'V4：按交易对 + Fee 探测池（hooks=0）。WETH 池勾选原生 ETH 时会先 Wrap 再经 Permit2 入池。'
+              ? 'V4：优先匹配原生 ETH 池（address(0)）。勾选「直接付 ETH」时开仓用钱包原生 ETH，一笔完成，无需先 Wrap。'
               : <>Token 选 <strong>ETH</strong> 即可（链上池仍是 WETH）。勾选「直接付 ETH」后用钱包原生 ETH 开仓。示例：<code style={{ fontSize: 11 }}>0x7ad1eed380501e037a3207c3355de4a1be789559</code></>}
           </p>
           <div className="grid2">
             <label>
-              Token A
+              币（要做 LP 的代币）
               <select value={tokenA} onChange={(e) => setTokenA(e.target.value as Address)}>
-                {tokenOptions.map((t) => <option key={t.addr} value={t.addr}>{t.symbol}</option>)}
+                {tokenOptions.map((t) => <option key={`a-${t.addr}`} value={t.addr}>{t.symbol}</option>)}
               </select>
             </label>
             <label>
-              Token B
+              报价（通常选 ETH）
               <select value={tokenB} onChange={(e) => setTokenB(e.target.value as Address)}>
-                {tokenOptions.map((t) => <option key={t.addr} value={t.addr}>{t.symbol}</option>)}
+                {tokenOptions.map((t) => <option key={`b-${t.addr}`} value={t.addr}>{t.symbol}</option>)}
               </select>
             </label>
             <label>
               Fee tier
-              <select value={fee} onChange={(e) => setFee(Number(e.target.value))}>
-                {FEE_TIERS.map((f) => <option key={f} value={f}>{(f / 10000).toFixed(2)}%</option>)}
+              <select
+                value={fee}
+                onChange={(e) => {
+                  const f = Number(e.target.value)
+                  setFee(f)
+                  if (mintProtocol === 'v4') setV4TickSpacing(suggestV4TickSpacing(f))
+                }}
+              >
+                {(mintProtocol === 'v4' ? V4_FEE_PRESETS : FEE_TIERS).map((f) => (
+                  <option key={f} value={f}>{(f / 10000).toFixed(2)}%</option>
+                ))}
               </select>
             </label>
             <label>
-              自定义 Token 地址 → B
+              自定义 Token → 币
               <div className="inline">
                 <input value={customToken} onChange={(e) => setCustomToken(e.target.value)} placeholder="0x…" />
-                <button className="btn" type="button" onClick={() => void addCustomToken()}>设为 B</button>
+                <button className="btn" type="button" onClick={() => void addCustomToken()}>设为币</button>
               </div>
             </label>
           </div>
+          <p className="muted" style={{ margin: '8px 0 0', fontSize: 12 }}>
+            将加载/创建：
+            <strong>
+              {tokenLabel(tokenA)}
+              {' / '}
+              {tokenLabel(tokenB)}
+            </strong>
+            {isEthLikeCurrency(tokenA) && !isEthLikeCurrency(tokenB)
+              ? '（建议把 ETH 放在右侧「报价」）'
+              : ''}
+            。链上 token0/token1 会按地址自动排序，不影响币价口径。
+          </p>
           <div className="btn-row">
             <button className="btn" disabled={busy} onClick={() => void loadPoolByPair()}>按 Fee 加载</button>
             <button className="btn primary" disabled={busy} onClick={() => void scanPools()}>扫描全部 Fee</button>
-            {mintProtocol === 'v3' && (
-              <button
-                className="btn"
-                type="button"
-                disabled={busy}
-                onClick={() => {
-                  setShowCreatePool(true)
-                  setPool(null)
-                  setStatus('填写初始价后创建 V3 池')
-                }}
-              >
-                创建 V3 池
-              </button>
-            )}
+            <button
+              className="btn"
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                setShowCreatePool(true)
+                setPool(null)
+                if (mintProtocol === 'v4') {
+                  setV4TickSpacing(suggestV4TickSpacing(fee))
+                  setCustomFeeInput('')
+                }
+                setStatus(`填写初始价后创建 ${mintProtocol.toUpperCase()} 池（可同笔注入初仓）`)
+              }}
+            >
+              创建 {mintProtocol.toUpperCase()} 池
+            </button>
           </div>
 
-          {mintProtocol === 'v3' && showCreatePool && !pool && (
+          {showCreatePool && !pool && (
             <div className="mint-create">
-              <div className="mint-create-title">池不存在时创建并初始化</div>
+              <div className="mint-create-title">
+                创建 {mintProtocol.toUpperCase()} 池
+                {seedOnCreate ? ' + 注入初仓（同笔交易）' : '（仅初始化）'}
+              </div>
               <p className="muted" style={{ margin: '0 0 10px' }}>
-                初始价单位：Token B / Token A（当前为{' '}
-                {tokenOptions.find((x) => x.addr === tokenB)?.symbol ?? 'B'}
-                {' per '}
-                {tokenOptions.find((x) => x.addr === tokenA)?.symbol ?? 'A'}
-                ）。
+                交易对：
+                <strong>
+                  {tokenLabel(tokenA)}/{tokenLabel(tokenB)}
+                </strong>
+                。可在上方粘贴 CA「设为币」后创建。
+                {isEthLikeCurrency(tokenA) !== isEthLikeCurrency(tokenB) ? (
+                  <> 初始<strong>币价</strong>单位：ETH per 币。</>
+                ) : (
+                  <> 初始价：报价 per 币。</>
+                )}
               </p>
+
+              {mintProtocol === 'v4' && (
+                <div className="grid2" style={{ marginBottom: 8 }}>
+                  <label>
+                    V4 费率
+                    <select
+                      value={
+                        (V4_FEE_PRESETS as readonly number[]).includes(fee) && !customFeeInput
+                          ? fee
+                          : -1
+                      }
+                      onChange={(e) => {
+                        const v = Number(e.target.value)
+                        if (v < 0) return
+                        setFee(v)
+                        setCustomFeeInput('')
+                        setV4TickSpacing(suggestV4TickSpacing(v))
+                      }}
+                    >
+                      {V4_FEE_PRESETS.map((f) => (
+                        <option key={f} value={f}>{(f / 10000).toFixed(2)}%</option>
+                      ))}
+                      <option value={-1}>自定义…</option>
+                    </select>
+                  </label>
+                  <label>
+                    自定义费率 %
+                    <input
+                      value={customFeeInput}
+                      onChange={(e) => {
+                        setCustomFeeInput(e.target.value)
+                        const pct = Number(e.target.value.replace(/%/g, '').trim())
+                        if (pct > 0 && Number.isFinite(pct)) {
+                          const f = Math.round(pct * 10000)
+                          setFee(f)
+                          setV4TickSpacing(suggestV4TickSpacing(f))
+                        }
+                      }}
+                      placeholder="如 0.25 → 0.25%"
+                      inputMode="decimal"
+                    />
+                  </label>
+                  <label>
+                    tickSpacing
+                    <input
+                      type="number"
+                      value={v4TickSpacing}
+                      min={1}
+                      max={16384}
+                      onChange={(e) => setV4TickSpacing(Math.max(1, Number(e.target.value) || 1))}
+                    />
+                  </label>
+                  <label className="inline-setting check" style={{ alignSelf: 'end', marginBottom: 8 }}>
+                    <input type="checkbox" checked={useNativeEth} onChange={(e) => setUseNativeEth(e.target.checked)} />
+                    ETH 用原生币（非 WETH）
+                  </label>
+                </div>
+              )}
+
               <div className="grid2">
                 <label>
-                  初始价格（B per A）
+                  {isEthLikeCurrency(tokenA) !== isEthLikeCurrency(tokenB)
+                    ? `初始币价（ETH per ${isEthLikeCurrency(tokenA) ? (tokenOptions.find((x) => x.addr === tokenB)?.symbol ?? '币') : (tokenOptions.find((x) => x.addr === tokenA)?.symbol ?? '币')}）`
+                    : '初始价格（报价 per 币）'}
                   <input
                     value={initPrice}
                     onChange={(e) => setInitPrice(e.target.value)}
-                    placeholder="例如 3000"
+                    placeholder={isEthLikeCurrency(tokenA) !== isEthLikeCurrency(tokenB) ? '例如 0.0003' : '例如 1'}
                     inputMode="decimal"
                   />
                 </label>
-                <label>
-                  Fee
-                  <input value={`${(fee / 10000).toFixed(2)}%`} disabled />
-                </label>
+                {mintProtocol === 'v3' && (
+                  <label>
+                    Fee
+                    <input value={`${(fee / 10000).toFixed(2)}%`} disabled />
+                  </label>
+                )}
               </div>
+
+              <label className="inline-setting check" style={{ margin: '12px 0 8px' }}>
+                <input type="checkbox" checked={seedOnCreate} onChange={(e) => setSeedOnCreate(e.target.checked)} />
+                同时注入初仓（与创建同笔发送）
+              </label>
+
+              {seedOnCreate && (
+                <>
+                  <div className="mint-preset-row" style={{ marginBottom: 8 }}>
+                    <span className="mint-preset-label">区间</span>
+                    <div className="chip-row">
+                      <button
+                        type="button"
+                        className={`chip ${createRangePreset === 'onesided-eth' ? 'on' : ''}`}
+                        onClick={() => {
+                          setCreateRangePreset('onesided-eth')
+                          const { percentLower: lo, percentUpper: hi } = oneSidedEthPercents()
+                          setPercentLower(lo)
+                          setPercentUp(hi)
+                        }}
+                      >
+                        单边 ETH
+                      </button>
+                      <button
+                        type="button"
+                        className={`chip ${createRangePreset === 'full' ? 'on' : ''}`}
+                        onClick={() => setCreateRangePreset('full')}
+                      >
+                        全区间
+                      </button>
+                      {[5, 10, 20, 30, 50].map((n) => (
+                        <button
+                          key={`create-bi-${n}`}
+                          type="button"
+                          className={`chip ${createRangePreset === n ? 'on' : ''}`}
+                          onClick={() => {
+                            setCreateRangePreset(n)
+                            setPercentLower(-n)
+                            setPercentUp(n)
+                          }}
+                        >
+                          ±{n}%
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <p className="muted" style={{ margin: '0 0 8px', fontSize: 12 }}>
+                    {createRangePreset === 'onesided-eth'
+                      ? '单边 ETH：区间在市价下方，创建时通常只需付 ETH。'
+                      : createRangePreset === 'full'
+                        ? '全区间：覆盖全部价格，需同时准备两侧代币（按初始价比例）。'
+                        : `双边 ±${createRangePreset}%：区间围绕初始价，通常需两侧代币。`}
+                    {createSynth && initPrice.trim() ? (
+                      <> 填<strong>一边数量</strong>，另一边按初始价+区间自动配平。</>
+                    ) : (
+                      <> 请先填好上方初始价。</>
+                    )}
+                    {mintProtocol === 'v3' && (
+                      <> V3 链上用 WETH，可直接付 ETH（自动 Wrap）。</>
+                    )}
+                  </p>
+                  <div className="grid2">
+                    <label>
+                      {tokenLabel(tokenA)} 数量
+                      {createRangePreset === 'onesided-eth' && isEthLikeCurrency(tokenA)
+                        ? '（单边）'
+                        : createRangePreset === 'onesided-eth' && isEthLikeCurrency(tokenB)
+                          ? '（不需要）'
+                          : ''}
+                      <span className="bal-hint">余额 {formatAmount(createSeedBalA, createSynth?.decA ?? 18, 6)}</span>
+                      <input
+                        value={seedAmtA}
+                        onChange={(e) => onCreateSeedSide('A', e.target.value)}
+                        disabled={
+                          !createSynth
+                          || (createRangePreset === 'onesided-eth'
+                          && isEthLikeCurrency(tokenB)
+                          && !isEthLikeCurrency(tokenA))
+                        }
+                        placeholder={createSynth ? '填数量' : '先填初始价'}
+                        inputMode="decimal"
+                      />
+                    </label>
+                    <label>
+                      {tokenLabel(tokenB)} 数量
+                      {createRangePreset === 'onesided-eth' && isEthLikeCurrency(tokenB)
+                        ? '（单边）'
+                        : createRangePreset === 'onesided-eth' && isEthLikeCurrency(tokenA)
+                          ? '（不需要）'
+                          : ''}
+                      <span className="bal-hint">余额 {formatAmount(createSeedBalB, createSynth?.decB ?? 18, 6)}</span>
+                      <input
+                        value={seedAmtB}
+                        onChange={(e) => onCreateSeedSide('B', e.target.value)}
+                        disabled={
+                          !createSynth
+                          || (createRangePreset === 'onesided-eth'
+                          && isEthLikeCurrency(tokenA)
+                          && !isEthLikeCurrency(tokenB))
+                        }
+                        placeholder={createSynth ? '填数量' : '先填初始价'}
+                        inputMode="decimal"
+                      />
+                    </label>
+                  </div>
+                  <div className="chip-row">
+                    {[25, 50, 75, 100].map((n) => (
+                      <button
+                        key={`seed-${n}`}
+                        type="button"
+                        className="chip"
+                        disabled={!address || !createSynth}
+                        onClick={() => fillCreateSeedBalances(n)}
+                      >
+                        {n === 100 ? 'Max' : `${n}%`}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+
               <div className="btn-row" style={{ marginTop: 10 }}>
                 <button className="btn primary" disabled={busy || !address} onClick={() => void createPool()}>
-                  {!address ? '先连接钱包' : '创建并初始化'}
+                  {!address ? '先连接钱包' : seedOnCreate ? '创建并注入流动性' : '创建并初始化'}
                 </button>
                 <button className="btn" type="button" disabled={busy} onClick={() => setShowCreatePool(false)}>取消</button>
               </div>
@@ -1231,9 +1929,16 @@ export default function App() {
           )}
 
           <label className="full">
-            或粘贴 V3 Pool 地址
+            或粘贴 V3 池地址 / V4 poolId / 池子链接
             <div className="inline">
-              <input value={poolInput} onChange={(e) => setPoolInput(e.target.value)} placeholder="0x…" />
+              <input
+                value={poolInput}
+                onChange={(e) => setPoolInput(e.target.value)}
+                placeholder="0x… 或 Uniswap / Blockscout 链接"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void loadPoolByAddress()
+                }}
+              />
               <button className="btn" disabled={busy} onClick={() => void loadPoolByAddress()}>加载</button>
             </div>
           </label>
@@ -1243,7 +1948,7 @@ export default function App() {
               <div className="mint-pool">
                 <div className="mint-pool-top">
                   <div>
-                    <div className="mint-pair">{pool.token0.symbol} / {pool.token1.symbol}</div>
+                    <div className="mint-pair">{getCoinQuote(pool).coin.symbol} / {getCoinQuote(pool).quote.symbol}</div>
                     <div className="mint-meta">Fee {(pool.fee / 10000).toFixed(2)}% · {pool.version.toUpperCase()}</div>
                   </div>
                   <button className="btn" type="button" disabled={busy} onClick={() => void refreshPoolPrice()}>
@@ -1269,21 +1974,24 @@ export default function App() {
                   <div className="range-mode">
                     <button type="button" className={`chip ${rangeMode === 'percent' ? 'on' : ''}`} onClick={() => setRangeMode('percent')}>按 %</button>
                     <button type="button" className={`chip ${rangeMode === 'custom' ? 'on' : ''}`} onClick={() => setRangeMode('custom')}>自定义价</button>
+                    <button type="button" className={`chip ${rangeMode === 'full' ? 'on' : ''}`} onClick={() => setRangeMode('full')}>全区间</button>
                   </div>
                 </div>
 
-                {rangeMode === 'percent' ? (
+                {rangeMode === 'full' ? (
+                  <p className="mint-full-hint">全区间：使用当前池 tickSpacing 对齐的最小/最大 tick，V3/V4 均适用。流动性覆盖全部价格。</p>
+                ) : rangeMode === 'percent' ? (
                   <>
                     <div className="mint-presets">
                       <div className="chip-row">
                         <button
                           type="button"
-                          className={`chip ${percentLower === -75 && percentUp === -1 ? 'on' : ''}`}
+                          className={`chip ${percentLower === -75 && percentUp === -3 ? 'on' : ''}`}
                           onClick={() => {
-                            const eth0 = isEthLikeCurrency(pool.token0.address)
-                            // 单边 ETH：默认币价 -75% ~ -1%
-                            if (eth0) { setPercentLower(-75); setPercentUp(-1) }
-                            else { setPercentLower(1); setPercentUp(75) }
+                            // 币价口径固定 -75%~-3%，ETH 在 token0/token1 都能单边付 ETH
+                            const { percentLower: lo, percentUpper: hi } = oneSidedEthPercents()
+                            setPercentLower(lo)
+                            setPercentUp(hi)
                             setRangeMode('percent')
                           }}
                         >
@@ -1396,7 +2104,9 @@ export default function App() {
                   const singleSym = needToken0 ? label0 : needToken1 ? label1 : null
                   const coinBelow = coinHi < coinSpot
                   const marker = coinBelow ? 108 : coinLo > coinSpot ? -8 : Math.max(4, Math.min(96, rawMarker))
-                  const statusText = rangePreview.inRangePreview
+                  const statusText = rangeMode === 'full'
+                    ? '全区间 · 覆盖全部价格'
+                    : rangePreview.inRangePreview
                     ? '双边 · 币价在区间内'
                     : `单边 · 币价区间${coinBelow ? '低于' : '高于'}市价，只需 ${singleSym}`
                   return (
@@ -1442,7 +2152,9 @@ export default function App() {
               {poolUsesWeth && (
                 <label className="inline-setting check" style={{ marginBottom: 10 }}>
                   <input type="checkbox" checked={useNativeEth} onChange={(e) => setUseNativeEth(e.target.checked)} />
-                  直接付 ETH 铸造（Uniswap 会自动 Wrap 成 WETH）
+                  {mintProtocol === 'v4' || pool?.version === 'v4'
+                    ? '直接付 ETH 铸造（原生 ETH 池 · 一笔 value，不经 WETH）'
+                    : '直接付 ETH 铸造（Uniswap 会自动 Wrap 成 WETH）'}
                 </label>
               )}
 
@@ -1518,6 +2230,7 @@ export default function App() {
                         tickLower: mintTicks.tickLower,
                         tickUpper: mintTicks.tickUpper,
                         useNativeEth: mintUseEth,
+                        slippageBps,
                       }), `${pool.token0.symbol}/${pool.token1.symbol}`)
                       return
                     }
@@ -1578,6 +2291,47 @@ export default function App() {
               Unwrap → ETH
             </button>
           </div>
+          <hr className="sep" />
+          <h2>清理空 V3 仓位 NFT</h2>
+          <p className="muted">
+            撤出流动性后 NFT 可能仍留在钱包（如 #107661），刷新列表会隐藏它们，但链上仍占一个 NFT 槽位。
+          </p>
+          <div className="btn-row">
+            <button
+              className="btn"
+              type="button"
+              disabled={!address || busy}
+              onClick={() => void run('扫描空 NFT', async () => {
+                const ids = await listVacantV3TokenIds(address!)
+                setVacantV3Ids(ids)
+                setStatus(`发现 ${ids.length} 个可销毁的空 V3 NFT`)
+              })}
+            >
+              扫描空 NFT
+            </button>
+            <button
+              className="btn primary"
+              type="button"
+              disabled={!address || !wallet || busy || vacantV3Ids === null || vacantV3Ids.length === 0}
+              onClick={() => void run('销毁空 NFT', async () => {
+                const { burned, failed } = await burnVacantV3Nfts({
+                  walletClient: wallet!,
+                  owner: address!,
+                  onStatus: setStatus,
+                })
+                setVacantV3Ids(failed.length ? failed : [])
+                await refreshPositions({ silent: true })
+                setStatus(`已销毁 ${burned.length} 个空 NFT${failed.length ? `，${failed.length} 个失败` : ''}`)
+              })}
+            >
+              销毁全部空 NFT{vacantV3Ids?.length ? ` (${vacantV3Ids.length})` : ''}
+            </button>
+          </div>
+          {vacantV3Ids && vacantV3Ids.length > 0 && (
+            <p className="muted mono" style={{ marginTop: 8 }}>
+              {vacantV3Ids.map((id) => `#${id.toString()}`).join(', ')}
+            </p>
+          )}
           <hr className="sep" />
           <h2>常用链接</h2>
           <ul className="link-list">
