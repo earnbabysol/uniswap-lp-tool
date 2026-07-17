@@ -115,6 +115,45 @@ h1 {
 }
 .inline-setting select { padding: 6px 10px; }
 .inline-setting.check { color: var(--muted); font-size: 13px; }
+
+.rpc-panel {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  border-radius: 10px;
+}
+.rpc-panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+.rpc-panel-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.rpc-input {
+  flex: 1 1 280px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 13px;
+  background: #fff;
+}
+.rpc-panel-note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.rpc-latency { font-weight: 600; }
+
 .summary-strip {
   display: grid;
   grid-template-columns: repeat(4, 1fr);

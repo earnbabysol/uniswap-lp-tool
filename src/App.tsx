@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Address, WalletClient } from 'viem'
 import { isAddress } from 'viem'
-import { CONTRACTS, FEE_TIERS, V4_FEE_PRESETS, KNOWN_TOKENS } from './chain'
+import {
+  CONTRACTS,
+  FEE_TIERS,
+  V4_FEE_PRESETS,
+  KNOWN_TOKENS,
+  SUPPORTED_CHAINS,
+  getActiveChainConfig,
+  getActiveChainId,
+  listKnownTokens,
+  type SupportedChainId,
+} from './chain'
 import {
   claimV3,
   claimV4,
@@ -48,11 +58,21 @@ import { parseAmount, formatPrice, formatUsd, pairAmountForRange, formatAmountEx
 import { withTimeout } from './async'
 import {
   connectWallet,
+  ensureActiveChain,
   explorerAddress,
   explorerTx,
   makeWalletClient,
+  refreshPublicClient,
   shortAddr,
+  switchAppChain,
 } from './wallet'
+import {
+  defaultRpcUrl,
+  describeActiveRpc,
+  loadCustomRpcUrl,
+  saveCustomRpcUrl,
+  testRpcLatency,
+} from './rpcSettings'
 import { clearTxHistory, loadTxHistory, pushTxHistory, type TxRecord } from './history'
 import './App.css'
 
@@ -177,9 +197,16 @@ export default function App() {
   const [addBal1, setAddBal1] = useState<bigint>(0n)
   const [autoRefresh, setAutoRefresh] = useState(false)
   const [txHistory, setTxHistory] = useState<TxRecord[]>(() => loadTxHistory())
+  const [rpcInput, setRpcInput] = useState(() => loadCustomRpcUrl() ?? '')
+  const [activeRpcLabel, setActiveRpcLabel] = useState(() => describeActiveRpc())
+  const [rpcLatency, setRpcLatency] = useState<number | null>(null)
+  const [rpcBlock, setRpcBlock] = useState<bigint | null>(null)
+  const [rpcBusy, setRpcBusy] = useState(false)
+  const [chainId, setChainId] = useState<SupportedChainId>(() => getActiveChainId())
+  const chainCfg = getActiveChainConfig()
 
-  const [tokenA, setTokenA] = useState<Address>(CONTRACTS.usdg)
-  const [tokenB, setTokenB] = useState<Address>(CONTRACTS.weth)
+  const [tokenA, setTokenA] = useState<Address>(() => getActiveChainConfig().defaultTokenA)
+  const [tokenB, setTokenB] = useState<Address>(() => getActiveChainConfig().defaultTokenB)
   const [customToken, setCustomToken] = useState('')
   const [fee, setFee] = useState(500)
   const [pool, setPool] = useState<PoolInfo | null>(null)
@@ -283,6 +310,83 @@ export default function App() {
     setStatusHash(null)
   }
 
+  const testRpc = async () => {
+    try {
+      setRpcBusy(true)
+      setRpcLatency(null)
+      setRpcBlock(null)
+      const { latencyMs, blockNumber } = await testRpcLatency(rpcInput.trim() || defaultRpcUrl())
+      setRpcLatency(latencyMs)
+      setRpcBlock(blockNumber)
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : String(e))
+      setStatusHash(null)
+    } finally {
+      setRpcBusy(false)
+    }
+  }
+
+  const saveRpc = () => {
+    try {
+      setRpcBusy(true)
+      const saved = saveCustomRpcUrl(rpcInput)
+      refreshPublicClient()
+      setRpcInput(saved ?? '')
+      setActiveRpcLabel(describeActiveRpc())
+      setRpcLatency(null)
+      setRpcBlock(null)
+      setStatus(saved ? `已保存自定义 RPC：${saved}` : `已恢复默认 RPC（${defaultRpcUrl()}）`)
+      setStatusHash(null)
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : String(e))
+      setStatusHash(null)
+    } finally {
+      setRpcBusy(false)
+    }
+  }
+
+  const onSwitchChain = async (nextId: SupportedChainId) => {
+    if (nextId === chainId) return
+    try {
+      setBusy(true)
+      const cfg = switchAppChain(nextId)
+      setChainId(nextId)
+      setTokenA(cfg.defaultTokenA)
+      setTokenB(cfg.defaultTokenB)
+      setCustomToken('')
+      setPool(null)
+      setScannedPools([])
+      setPositions([])
+      setSelectedId(null)
+      setPoolInput('')
+      setAmount0('')
+      setAmount1('')
+      setInitPrice('')
+      setRpcInput(loadCustomRpcUrl(nextId) ?? '')
+      setActiveRpcLabel(describeActiveRpc(nextId))
+      setRpcLatency(null)
+      setRpcBlock(null)
+      setStatus(`已切换到 ${cfg.label}`)
+      setStatusHash(null)
+      if (address) {
+        try {
+          await ensureActiveChain()
+          setWallet(makeWalletClient(address))
+          setStatus(`已切换到 ${cfg.label}，正在刷新仓位…`)
+          await refreshPositions({ silent: false })
+        } catch (e) {
+          setStatus(
+            `应用已切到 ${cfg.label}，请在钱包中切换网络后点连接：${e instanceof Error ? e.message : String(e)}`,
+          )
+        }
+      }
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const refreshingRef = useRef(false)
   const refreshPositions = useCallback(async (opts?: { silent?: boolean; deep?: boolean }) => {
     if (!address) return
@@ -302,34 +406,47 @@ export default function App() {
     let v3: PositionRow[] | null = null
     let v4: PositionRow[] | null = null
     try {
-      try {
-        v3 = await withTimeout(loadV3Positions(address), deep ? 90_000 : 45_000, 'V3 仓位')
-      } catch (e) {
-        partial.push(e instanceof Error ? e.message : String(e))
-        console.warn('loadV3Positions failed', e)
-      }
-      if (v3) {
-        setPositions((prev) => {
-          const keepV4 = prev.filter((p) => p.version === 'v4')
-          return [...v3!, ...keepV4]
-        })
-      }
-      if (!silent) setRefreshStatus(deep ? '深度扫描 V4…' : '刷新 V4 仓位…')
+      if (!silent) setRefreshStatus(deep ? '深度扫描仓位…' : '刷新 V3 / V4 仓位…')
 
-      try {
-        v4 = await withTimeout(
-          loadV4Positions(address, {
-            deep,
-            skipPnl: true,
-            onStatus: silent ? undefined : setRefreshStatus,
-          }),
-          deep ? 120_000 : 55_000,
-          'V4 仓位',
-        )
-      } catch (e) {
-        partial.push(e instanceof Error ? e.message : String(e))
-        console.warn('loadV4Positions failed', e)
-      }
+      const v3P = withTimeout(loadV3Positions(address), deep ? 90_000 : 35_000, 'V3 仓位')
+        .then((rows) => {
+          v3 = rows
+          setPositions((prev) => {
+            const keepV4 = prev.filter((p) => p.version === 'v4')
+            return [...rows, ...keepV4]
+          })
+          return rows
+        })
+        .catch((e) => {
+          partial.push(e instanceof Error ? e.message : String(e))
+          console.warn('loadV3Positions failed', e)
+          return null
+        })
+
+      const v4P = withTimeout(
+        loadV4Positions(address, {
+          deep,
+          skipPnl: true,
+          onStatus: silent ? undefined : setRefreshStatus,
+        }),
+        deep ? 90_000 : 35_000,
+        'V4 仓位',
+      )
+        .then((rows) => {
+          v4 = rows
+          setPositions((prev) => {
+            const keepV3 = prev.filter((p) => p.version === 'v3')
+            return [...keepV3, ...rows]
+          })
+          return rows
+        })
+        .catch((e) => {
+          partial.push(e instanceof Error ? e.message : String(e))
+          console.warn('loadV4Positions failed', e)
+          return null
+        })
+
+      await Promise.all([v3P, v4P])
 
       setPositions((prev) => {
         const nextV3 = v3 ?? prev.filter((p) => p.version === 'v3')
@@ -420,9 +537,12 @@ export default function App() {
       }
       setStatus(`已切换账户 ${shortAddr(next)}`)
     }
-    const onChain = (chainId: unknown) => {
-      const id = Number(chainId as string)
-      if (id !== 4663) setStatus('请切换到 Robinhood Chain (4663)')
+    const onChain = (chainIdHex: unknown) => {
+      const id = Number(chainIdHex as string)
+      const want = getActiveChainId()
+      if (id !== want) {
+        setStatus(`钱包不在 ${getActiveChainConfig().label}（${want}），请切换网络`)
+      }
     }
     window.ethereum.on?.('accountsChanged', onAccounts)
     window.ethereum.on?.('chainChanged', onChain)
@@ -705,11 +825,10 @@ export default function App() {
   const tokenOptions = useMemo(() => {
     const weth = CONTRACTS.weth.toLowerCase()
     const zero = '0x0000000000000000000000000000000000000000'
-    const base = Object.entries(KNOWN_TOKENS).map(([addr, t]) => ({
-      addr: addr as Address,
-      ...t,
-      // 池子仍是 WETH，界面显示 ETH（可直接付原生 ETH）
-      symbol: addr.toLowerCase() === weth ? 'ETH' : t.symbol,
+    const base = listKnownTokens().map((t) => ({
+      addr: t.address,
+      symbol: t.address.toLowerCase() === weth ? 'ETH' : t.symbol,
+      decimals: t.decimals,
     }))
     const extra: { addr: Address; symbol: string; decimals: number }[] = []
     const pushExtra = (addr: Address) => {
@@ -724,7 +843,7 @@ export default function App() {
     pushExtra(tokenA)
     pushExtra(tokenB)
     return [...base, ...extra]
-  }, [tokenA, tokenB])
+  }, [tokenA, tokenB, chainId])
 
   const tokenLabel = (addr: Address) => {
     if (isNativeCurrency(addr) || addr.toLowerCase() === CONTRACTS.weth.toLowerCase()) return 'ETH'
@@ -1206,7 +1325,7 @@ export default function App() {
       <header className="hero">
         <div>
           <p className="brand">RangeDesk</p>
-          <h1>Uniswap LP · Robinhood Chain</h1>
+          <h1>Uniswap LP · {chainCfg.shortLabel}</h1>
           <p className="sub">半自动 · V3/V4 Claim / 加仓 / 撤出 / Mint</p>
         </div>
         <div className="wallet-box">
@@ -1236,7 +1355,7 @@ export default function App() {
       </header>
 
       <div className={`status-bar ${busy ? 'busy' : ''}`}>
-        <span>{status || (tab === 'positions' && refreshStatus) || '连接钱包（MetaMask/Rabby），切到 Robinhood Chain (4663）'}</span>
+        <span>{status || (tab === 'positions' && refreshStatus) || `连接钱包（MetaMask/Rabby），切到 ${chainCfg.label}（${chainCfg.id}）`}</span>
         {tab === 'positions' && lastRefreshAt && !refreshing && !refreshStatus && (
           <span className="muted" style={{ marginLeft: 8 }}>
             上次 {new Date(lastRefreshAt).toLocaleTimeString()}
@@ -1248,6 +1367,18 @@ export default function App() {
       </div>
 
       <div className="settings-row">
+        <label className="inline-setting">
+          网络
+          <select
+            value={chainId}
+            disabled={busy || refreshing}
+            onChange={(e) => void onSwitchChain(Number(e.target.value) as SupportedChainId)}
+          >
+            {SUPPORTED_CHAINS.map((c) => (
+              <option key={c.id} value={c.id}>{c.label}</option>
+            ))}
+          </select>
+        </label>
         <label className="inline-setting">
           滑点
           <select value={slippageBps} onChange={(e) => setSlippageBps(Number(e.target.value))}>
@@ -1263,6 +1394,42 @@ export default function App() {
           <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} />
           每 60s 自动刷新
         </label>
+      </div>
+
+      <div className="rpc-panel">
+        <div className="rpc-panel-head">
+          <strong>{chainCfg.shortLabel} RPC</strong>
+          <span className="muted">{activeRpcLabel}</span>
+        </div>
+        <div className="rpc-panel-row">
+          <input
+            className="rpc-input mono"
+            type="url"
+            value={rpcInput}
+            placeholder={`默认 ${defaultRpcUrl()}`}
+            onChange={(e) => {
+              setRpcInput(e.target.value)
+              setRpcLatency(null)
+              setRpcBlock(null)
+            }}
+          />
+          <button className="btn" type="button" disabled={rpcBusy} onClick={() => void testRpc()}>
+            {rpcBusy ? '测试中…' : '测延迟'}
+          </button>
+          <button className="btn primary" type="button" disabled={rpcBusy} onClick={saveRpc}>
+            保存
+          </button>
+        </div>
+        <p className="rpc-panel-note muted">
+          留空并保存即恢复当前链默认 RPC。测延迟会请求输入框地址；未填写则测默认节点。
+          {rpcLatency != null && (
+            <span className="rpc-latency ok-text">
+              {' '}
+              延迟 {rpcLatency} ms
+              {rpcBlock != null ? ` · 区块 #${rpcBlock.toString()}` : ''}
+            </span>
+          )}
+        </p>
       </div>
 
       <nav className="tabs">
@@ -1369,6 +1536,16 @@ export default function App() {
                         <span className="asset-left">已领/复投</span>
                         <span className="asset-right mono">{formatUsd(p.claimedFeesUsd)}</span>
                       </div>
+                      {(p.claimed0 > 0n || p.claimed1 > 0n) && (
+                        <div className="asset-row fee-row muted claimed-tokens">
+                          <span className="asset-left" />
+                          <span className="asset-right mono">
+                            {p.claimed0 > 0n ? `${formatAmount(p.claimed0, p.token0.decimals, 4)} ${p.token0.symbol}` : ''}
+                            {p.claimed0 > 0n && p.claimed1 > 0n ? ' · ' : ''}
+                            {p.claimed1 > 0n ? `${formatAmount(p.claimed1, p.token1.decimals, 4)} ${p.token1.symbol}` : ''}
+                          </span>
+                        </div>
+                      )}
                       {hasFees && (
                         <>
                           <div className="bar fees-bar">
@@ -2337,8 +2514,8 @@ export default function App() {
           <ul className="link-list">
             <li><a href={explorerAddress(CONTRACTS.v3Npm)} target="_blank" rel="noreferrer">V3 Position Manager</a></li>
             <li><a href={explorerAddress(CONTRACTS.weth)} target="_blank" rel="noreferrer">WETH</a></li>
-            <li><a href={explorerAddress(CONTRACTS.usdg)} target="_blank" rel="noreferrer">USDG</a></li>
-            <li><a href="https://robinhoodchain.blockscout.com" target="_blank" rel="noreferrer">Blockscout 浏览器</a></li>
+            <li><a href={explorerAddress(CONTRACTS.stable)} target="_blank" rel="noreferrer">{chainId === 8453 ? 'USDC' : 'USDG'}</a></li>
+            <li><a href={chainCfg.explorerUrl} target="_blank" rel="noreferrer">{chainCfg.chain.blockExplorers?.default.name ?? '浏览器'}</a></li>
           </ul>
         </section>
       )}
@@ -2370,7 +2547,7 @@ export default function App() {
       )}
 
       <footer>
-        <p>Robinhood Chain · Uniswap V3 NPM <code>{CONTRACTS.v3Npm}</code></p>
+        <p>{chainCfg.label} · Uniswap V3 NPM <code>{CONTRACTS.v3Npm}</code></p>
         <p>半自动工具：V3 + V4（modifyLiquidities / Permit2）。无人值守 keeper 后续再加。</p>
       </footer>
     </div>

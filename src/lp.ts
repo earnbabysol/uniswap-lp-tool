@@ -10,11 +10,12 @@ import {
   encodeEventTopics,
   decodeAbiParameters,
   isAddress,
+  zeroAddress,
   type Address,
   type WalletClient,
   type Hash,
 } from 'viem'
-import { CONTRACTS, FEE_TIERS, KNOWN_TOKENS, V3_POOL_INIT_CODE_HASH } from './chain'
+import { CONTRACTS, FEE_TIERS, KNOWN_TOKENS, getActiveChainId, getExplorerApi, getStableAddress, getV3PoolInitCodeHash } from './chain'
 import { erc20Abi, v3FactoryAbi, v3NpmAbi, v3PoolAbi, v4PositionManagerAbi, v4StateViewAbi } from './abis'
 import {
   decodeV4PositionInfo,
@@ -403,7 +404,7 @@ export function predictV3PoolAddress(token0: Address, token1: Address, fee: numb
   return getContractAddress({
     from: CONTRACTS.v3Factory,
     opcode: 'CREATE2',
-    bytecodeHash: V3_POOL_INIT_CODE_HASH,
+    bytecodeHash: getV3PoolInitCodeHash(),
     salt,
   })
 }
@@ -687,7 +688,7 @@ async function resolveV4PoolKeyFromId(poolId: `0x${string}`): Promise<{
     const t1 = topics[1]
     if (t0 && t1) {
       const res = await fetch(
-        `https://robinhoodchain.blockscout.com/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest` +
+        `${getExplorerApi()}/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest` +
           `&address=${CONTRACTS.v4PoolManager}&topic0=${t0}&topic1=${t1}&topic0_1_opr=and`,
       )
       if (res.ok) {
@@ -792,8 +793,8 @@ export async function loadV4Pool(key: {
 async function getWethUsdPrice(): Promise<number> {
   try {
     // Prefer 0.05% WETH/USDG pool
-    const poolAddr = await findV3Pool(CONTRACTS.weth, CONTRACTS.usdg, 500)
-      ?? await findV3Pool(CONTRACTS.weth, CONTRACTS.usdg, 3000)
+    const poolAddr = await findV3Pool(CONTRACTS.weth, getStableAddress(), 500)
+      ?? await findV3Pool(CONTRACTS.weth, getStableAddress(), 3000)
     if (!poolAddr) return 0
     const pool = await loadV3Pool(poolAddr)
     // price = token1 per token0. If token0=USDG token1=WETH → price is WETH per USDG (invert)
@@ -835,10 +836,11 @@ function tokenUsd(
   const t1 = token1.toLowerCase()
   const eth0 = isEthLikeCurrency(token0)
   const eth1 = isEthLikeCurrency(token1)
-  const usdg0 = t0 === CONTRACTS.usdg.toLowerCase()
-  const usdg1 = t1 === CONTRACTS.usdg.toLowerCase()
+  const stable = getStableAddress().toLowerCase()
+  const usdg0 = t0 === stable
+  const usdg1 = t1 === stable
   const isEth = isEthLikeCurrency(address)
-  const isUsdg = addr === CONTRACTS.usdg.toLowerCase()
+  const isUsdg = addr === stable
 
   if (!(poolPriceToken1PerToken0 > 0) || !Number.isFinite(poolPriceToken1PerToken0)) {
     if (isUsdg) return clampUsd(qty)
@@ -1055,21 +1057,28 @@ type Cashflow = {
   claimed1: bigint
 }
 
-const FEE_CACHE_KEY = 'uniswap-lp-lifetime-fees-v1'
+const FEE_CACHE_KEY = 'uniswap-lp-lifetime-fees-v2'
+const FEE_CACHE_KEY_LEGACY = 'uniswap-lp-lifetime-fees-v1'
 
 type FeeCacheEntry = {
   claimed0: string
   claimed1: string
-  claimedFeesUsd: number
   updatedAt: number
 }
 
 function readFeeCache(): Record<string, FeeCacheEntry> {
   try {
-    const raw = localStorage.getItem(FEE_CACHE_KEY)
+    const raw = localStorage.getItem(FEE_CACHE_KEY) ?? localStorage.getItem(FEE_CACHE_KEY_LEGACY)
     if (!raw) return {}
-    const parsed = JSON.parse(raw) as Record<string, FeeCacheEntry>
-    return parsed && typeof parsed === 'object' ? parsed : {}
+    const parsed = JSON.parse(raw) as Record<string, FeeCacheEntry & { claimedFeesUsd?: number }>
+    if (!parsed || typeof parsed !== 'object') return {}
+    const out: Record<string, FeeCacheEntry> = {}
+    for (const [k, v] of Object.entries(parsed)) {
+      if (v?.claimed0 != null && v?.claimed1 != null) {
+        out[k] = { claimed0: v.claimed0, claimed1: v.claimed1, updatedAt: v.updatedAt ?? 0 }
+      }
+    }
+    return out
   } catch {
     return {}
   }
@@ -1079,19 +1088,16 @@ function writeFeeCacheEntry(key: string, entry: FeeCacheEntry) {
   try {
     const all = readFeeCache()
     const prev = all[key]
-    // 只升不降：复投后链上「在外余额」为 0 也不能把历史已领清零
     if (
       prev
       && BigInt(prev.claimed0) >= BigInt(entry.claimed0)
       && BigInt(prev.claimed1) >= BigInt(entry.claimed1)
-      && prev.claimedFeesUsd >= entry.claimedFeesUsd
     ) {
       return
     }
     all[key] = {
-      claimed0: (prev && BigInt(prev.claimed0) > BigInt(entry.claimed0) ? prev.claimed0 : entry.claimed0),
-      claimed1: (prev && BigInt(prev.claimed1) > BigInt(entry.claimed1) ? prev.claimed1 : entry.claimed1),
-      claimedFeesUsd: Math.max(prev?.claimedFeesUsd ?? 0, entry.claimedFeesUsd),
+      claimed0: prev && BigInt(prev.claimed0) > BigInt(entry.claimed0) ? prev.claimed0 : entry.claimed0,
+      claimed1: prev && BigInt(prev.claimed1) > BigInt(entry.claimed1) ? prev.claimed1 : entry.claimed1,
       updatedAt: Date.now(),
     }
     localStorage.setItem(FEE_CACHE_KEY, JSON.stringify(all))
@@ -1100,20 +1106,37 @@ function writeFeeCacheEntry(key: string, entry: FeeCacheEntry) {
   }
 }
 
-function mergeCachedLifetimeFees(row: PositionRow, unclaimedFeesUsd: number): PositionRow {
+function computeClaimedFeesUsd(
+  row: Pick<PositionRow, 'token0' | 'token1' | 'price'>,
+  claimed0: bigint,
+  claimed1: bigint,
+  wethUsd: number,
+): number {
+  return clampUsd(
+    tokenUsd(row.token0.address, claimed0, row.token0.decimals, row.price, row.token0.address, row.token1.address, wethUsd)
+    + tokenUsd(row.token1.address, claimed1, row.token1.decimals, row.price, row.token0.address, row.token1.address, wethUsd),
+  )
+}
+
+function mergeCachedLifetimeFees(row: PositionRow, unclaimedFeesUsd: number, wethUsd: number): PositionRow {
   const key = `${row.version}-${row.tokenId.toString()}`
   const cached = readFeeCache()[key]
-  if (!cached) return row
-  const c0 = BigInt(cached.claimed0)
-  const c1 = BigInt(cached.claimed1)
-  const claimed0 = c0 > row.claimed0 ? c0 : row.claimed0
-  const claimed1 = c1 > row.claimed1 ? c1 : row.claimed1
-  const claimedFeesUsd = Math.max(cached.claimedFeesUsd, row.claimedFeesUsd)
+  const claimed0 = cached && BigInt(cached.claimed0) > row.claimed0 ? BigInt(cached.claimed0) : row.claimed0
+  const claimed1 = cached && BigInt(cached.claimed1) > row.claimed1 ? BigInt(cached.claimed1) : row.claimed1
+  const claimedFeesUsd = computeClaimedFeesUsd(row, claimed0, claimed1, wethUsd)
+  if (
+    claimed0 === row.claimed0
+    && claimed1 === row.claimed1
+    && claimedFeesUsd === row.claimedFeesUsd
+    && row.totalFeesUsd === clampUsd(unclaimedFeesUsd + claimedFeesUsd)
+  ) {
+    return row
+  }
   return {
     ...row,
     claimed0,
     claimed1,
-    claimedFeesUsd: clampUsd(claimedFeesUsd),
+    claimedFeesUsd,
     totalFeesUsd: clampUsd(unclaimedFeesUsd + claimedFeesUsd),
   }
 }
@@ -1122,12 +1145,11 @@ function persistLifetimeFees(row: PositionRow) {
   writeFeeCacheEntry(`${row.version}-${row.tokenId.toString()}`, {
     claimed0: row.claimed0.toString(),
     claimed1: row.claimed1.toString(),
-    claimedFeesUsd: row.claimedFeesUsd,
     updatedAt: Date.now(),
   })
 }
 
-/** 分块拉日志，避免 fromBlock=0 一次扫挂死 */
+/** 分块拉日志，避免 fromBlock=0 一次扫挂死；默认 9k 兼容 Alchemy 等 10k 限制 */
 async function getLogsChunked<T>(opts: {
   address: Address
   event: ReturnType<typeof parseAbiItem>
@@ -1136,24 +1158,126 @@ async function getLogsChunked<T>(opts: {
   toBlock: bigint
   span?: bigint
 }): Promise<T[]> {
-  const span = opts.span ?? 120_000n
+  const span = opts.span ?? 9_000n
   const out: T[] = []
   for (let from = opts.fromBlock; from <= opts.toBlock; from += span) {
     const to = from + span - 1n > opts.toBlock ? opts.toBlock : from + span - 1n
+    const req = {
+      address: opts.address,
+      event: opts.event,
+      args: opts.args as never,
+      fromBlock: from,
+      toBlock: to,
+    }
     try {
-      const logs = await publicClient.getLogs({
-        address: opts.address,
-        event: opts.event,
-        args: opts.args as never,
-        fromBlock: from,
-        toBlock: to,
-      })
+      const logs = await publicClient.getLogs(req)
       out.push(...(logs as T[]))
     } catch (e) {
       console.warn('getLogsChunked fail', from.toString(), e)
+      try {
+        await new Promise((r) => setTimeout(r, 400))
+        const logs = await publicClient.getLogs(req)
+        out.push(...(logs as T[]))
+      } catch (e2) {
+        console.warn('getLogsChunked retry fail', from.toString(), e2)
+      }
     }
   }
   return out
+}
+
+const V3_NFT_MINT = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)')
+
+async function v3MintBlock(tokenId: bigint): Promise<bigint | null> {
+  try {
+    const logs = await publicClient.getLogs({
+      address: CONTRACTS.v3Npm,
+      event: V3_NFT_MINT,
+      args: { from: zeroAddress, tokenId },
+      fromBlock: 0n,
+      toBlock: 'latest',
+    })
+    return logs[0]?.blockNumber ?? null
+  } catch {
+    return null
+  }
+}
+
+type NpmAmountLog = { args: { amount0?: bigint; amount1?: bigint }; transactionHash: Hash }
+
+function dedupeNpmLogs<T extends { transactionHash: Hash; logIndex?: number }>(logs: T[]): T[] {
+  const m = new Map<string, T>()
+  for (const l of logs) {
+    m.set(`${l.transactionHash}-${l.logIndex ?? 0}`, l)
+  }
+  return [...m.values()]
+}
+
+async function fetchNpmLogsBlockscout(
+  event: ReturnType<typeof parseAbiItem>,
+  eventName: 'Collect' | 'IncreaseLiquidity' | 'DecreaseLiquidity',
+  tokenId: bigint,
+  fromBlock: bigint,
+): Promise<NpmAmountLog[]> {
+  try {
+    const topics = encodeEventTopics({
+      abi: [event as never],
+      eventName,
+      args: { tokenId },
+    })
+    const t0 = topics[0]
+    const t1 = topics[1]
+    if (!t0 || !t1) return []
+    const url =
+      `${getExplorerApi()}/api?module=logs&action=getLogs` +
+      `&fromBlock=${fromBlock}&toBlock=latest&address=${CONTRACTS.v3Npm}` +
+      `&topic0=${t0}&topic1=${t1}&topic0_1_opr=and`
+    const res = await fetch(url)
+    if (!res.ok) return []
+    const json = (await res.json()) as {
+      status?: string
+      result?: Array<{ data: `0x${string}`; topics: `0x${string}`[]; transactionHash: Hash }>
+    }
+    if (json.status !== '1' || !json.result?.length) return []
+    const out: NpmAmountLog[] = []
+    for (const log of json.result) {
+      try {
+        const decoded = decodeEventLog({
+          abi: [event as never],
+          data: log.data,
+          topics: log.topics,
+        })
+        out.push({
+          args: decoded.args as { amount0?: bigint; amount1?: bigint },
+          transactionHash: log.transactionHash,
+        })
+      } catch {
+        /* skip */
+      }
+    }
+    return out
+  } catch (e) {
+    console.warn('Blockscout NPM logs failed', eventName, tokenId.toString(), e)
+    return []
+  }
+}
+
+async function loadV3NpmLogs(
+  event: ReturnType<typeof parseAbiItem>,
+  eventName: 'Collect' | 'IncreaseLiquidity' | 'DecreaseLiquidity',
+  tokenId: bigint,
+  fromBlock: bigint,
+  toBlock: bigint,
+): Promise<NpmAmountLog[]> {
+  const rpc = await getLogsChunked<NpmAmountLog>({
+    address: CONTRACTS.v3Npm,
+    event,
+    args: { tokenId },
+    fromBlock,
+    toBlock,
+  })
+  if (rpc.length > 0) return rpc
+  return fetchNpmLogsBlockscout(event, eventName, tokenId, fromBlock)
 }
 
 export async function loadPositionCashflow(tokenId: bigint): Promise<Cashflow> {
@@ -1164,36 +1288,20 @@ export async function loadPositionCashflow(tokenId: bigint): Promise<Cashflow> {
   }
   try {
     const latest = await publicClient.getBlockNumber()
-    // 全链回扫太慢；保留足够长窗口覆盖多数仓位生命周期
-    const fromBlock = latest > 3_000_000n ? latest - 3_000_000n : 0n
+    const mintBlock = await v3MintBlock(tokenId)
+    const fromBlock = mintBlock ?? (latest > 3_000_000n ? latest - 3_000_000n : 0n)
     const incEvent = parseAbiItem('event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)')
     const decEvent = parseAbiItem('event DecreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)')
     const colEvent = parseAbiItem('event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)')
 
-    type LogA = { args: { amount0?: bigint; amount1?: bigint }; transactionHash: Hash }
-    const [inc, dec, col] = await Promise.all([
-      getLogsChunked<LogA>({
-        address: CONTRACTS.v3Npm,
-        event: incEvent,
-        args: { tokenId },
-        fromBlock,
-        toBlock: latest,
-      }),
-      getLogsChunked<LogA>({
-        address: CONTRACTS.v3Npm,
-        event: decEvent,
-        args: { tokenId },
-        fromBlock,
-        toBlock: latest,
-      }),
-      getLogsChunked<LogA>({
-        address: CONTRACTS.v3Npm,
-        event: colEvent,
-        args: { tokenId },
-        fromBlock,
-        toBlock: latest,
-      }),
+    const [incRpc, decRpc, colRpc] = await Promise.all([
+      loadV3NpmLogs(incEvent, 'IncreaseLiquidity', tokenId, fromBlock, latest),
+      loadV3NpmLogs(decEvent, 'DecreaseLiquidity', tokenId, fromBlock, latest),
+      loadV3NpmLogs(colEvent, 'Collect', tokenId, fromBlock, latest),
     ])
+    const inc = dedupeNpmLogs(incRpc)
+    const dec = dedupeNpmLogs(decRpc)
+    const col = dedupeNpmLogs(colRpc)
 
     let deposited0 = 0n
     let deposited1 = 0n
@@ -1458,7 +1566,7 @@ export async function loadV3Positions(owner: Address): Promise<PositionRow[]> {
           poolAddress: poolAddr,
           tickSpacing: pool.tickSpacing,
           sqrtPriceX96: pool.sqrtPriceX96,
-        }, unclaimedFeesUsd)
+        }, unclaimedFeesUsd, wethUsd)
         return row
       } catch (e) {
         console.warn('skip V3 position', tokenId.toString(), e)
@@ -1477,10 +1585,20 @@ async function listV4TokenIds(
   const deep = Boolean(opts?.deep)
   const npm = CONTRACTS.v4PositionManager.toLowerCase()
   const own = owner.toLowerCase()
+  const chainId = getActiveChainId()
+  const cacheKey = `rangedesk.v4ids.${chainId}.${own}`
   const ids = new Set<string>()
   const add = (id: bigint | string | undefined | null) => {
     if (id == null || id === '') return
     ids.add(typeof id === 'bigint' ? id.toString() : String(id))
+  }
+
+  // 本地缓存：先展示上次扫到的 id，再校验 owner（快路径）
+  try {
+    const cached = JSON.parse(localStorage.getItem(cacheKey) || '[]') as string[]
+    if (Array.isArray(cached)) for (const id of cached) add(id)
+  } catch {
+    /* ignore */
   }
 
   let balance = 0n
@@ -1500,63 +1618,113 @@ async function listV4TokenIds(
       : '扫描 V4 NFT…',
   )
 
-  // 1) 针对 PositionManager 的实例列表（比全量 /nft 小得多）
-  try {
-    let url: string | null =
-      `https://robinhoodchain.blockscout.com/api/v2/tokens/${CONTRACTS.v4PositionManager}/instances?holder_address_hash=${owner}`
-    for (let page = 0; page < (deep ? 20 : 10) && url; page++) {
-      const json = await fetchJson<{
-        items?: Array<{ id?: string; token_id?: string }>
-        next_page_params?: Record<string, string | number>
-      }>(url, deep ? 14_000 : 10_000)
-      for (const it of json.items ?? []) add(it.id ?? it.token_id)
-      if (json.next_page_params) {
-        const q = new URLSearchParams(
-          Object.entries(json.next_page_params).map(([k, v]) => [k, String(v)]),
-        ).toString()
-        url = `https://robinhoodchain.blockscout.com/api/v2/tokens/${CONTRACTS.v4PositionManager}/instances?holder_address_hash=${owner}&${q}`
-      } else {
-        url = null
-      }
-    }
-  } catch (e) {
-    console.warn('Blockscout V4 instances failed', e)
+  // 校验缓存 id 是否仍属本人（并行、限并发）
+  if (ids.size > 0) {
+    const cachedList = [...ids]
+    ids.clear()
+    await Promise.all(
+      cachedList.map(async (idStr) => {
+        try {
+          const who = await publicClient.readContract({
+            address: CONTRACTS.v4PositionManager,
+            abi: v4PositionManagerAbi,
+            functionName: 'ownerOf',
+            args: [BigInt(idStr)],
+          })
+          if (who.toLowerCase() === own) add(idStr)
+        } catch {
+          /* burned / transferred */
+        }
+      }),
+    )
   }
 
-  // 2) 全量 NFT 页兜底（只在条数仍不足时）
+  const complete = () => balance > 0n && BigInt(ids.size) >= balance
+
+  // 1) Blockscout / explorer 实例列表（通常最快最全）
+  if (!complete() || deep) {
+    try {
+      let url: string | null =
+        `${getExplorerApi()}/api/v2/tokens/${CONTRACTS.v4PositionManager}/instances?holder_address_hash=${owner}`
+      for (let page = 0; page < (deep ? 20 : 8) && url; page++) {
+        const json = await fetchJson<{
+          items?: Array<{ id?: string; token_id?: string }>
+          next_page_params?: Record<string, string | number>
+        }>(url, deep ? 12_000 : 8_000)
+        for (const it of json.items ?? []) add(it.id ?? it.token_id)
+        if (json.next_page_params) {
+          const q = new URLSearchParams(
+            Object.entries(json.next_page_params).map(([k, v]) => [k, String(v)]),
+          ).toString()
+          url = `${getExplorerApi()}/api/v2/tokens/${CONTRACTS.v4PositionManager}/instances?holder_address_hash=${owner}&${q}`
+        } else {
+          url = null
+        }
+        if (!deep && complete()) break
+      }
+    } catch (e) {
+      console.warn('Blockscout V4 instances failed', e)
+    }
+  }
+
+  // 已齐则直接返回（普通刷新跳过慢速 ownerOf/Transfer）
+  if (!deep && complete()) {
+    const list = [...ids].map((x) => BigInt(x)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+    try {
+      localStorage.setItem(cacheKey, JSON.stringify(list.map((x) => x.toString())))
+    } catch {
+      /* ignore */
+    }
+    opts?.onStatus?.(`已找到 ${list.length} 个 V4 NFT（快路径）`)
+    return list
+  }
+
+  // 2) 全量 NFT 页兜底
   if (ids.size < Number(balance) || (ids.size === 0 && balance === 0n)) {
     try {
       let url: string | null =
-        `https://robinhoodchain.blockscout.com/api/v2/addresses/${owner}/nft?type=ERC-721`
-      for (let page = 0; page < (deep ? 12 : 6) && url; page++) {
+        `${getExplorerApi()}/api/v2/addresses/${owner}/nft?type=ERC-721`
+      for (let page = 0; page < (deep ? 12 : 4) && url; page++) {
         const json = await fetchJson<{
           items?: Array<{ id?: string; token?: { address_hash?: string; address?: string } }>
           next_page_params?: Record<string, string>
-        }>(url, 8_000)
+        }>(url, 6_000)
         for (const it of json.items ?? []) {
           const addr = (it.token?.address_hash || it.token?.address || '').toLowerCase()
           if (addr === npm && it.id) add(it.id)
         }
         if (json.next_page_params) {
           const q = new URLSearchParams(json.next_page_params as Record<string, string>).toString()
-          url = `https://robinhoodchain.blockscout.com/api/v2/addresses/${owner}/nft?type=ERC-721&${q}`
+          url = `${getExplorerApi()}/api/v2/addresses/${owner}/nft?type=ERC-721&${q}`
         } else {
           url = null
         }
+        if (!deep && complete()) break
       }
     } catch (e) {
       console.warn('Blockscout V4 NFT list failed', e)
     }
   }
 
-  // 3) 近端 ownerOf：捕捉 Blockscout 尚未索引的新 mint
+  if (!deep && complete()) {
+    const list = [...ids].map((x) => BigInt(x)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+    try {
+      localStorage.setItem(cacheKey, JSON.stringify(list.map((x) => x.toString())))
+    } catch {
+      /* ignore */
+    }
+    opts?.onStatus?.(`已找到 ${list.length} 个 V4 NFT`)
+    return list
+  }
+
+  // 3) 近端 ownerOf：仅补漏；普通刷新只探最近一小段
   try {
     const nextId = await publicClient.readContract({
       address: CONTRACTS.v4PositionManager,
       abi: v4PositionManagerAbi,
       functionName: 'nextTokenId',
     })
-    const probe = deep ? 800n : 300n
+    const probe = deep ? 500n : chainId === 8453 ? 80n : 120n
     const start = nextId > probe ? nextId - probe : 1n
     opts?.onStatus?.(`校验近 ${probe.toString()} 个 V4 tokenId…`)
     const batch = 40n
@@ -1582,29 +1750,44 @@ async function listV4TokenIds(
         )
       }
       await Promise.all(checks)
-      if (!deep && ids.size >= Number(balance) && balance > 0n) break
+      if (!deep && complete()) break
     }
   } catch (e) {
     console.warn('V4 ownerOf probe failed', e)
   }
 
-  // 4) Transfer 日志：始终合并（不再因 Blockscout 有结果就跳过）
-  const needMore = balance > 0n && BigInt(ids.size) < balance
-  const lookback = deep || needMore ? 1_500_000n : 400_000n
-  try {
-    opts?.onStatus?.(`扫链上 Transfer（回溯 ${lookback.toString()} 块）…`)
-    const fromLogs = await withTimeout(
-      scanV4TokenIdsByLogs(owner, lookback),
-      deep ? 60_000 : 25_000,
-      'V4 事件索引',
+  // 4) 链上 Transfer 扫块：仅「深度扫描」才做。
+  // 普通刷新绝不回溯几万块——Base 公共 RPC 极慢；索引用 Blockscout（类似 Uniswap Subgraph，但免 API Key）。
+  // Uniswap 官方 GraphQL/The Graph 需鉴权，本地工具默认不依赖。
+  if (deep) {
+    const lookback = chainId === 8453 ? 120_000n : 800_000n
+    try {
+      opts?.onStatus?.(`深度扫描：扫链上 Transfer（回溯 ${lookback.toString()} 块）…`)
+      const fromLogs = await withTimeout(
+        scanV4TokenIdsByLogs(owner, lookback),
+        40_000,
+        'V4 事件索引',
+      )
+      for (const id of fromLogs) add(id)
+    } catch (e) {
+      console.warn('V4 event scan failed or timed out', e)
+    }
+  } else if (balance > 0n && BigInt(ids.size) < balance) {
+    opts?.onStatus?.(
+      `索引到 ${ids.size}/${balance.toString()} 个 V4 NFT（未扫块；漏仓请点「深度扫描」）`,
     )
-    for (const id of fromLogs) add(id)
-  } catch (e) {
-    console.warn('V4 event scan failed or timed out', e)
   }
 
-  opts?.onStatus?.(`已找到 ${ids.size} 个 V4 NFT（链上余额 ${balance.toString()}）`)
-  return [...ids].map((x) => BigInt(x)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const list = [...ids].map((x) => BigInt(x)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  try {
+    localStorage.setItem(cacheKey, JSON.stringify(list.map((x) => x.toString())))
+  } catch {
+    /* ignore */
+  }
+  if (!(balance > 0n && BigInt(ids.size) < balance && !deep)) {
+    opts?.onStatus?.(`已找到 ${list.length} 个 V4 NFT（链上余额 ${balance.toString()}）`)
+  }
+  return list
 }
 
 async function scanV4TokenIdsByLogs(owner: Address, lookbackBlocks: bigint): Promise<bigint[]> {
@@ -1613,7 +1796,8 @@ async function scanV4TokenIdsByLogs(owner: Address, lookbackBlocks: bigint): Pro
   )
   const latest = await publicClient.getBlockNumber()
   const owned = new Set<string>()
-  const span = 40_000n
+  // Base / 多数公共 RPC 对 eth_getLogs 窗口很严
+  const span = getActiveChainId() === 8453 ? 2_000n : 8_000n
   const start = latest > lookbackBlocks ? latest - lookbackBlocks : 0n
   for (let from = start; from <= latest; from += span) {
     const to = from + span - 1n > latest ? latest : from + span - 1n
@@ -1660,7 +1844,7 @@ async function v4MintBlock(tokenId: bigint): Promise<bigint | null> {
     const json = await fetchJson<{
       items?: Array<{ block_number?: number; from?: { hash?: string } }>
     }>(
-      `https://robinhoodchain.blockscout.com/api/v2/tokens/${CONTRACTS.v4PositionManager}/instances/${tokenId.toString()}/transfers`,
+      `${getExplorerApi()}/api/v2/tokens/${CONTRACTS.v4PositionManager}/instances/${tokenId.toString()}/transfers`,
       8_000,
     )
     const mint = (json.items ?? []).find(
@@ -1689,7 +1873,7 @@ async function collectV4ModifyLogs(opts: {
   const { poolId, tokenId, fromBlock } = opts
   const salt = v4Salt(tokenId).toLowerCase()
   const latest = await publicClient.getBlockNumber()
-  const span = 25_000n
+  const span = getActiveChainId() === 8453 ? 2_000n : 8_000n
   const out: Array<{
     blockNumber: bigint
     transactionHash: Hash
@@ -1895,7 +2079,7 @@ export async function enrichPositionsLifetimeFees(
   await Promise.all(
     rows.map(async (row, idx) => {
       const unclaimedFeesUsd = row.fees0Usd + row.fees1Usd
-      let next = mergeCachedLifetimeFees(row, unclaimedFeesUsd)
+      let next = mergeCachedLifetimeFees(row, unclaimedFeesUsd, wethUsd)
       try {
         const principalUsd = row.amount0Usd + row.amount1Usd
         if (row.version === 'v3') {
@@ -1917,7 +2101,7 @@ export async function enrichPositionsLifetimeFees(
             liquidity: row.liquidity,
           }
           const pnl = enrichPnl(pool, wethUsd, principalUsd, unclaimedFeesUsd, cf)
-          next = mergeCachedLifetimeFees({ ...row, ...pnl }, unclaimedFeesUsd)
+          next = mergeCachedLifetimeFees({ ...row, ...pnl }, unclaimedFeesUsd, wethUsd)
         } else if (row.version === 'v4' && row.poolId) {
           const cf = await withTimeout(
             loadV4PositionCashflow({
@@ -1946,11 +2130,11 @@ export async function enrichPositionsLifetimeFees(
             hooks: row.hooks,
           }
           const pnl = enrichPnl(pool, wethUsd, principalUsd, unclaimedFeesUsd, cf)
-          next = mergeCachedLifetimeFees({ ...row, ...pnl }, unclaimedFeesUsd)
+          next = mergeCachedLifetimeFees({ ...row, ...pnl }, unclaimedFeesUsd, wethUsd)
         }
       } catch (e) {
         console.warn('enrich lifetime fees fail', row.tokenId.toString(), e)
-        next = mergeCachedLifetimeFees(row, unclaimedFeesUsd)
+        next = mergeCachedLifetimeFees(row, unclaimedFeesUsd, wethUsd)
       }
       persistLifetimeFees(next)
       out[idx] = next
@@ -2053,7 +2237,7 @@ export async function loadV4Positions(
           tickSpacing: Number(poolKey.tickSpacing),
           hooks: poolKey.hooks,
           sqrtPriceX96: pool.sqrtPriceX96,
-        }, unclaimedFeesUsd)
+        }, unclaimedFeesUsd, wethUsd)
         return row
       } catch (e) {
         console.warn('skip V4 position', tokenId.toString(), e)
