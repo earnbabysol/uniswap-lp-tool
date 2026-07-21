@@ -29,6 +29,7 @@ import {
   isEthLikeCurrency,
   isNativeCurrency,
   loadPoolFromInput,
+  loadPoolDepth,
   loadV3Pool,
   loadV4Pool,
   burnVacantV3Nfts,
@@ -36,11 +37,13 @@ import {
   loadV3Positions,
   loadV4Positions,
   enrichPositionsLifetimeFees,
+  isOneSidedRangeStale,
   mintV3Position,
   mintV4Position,
   pairHasWeth,
   removeV3Liquidity,
   removeV4Liquidity,
+  rebalanceV3,
   resolveTokenMeta,
   scanV3Pools,
   scanV4Pools,
@@ -51,9 +54,13 @@ import {
   suggestV4TickSpacing,
   unwrapWeth,
   wrapEth,
+  loadV4PoolById,
+  type PoolDepth,
   type PoolInfo,
   type PositionRow,
 } from './lp'
+import { RangeDepthChart } from './RangeDepthChart'
+import { PositionDetailCard, estimateRebalanceHalfPercent } from './PositionDetailCard'
 import { parseAmount, formatPrice, formatUsd, pairAmountForRange, formatAmountExact, priceToClosestTick, priceToSqrtPriceX96, tickToPrice } from './math'
 import { withTimeout } from './async'
 import {
@@ -219,6 +226,9 @@ export default function App() {
   const [rangeMode, setRangeMode] = useState<RangeMode>('percent')
   const [priceLo, setPriceLo] = useState('')
   const [priceHi, setPriceHi] = useState('')
+  const [poolDepth, setPoolDepth] = useState<PoolDepth | null>(null)
+  const [depthLoading, setDepthLoading] = useState(false)
+  const [depthError, setDepthError] = useState<string | null>(null)
   const [useNativeEth, setUseNativeEth] = useState(true)
   const [mintProtocol, setMintProtocol] = useState<'v3' | 'v4'>('v3')
   const [initPrice, setInitPrice] = useState('')
@@ -245,6 +255,12 @@ export default function App() {
     () => positions.find((p) => `${p.version}-${p.tokenId}` === selectedId) ?? null,
     [positions, selectedId],
   )
+
+  useEffect(() => {
+    if (!selectedId) return
+    const el = document.getElementById('position-detail-card')
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  }, [selectedId])
 
   const summary = useMemo(() => {
     const totalUsd = positions.reduce((s, p) => s + p.totalUsd, 0)
@@ -813,6 +829,40 @@ export default function App() {
       return null
     }
   }, [pool, percentLower, percentUp, rangeMode, priceLo, priceHi])
+
+  // 池子变化时加载深度剖面（不阻塞表单）
+  useEffect(() => {
+    if (!pool) {
+      setPoolDepth(null)
+      setDepthError(null)
+      setDepthLoading(false)
+      return
+    }
+    let cancelled = false
+    setDepthLoading(true)
+    setDepthError(null)
+    void loadPoolDepth(pool)
+      .then((d) => {
+        if (cancelled) return
+        setPoolDepth(d)
+        setDepthLoading(false)
+      })
+      .catch((e) => {
+        if (cancelled) return
+        setPoolDepth(null)
+        setDepthError(e instanceof Error ? e.message : '深度加载失败')
+        setDepthLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [pool?.poolAddress, pool?.poolId, pool?.tick, pool?.liquidity, pool?.version])
+
+  const onDepthRangeChange = useCallback((range: { coinLower: number; coinUpper: number }) => {
+    setRangeMode('custom')
+    setPriceLo(formatPrice(range.coinLower))
+    setPriceHi(formatPrice(range.coinUpper))
+  }, [])
 
   // 切到单边区间时清掉不需要的那一侧输入
   useEffect(() => {
@@ -1592,51 +1642,124 @@ export default function App() {
           )}
 
           {selected && (
-            <div className="actions">
-              <div className="actions-head">
-                <h3>
-                  操作 · {selected.token0.symbol}/{selected.token1.symbol} #{selected.tokenId.toString()}
-                </h3>
-                <div className="btn-row tight">
-                  <button className="btn ghost" type="button" onClick={() => copyText(selected.tokenId.toString())}>复制 NFT ID</button>
-                  {selected.poolAddress && (
-                    <a className="btn ghost" href={explorerAddress(selected.poolAddress)} target="_blank" rel="noreferrer">看池子 ↗</a>
-                  )}
-                </div>
-              </div>
-
+            <PositionDetailCard
+              position={selected}
+              busy={busy}
+              poolHref={selected.poolAddress ? explorerAddress(selected.poolAddress) : null}
+              onCopyId={() => copyText(selected.tokenId.toString())}
+              onCollect={() => void run(
+                selected.version === 'v4'
+                  ? 'Claim V4'
+                  : (addUseEth ? 'Claim→ETH' : 'Claim'),
+                () => selected.version === 'v4'
+                  ? claimV4({ walletClient: wallet!, owner: address!, position: selected })
+                  : claimV3({
+                    walletClient: wallet!,
+                    owner: address!,
+                    tokenId: selected.tokenId,
+                    unwrapEth: addUseEth,
+                    token0: selected.token0.address,
+                    token1: selected.token1.address,
+                  }),
+                `${selected.token0.symbol}/${selected.token1.symbol}`,
+              )}
+              onClose={() => {
+                const ok = window.confirm(
+                  `确认关闭仓位（全撤 100%）？\n${selected.token0.symbol}/${selected.token1.symbol} #${selected.tokenId}`,
+                )
+                if (!ok) return
+                void run(selected.version === 'v4' ? '关闭 V4' : '关闭仓位', async () => {
+                  const hash = selected.version === 'v4'
+                    ? await removeV4Liquidity({
+                      walletClient: wallet!,
+                      owner: address!,
+                      position: selected,
+                      percent: 100,
+                      burnEmpty: true,
+                    })
+                    : await removeV3Liquidity({
+                      walletClient: wallet!,
+                      owner: address!,
+                      position: selected,
+                      percent: 100,
+                      burnEmpty: true,
+                      slippageBps,
+                      unwrapEth: addUseEth,
+                    })
+                  setSelectedId(null)
+                  return { hash }
+                }, `${selected.token0.symbol}/${selected.token1.symbol}`)
+              }}
+              onRebalance={() => {
+                if (selected.version === 'v3') {
+                  const half = estimateRebalanceHalfPercent(selected)
+                  const ok = window.confirm(
+                    `Rebalance V3：全撤后按现价重开约 ±${half.toFixed(1)}% 区间。\n单边仓常无需 swap。\n#${selected.tokenId}`,
+                  )
+                  if (!ok) return
+                  void run('Rebalance V3', () => rebalanceV3({
+                    walletClient: wallet!,
+                    owner: address!,
+                    position: selected,
+                    percent: half,
+                    slippageBps,
+                  }), `${selected.token0.symbol}/${selected.token1.symbol}`)
+                  return
+                }
+                const ok = window.confirm(
+                  `V4 暂无一键 Rebalance：将先全撤，再跳到「新建仓」预填同池与等宽币价区间。\n#${selected.tokenId}`,
+                )
+                if (!ok) return
+                const cq = getPositionCoinPrices(selected)
+                const width = Math.max(cq.coinPriceUpper - cq.coinPriceLower, 0)
+                const spot = cq.coinPrice
+                const halfW = width > 0 ? width / 2 : spot * 0.1
+                const nextLo = Math.max(spot - halfW, spot * 1e-6)
+                const nextHi = spot + halfW
+                void run('关闭并去新建仓', async () => {
+                  const hash = await removeV4Liquidity({
+                    walletClient: wallet!,
+                    owner: address!,
+                    position: selected,
+                    percent: 100,
+                    burnEmpty: true,
+                  })
+                  setSelectedId(null)
+                  setMintProtocol('v4')
+                  setTokenA(cq.coin.address)
+                  setTokenB(cq.quote.address)
+                  setFee(selected.fee)
+                  if (selected.tickSpacing) setV4TickSpacing(selected.tickSpacing)
+                  setRangeMode('custom')
+                  setPriceLo(formatPrice(nextLo))
+                  setPriceHi(formatPrice(nextHi))
+                  try {
+                    if (selected.hooks != null && selected.tickSpacing) {
+                      const info = await loadV4Pool({
+                        currency0: selected.token0.address,
+                        currency1: selected.token1.address,
+                        fee: selected.fee,
+                        tickSpacing: selected.tickSpacing,
+                        hooks: selected.hooks,
+                      })
+                      setPool(info)
+                    } else if (selected.poolId) {
+                      setPool(await loadV4PoolById(selected.poolId))
+                    }
+                  } catch (e) {
+                    console.warn('prefill V4 pool failed', e)
+                  }
+                  setTab('mint')
+                  return { hash }
+                }, `${selected.token0.symbol}/${selected.token1.symbol}`)
+              }}
+            >
               {selectedUsesWeth && (
                 <label className="inline-setting check" style={{ marginBottom: 10 }}>
                   <input type="checkbox" checked={useNativeEth} onChange={(e) => setUseNativeEth(e.target.checked)} />
                   用原生 ETH：加仓付 ETH / Claim·撤出收 ETH（不经 WETH）
                 </label>
               )}
-
-              <div className="btn-row">
-                <button
-                  className="btn"
-                  disabled={busy}
-                  onClick={() => void run(
-                    selected.version === 'v4'
-                      ? 'Claim V4'
-                      : (addUseEth ? 'Claim→ETH' : 'Claim'),
-                    () => selected.version === 'v4'
-                      ? claimV4({ walletClient: wallet!, owner: address!, position: selected })
-                      : claimV3({
-                        walletClient: wallet!,
-                        owner: address!,
-                        tokenId: selected.tokenId,
-                        unwrapEth: addUseEth,
-                        token0: selected.token0.address,
-                        token1: selected.token1.address,
-                      }),
-                    `${selected.token0.symbol}/${selected.token1.symbol}`,
-                  )}
-                >
-                  Claim 手续费{selected.version === 'v3' && addUseEth ? '（收 ETH）' : ''}
-                  {selected.version === 'v4' ? ' · V4' : ''}
-                </button>
-              </div>
 
               <div className="op-block">
                 <h4>向该仓位加仓</h4>
@@ -1774,8 +1897,7 @@ export default function App() {
                   撤出 {removePct}%{selected.version === 'v4' ? ' · V4' : ''}
                 </button>
               </div>
-
-            </div>
+            </PositionDetailCard>
           )}
         </section>
       )}
@@ -2143,6 +2265,11 @@ export default function App() {
                     {rangePreview?.coinSymbol ?? getCoinQuote(pool).coin.symbol}
                   </span>
                 </div>
+                {pool.version === 'v4' && pool.hooks && pool.hooks.toLowerCase() !== '0x0000000000000000000000000000000000000000' && (
+                  <p className="hook-warn">
+                    含自定义 Hook（{shortAddr(pool.hooks)}），可能拒绝外部流动性或改变费用逻辑，开仓前请确认。
+                  </p>
+                )}
               </div>
 
               <div className={`mint-range ${rangePreview?.inRangePreview === false ? 'out' : 'in'}`}>
@@ -2154,6 +2281,17 @@ export default function App() {
                     <button type="button" className={`chip ${rangeMode === 'full' ? 'on' : ''}`} onClick={() => setRangeMode('full')}>全区间</button>
                   </div>
                 </div>
+
+                <RangeDepthChart
+                  pool={pool}
+                  depth={poolDepth}
+                  loading={depthLoading}
+                  error={depthError}
+                  coinLower={rangePreview?.coinPriceLower ?? null}
+                  coinUpper={rangePreview?.coinPriceUpper ?? null}
+                  fullRange={rangeMode === 'full'}
+                  onRangeChange={onDepthRangeChange}
+                />
 
                 {rangeMode === 'full' ? (
                   <p className="mint-full-hint">全区间：使用当前池 tickSpacing 对齐的最小/最大 tick，V3/V4 均适用。流动性覆盖全部价格。</p>
@@ -2397,30 +2535,57 @@ export default function App() {
                       setStatus('请先输入数量')
                       return
                     }
-                    if (pool.version === 'v4' || mintProtocol === 'v4') {
-                      void run('Mint V4', () => mintV4Position({
+                    const plannedTick = pool.tick
+                    const ticks = mintTicks
+                    const isV4 = pool.version === 'v4' || mintProtocol === 'v4'
+                    void run(isV4 ? 'Mint V4' : 'Mint', async () => {
+                      const live = isV4
+                        ? (pool.hooks != null && pool.tickSpacing
+                          ? await loadV4Pool({
+                            currency0: pool.token0.address,
+                            currency1: pool.token1.address,
+                            fee: pool.fee,
+                            tickSpacing: pool.tickSpacing,
+                            hooks: pool.hooks,
+                          })
+                          : await findV4Pool(pool.token0.address, pool.token1.address, pool.fee).then((p) => {
+                            if (!p) throw new Error('刷新 V4 池失败')
+                            return p
+                          }))
+                        : await loadV3Pool(pool.poolAddress!)
+                      setPool(live)
+                      if (isOneSidedRangeStale({
+                        plannedTick,
+                        liveTick: live.tick,
+                        tickLower: ticks.tickLower,
+                        tickUpper: ticks.tickUpper,
+                      })) {
+                        throw new Error('现价已变化，单边区间过期，请重设区间后再 Mint')
+                      }
+                      if (isV4) {
+                        return mintV4Position({
+                          walletClient: wallet!,
+                          owner: address!,
+                          pool: live,
+                          amount0: parseAmount(a0, live.token0.decimals),
+                          amount1: parseAmount(a1, live.token1.decimals),
+                          tickLower: ticks.tickLower,
+                          tickUpper: ticks.tickUpper,
+                          useNativeEth: mintUseEth,
+                          slippageBps,
+                        })
+                      }
+                      return mintV3Position({
                         walletClient: wallet!,
                         owner: address!,
-                        pool,
-                        amount0: parseAmount(a0, pool.token0.decimals),
-                        amount1: parseAmount(a1, pool.token1.decimals),
-                        tickLower: mintTicks.tickLower,
-                        tickUpper: mintTicks.tickUpper,
+                        pool: live,
+                        amount0: parseAmount(a0, live.token0.decimals),
+                        amount1: parseAmount(a1, live.token1.decimals),
+                        tickLower: ticks.tickLower,
+                        tickUpper: ticks.tickUpper,
                         useNativeEth: mintUseEth,
-                        slippageBps,
-                      }), `${pool.token0.symbol}/${pool.token1.symbol}`)
-                      return
-                    }
-                    void run('Mint', () => mintV3Position({
-                      walletClient: wallet!,
-                      owner: address!,
-                      pool,
-                      amount0: parseAmount(a0, pool.token0.decimals),
-                      amount1: parseAmount(a1, pool.token1.decimals),
-                      tickLower: mintTicks.tickLower,
-                      tickUpper: mintTicks.tickUpper,
-                      useNativeEth: mintUseEth,
-                    }), `${pool.token0.symbol}/${pool.token1.symbol}`)
+                      })
+                    }, `${pool.token0.symbol}/${pool.token1.symbol}`)
                   }}
                 >
                   Mint {pool?.version === 'v4' || mintProtocol === 'v4' ? 'V4' : 'V3'} 开仓{mintUseEth ? '（ETH）' : ''}

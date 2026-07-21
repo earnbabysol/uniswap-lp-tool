@@ -200,6 +200,181 @@ export async function loadV3Pool(poolAddress: Address): Promise<PoolInfo> {
   }
 }
 
+export type DepthBar = {
+  tick: number
+  /** 币价口径（与 getCoinQuote 一致） */
+  coinPrice: number
+  liquidity: number
+}
+
+export type PoolDepth = {
+  bars: DepthBar[]
+  currentTick: number
+  currentCoinPrice: number
+  tickSpacing: number
+  invert: boolean
+  coinSymbol: string
+  quoteSymbol: string
+  /** 无柱状数据时仍可拖拽（如部分 V4） */
+  hasLiquidityProfile: boolean
+}
+
+function alignTickDown(tick: number, spacing: number): number {
+  return Math.floor(tick / spacing) * spacing
+}
+
+/**
+ * 读池子附近流动性深度，供拖拽区间图使用。
+ * V3：按 tickSpacing 采样 liquidityNet 并累加；V4：尽量用 StateView，失败则仅返回现价轴。
+ */
+export async function loadPoolDepth(
+  pool: PoolInfo,
+  opts?: { halfWidthSteps?: number },
+): Promise<PoolDepth> {
+  const quote = getCoinQuote(pool)
+  const spacing = Math.max(1, pool.tickSpacing)
+  const steps = opts?.halfWidthSteps ?? 48
+  const currentAligned = alignTickDown(pool.tick, spacing)
+  const tickMin = currentAligned - steps * spacing
+  const tickMax = currentAligned + steps * spacing
+
+  const empty = (): PoolDepth => ({
+    bars: [],
+    currentTick: pool.tick,
+    currentCoinPrice: quote.spot,
+    tickSpacing: spacing,
+    invert: quote.invert,
+    coinSymbol: quote.coin.symbol,
+    quoteSymbol: quote.quote.symbol,
+    hasLiquidityProfile: false,
+  })
+
+  const tickToCoin = (tick: number) => {
+    const poolPrice = tickToPrice(tick, pool.token0.decimals, pool.token1.decimals)
+    return poolPriceToCoinPrice(poolPrice, quote.invert)
+  }
+
+  const netByTick = new Map<number, bigint>()
+  const ticks: number[] = []
+  for (let t = tickMin; t <= tickMax; t += spacing) ticks.push(t)
+
+  try {
+    if (pool.version === 'v3' && pool.poolAddress) {
+      const addr = pool.poolAddress
+      const batch = 24
+      for (let i = 0; i < ticks.length; i += batch) {
+        const slice = ticks.slice(i, i + batch)
+        const rows = await Promise.all(
+          slice.map((tick) =>
+            publicClient
+              .readContract({
+                address: addr,
+                abi: v3PoolAbi,
+                functionName: 'ticks',
+                args: [tick],
+              })
+              .then((r) => ({ tick, net: r[1] as bigint, init: Boolean(r[7]) }))
+              .catch(() => ({ tick, net: 0n, init: false })),
+          ),
+        )
+        for (const r of rows) {
+          if (r.init || r.net !== 0n) netByTick.set(r.tick, r.net)
+        }
+      }
+    } else if (pool.version === 'v4' && pool.poolId) {
+      const poolId = pool.poolId
+      const batch = 24
+      for (let i = 0; i < ticks.length; i += batch) {
+        const slice = ticks.slice(i, i + batch)
+        const rows = await Promise.all(
+          slice.map((tick) =>
+            publicClient
+              .readContract({
+                address: CONTRACTS.v4StateView,
+                abi: v4StateViewAbi,
+                functionName: 'getTickLiquidity',
+                args: [poolId, tick],
+              })
+              .then((r) => ({ tick, net: r[1] as bigint, gross: r[0] as bigint }))
+              .catch(() => ({ tick, net: 0n, gross: 0n })),
+          ),
+        )
+        for (const r of rows) {
+          if (r.gross > 0n || r.net !== 0n) netByTick.set(r.tick, r.net)
+        }
+      }
+    } else {
+      return empty()
+    }
+  } catch (e) {
+    console.warn('loadPoolDepth failed', e)
+    return empty()
+  }
+
+  // 从现价向两侧累加 liquidityNet，得到每段 [tick, tick+spacing) 的 active liquidity
+  const liqAt = new Map<number, number>()
+  const clip = (v: bigint) => Number(v < 0n ? 0n : v > 2n ** 90n ? 2n ** 90n : v)
+
+  {
+    let liq = pool.liquidity
+    liqAt.set(currentAligned, clip(liq))
+    for (let t = currentAligned + spacing; t <= tickMax; t += spacing) {
+      liq = liq + (netByTick.get(t) ?? 0n)
+      liqAt.set(t, clip(liq))
+    }
+  }
+  {
+    let liq = pool.liquidity
+    for (let t = currentAligned - spacing; t >= tickMin; t -= spacing) {
+      liq = liq - (netByTick.get(t + spacing) ?? 0n)
+      liqAt.set(t, clip(liq))
+    }
+  }
+
+  const bars: DepthBar[] = ticks.map((tick) => ({
+    tick,
+    coinPrice: tickToCoin(tick),
+    liquidity: liqAt.get(tick) ?? 0,
+  }))
+
+  // 若几乎全 0，仍返回 bars 供坐标轴，但标记无剖面
+  const maxL = bars.reduce((m, b) => Math.max(m, b.liquidity), 0)
+  return {
+    bars,
+    currentTick: pool.tick,
+    currentCoinPrice: quote.spot,
+    tickSpacing: spacing,
+    invert: quote.invert,
+    coinSymbol: quote.coin.symbol,
+    quoteSymbol: quote.quote.symbol,
+    hasLiquidityProfile: maxL > 0,
+  }
+}
+
+/**
+ * Mint 前复检：开仓时若是单边（现价在区间外），发送前现价已进入区间或翻到另一侧 → 视为过期。
+ */
+export function isOneSidedRangeStale(opts: {
+  plannedTick: number
+  liveTick: number
+  tickLower: number
+  tickUpper: number
+}): boolean {
+  const { plannedTick, liveTick, tickLower, tickUpper } = opts
+  if (tickLower >= tickUpper) return true
+  const plannedIn = plannedTick >= tickLower && plannedTick < tickUpper
+  if (plannedIn) return false
+  const liveIn = liveTick >= tickLower && liveTick < tickUpper
+  if (liveIn) return true
+  const plannedBelow = plannedTick < tickLower
+  const plannedAbove = plannedTick >= tickUpper
+  const liveBelow = liveTick < tickLower
+  const liveAbove = liveTick >= tickUpper
+  if (plannedBelow && liveAbove) return true
+  if (plannedAbove && liveBelow) return true
+  return false
+}
+
 export async function findV3Pool(tokenA: Address, tokenB: Address, fee: number): Promise<Address | null> {
   const pool = await publicClient.readContract({
     address: CONTRACTS.v3Factory,

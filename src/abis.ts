@@ -64,6 +64,11 @@ export const v3PoolAbi = [
       { name: 'initialized', type: 'bool' },
     ],
   },
+  {
+    type: 'function', name: 'tickBitmap', stateMutability: 'view',
+    inputs: [{ name: 'wordPosition', type: 'int16' }],
+    outputs: [{ type: 'uint256' }],
+  },
 ] as const
 
 export const v3NpmAbi = [
@@ -275,6 +280,17 @@ export const v4StateViewAbi = [
     outputs: [
       { name: 'feeGrowthInside0X128', type: 'uint256' },
       { name: 'feeGrowthInside1X128', type: 'uint256' },
+    ],
+  },
+  {
+    type: 'function', name: 'getTickLiquidity', stateMutability: 'view',
+    inputs: [
+      { name: 'poolId', type: 'bytes32' },
+      { name: 'tick', type: 'int24' },
+    ],
+    outputs: [
+      { name: 'liquidityGross', type: 'uint128' },
+      { name: 'liquidityNet', type: 'int128' },
     ],
   },
 ] as const
