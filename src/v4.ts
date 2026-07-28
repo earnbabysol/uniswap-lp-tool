@@ -818,6 +818,11 @@ export async function increaseV4Liquidity(opts: {
   amount1: bigint
   useNativeEth?: boolean
   slippageBps?: number
+  /**
+   * 手续费复投：两边数量都是上限，不再按单边配平放大另一侧，
+   * 且 amountMax 不超过提供量，避免 SETTLE 从钱包多扣本金。
+   */
+  capToProvided?: boolean
 }) {
   const { walletClient, owner, position } = opts
   const slippageBps = opts.slippageBps ?? 300
@@ -825,32 +830,34 @@ export async function increaseV4Liquidity(opts: {
   const key = poolKeyFromPosition(position)
   const live = await loadV4Pool(key)
 
-  const from0 = opts.amount0 > 0n
-    ? pairAmountForRange({
-      sqrtPriceX96: live.sqrtPriceX96,
-      tickLower: position.tickLower,
-      tickUpper: position.tickUpper,
-      amount: opts.amount0,
-      side: 0,
-    })
-    : null
-  const from1 = opts.amount1 > 0n
-    ? pairAmountForRange({
-      sqrtPriceX96: live.sqrtPriceX96,
-      tickLower: position.tickLower,
-      tickUpper: position.tickUpper,
-      amount: opts.amount1,
-      side: 1,
-    })
-    : null
   let amount0 = opts.amount0
   let amount1 = opts.amount1
-  if (from0 && from0.amount0 > 0n) {
-    amount0 = from0.amount0
-    amount1 = from0.amount1
-  } else if (from1 && from1.amount1 > 0n) {
-    amount0 = from1.amount0
-    amount1 = from1.amount1
+  if (!opts.capToProvided) {
+    const from0 = opts.amount0 > 0n
+      ? pairAmountForRange({
+        sqrtPriceX96: live.sqrtPriceX96,
+        tickLower: position.tickLower,
+        tickUpper: position.tickUpper,
+        amount: opts.amount0,
+        side: 0,
+      })
+      : null
+    const from1 = opts.amount1 > 0n
+      ? pairAmountForRange({
+        sqrtPriceX96: live.sqrtPriceX96,
+        tickLower: position.tickLower,
+        tickUpper: position.tickUpper,
+        amount: opts.amount1,
+        side: 1,
+      })
+      : null
+    if (from0 && from0.amount0 > 0n) {
+      amount0 = from0.amount0
+      amount1 = from0.amount1
+    } else if (from1 && from1.amount1 > 0n) {
+      amount0 = from1.amount0
+      amount1 = from1.amount1
+    }
   }
   if (amount0 <= 0n && amount1 <= 0n) throw new Error('数量必须 > 0')
 
@@ -880,13 +887,29 @@ export async function increaseV4Liquidity(opts: {
   )
   if (liquidity <= 0n) throw new Error('算出的流动性为 0')
 
-  const { amount0: need0, amount1: need1, amount0Max, amount1Max } = maxAmountsForLiquidity({
-    sqrtPriceX96: live.sqrtPriceX96,
-    tickLower: position.tickLower,
-    tickUpper: position.tickUpper,
-    liquidity,
-    slippageBps,
-  })
+  let amount0Max: bigint
+  let amount1Max: bigint
+  let need0: bigint
+  let need1: bigint
+  if (opts.capToProvided) {
+    // 只花提供量：价动导致需要更多时直接失败，由上层软降级，绝不从钱包多扣
+    need0 = amount0
+    need1 = amount1
+    amount0Max = amount0
+    amount1Max = amount1
+  } else {
+    const maxed = maxAmountsForLiquidity({
+      sqrtPriceX96: live.sqrtPriceX96,
+      tickLower: position.tickLower,
+      tickUpper: position.tickUpper,
+      liquidity,
+      slippageBps,
+    })
+    need0 = maxed.amount0
+    need1 = maxed.amount1
+    amount0Max = maxed.amount0Max
+    amount1Max = maxed.amount1Max
+  }
 
   await ensurePermit2(walletClient, key.currency0, owner, nativeIs0 ? 0n : amount0Max)
   await ensurePermit2(walletClient, key.currency1, owner, nativeIs1 ? 0n : amount1Max)
@@ -897,8 +920,8 @@ export async function increaseV4Liquidity(opts: {
     encodeSettlePair(key.currency0, key.currency1),
   ]
   let value = 0n
-  if (nativeIs0) value = bumpAmountMax(need0, slippageBps)
-  if (nativeIs1) value = bumpAmountMax(need1, slippageBps)
+  if (nativeIs0) value = opts.capToProvided ? amount0 : bumpAmountMax(need0, slippageBps)
+  if (nativeIs1) value = opts.capToProvided ? amount1 : bumpAmountMax(need1, slippageBps)
   if (nativeIs0 || nativeIs1) {
     actions.push(V4_ACTIONS.SWEEP)
     params.push(encodeSweep(NATIVE_ETH, owner))

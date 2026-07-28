@@ -61,11 +61,11 @@ export function RangeDepthChart({
   }, [poolKey])
 
   const W = 640
-  const H = 168
-  const padL = 8
-  const padR = 8
-  const padT = 10
-  const padB = 28
+  const H = 84
+  const padL = 6
+  const padR = 6
+  const padT = 4
+  const padB = 18
   const plotW = W - padL - padR
   const plotH = H - padT - padB
 
@@ -245,8 +245,13 @@ export function RangeDepthChart({
         <span>流动性深度</span>
         {depth && (
           <span className="muted">
-            {depth.quoteSymbol} / {depth.coinSymbol}
-            {depth.hasLiquidityProfile ? '' : ' · 占位轴'}
+            {/*
+             * 写成 "USDG per NVDA" 而不是 "USDG / NVDA"。
+             * 这是价格单位，不是交易对名字 —— 而上面池子卡片正好用 "NVDA / USDG"
+             * 写对名，两个只隔一屏、顺序还相反，斜杠写法会被读成自相矛盾。
+             */}
+            {depth.quoteSymbol} per {depth.coinSymbol}
+            {depth.hasLiquidityProfile ? '' : ' · 占位轴（无深度数据）'}
           </span>
         )}
         <div className="depth-width-controls">
@@ -336,7 +341,7 @@ export function RangeDepthChart({
               onPointerDown={(e) => startDrag('lo', e)}
               style={{ cursor: 'ew-resize' }}
             >
-              <rect x={loX - 6} y={padT + plotH / 2 - 16} width={12} height={32} rx={3} />
+              <rect x={loX - 4} y={padT + plotH / 2 - 9} width={8} height={18} rx={2} />
               <text x={loX} y={H - 8} textAnchor="middle" className="depth-handle-caption">
                 下限
               </text>
@@ -346,7 +351,7 @@ export function RangeDepthChart({
               onPointerDown={(e) => startDrag('hi', e)}
               style={{ cursor: 'ew-resize' }}
             >
-              <rect x={hiX - 6} y={padT + plotH / 2 - 16} width={12} height={32} rx={3} />
+              <rect x={hiX - 4} y={padT + plotH / 2 - 9} width={8} height={18} rx={2} />
               <text x={hiX} y={H - 8} textAnchor="middle" className="depth-handle-caption">
                 上限
               </text>

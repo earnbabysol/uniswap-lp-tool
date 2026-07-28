@@ -23,6 +23,7 @@ import {
   formatAmount,
   formatAmountExact,
   getAmountsForPosition,
+  getLiquidityForAmounts,
   MAX_UINT128,
   mulDiv,
   Q128,
@@ -119,6 +120,12 @@ export type PositionRow = {
   costBasisUsd: number
   /** PnL = 当前本金 + 未领费 + 已领费 + 已取出本金 - 存入本金 */
   pnlUsd: number
+  /** 首次建仓时间（秒）；后台补扫得到，可能为空 */
+  openedAt?: number
+  /** 持仓天数 */
+  ageDays?: number
+  /** 手续费年化 %：累计费 / 本金 / 天数 × 365（持仓 < 6h 不给数） */
+  feeAprPct?: number
   poolAddress?: Address
   poolId?: `0x${string}`
   tickSpacing: number
@@ -373,6 +380,86 @@ export function isOneSidedRangeStale(opts: {
   if (plannedBelow && liveAbove) return true
   if (plannedAbove && liveBelow) return true
   return false
+}
+
+/**
+ * 单边区间过期时：按「相对当时现价的 %」锚到最新现价，保持策略形态（例如市价下方 -75%~-3%）。
+ * 返回新区间；若无法从原区间推出有效百分比则返回 null。
+ */
+export function reanchorRangeToLiveSpot(opts: {
+  livePool: PoolInfo
+  plannedSpot: number
+  coinLower: number
+  coinUpper: number
+}): ReturnType<typeof describeRange> | null {
+  const { livePool, plannedSpot, coinLower, coinUpper } = opts
+  if (!(plannedSpot > 0) || !(coinLower > 0) || !(coinUpper > coinLower)) return null
+  const loPct = (coinLower / plannedSpot - 1) * 100
+  const hiPct = (coinUpper / plannedSpot - 1) * 100
+  if (!Number.isFinite(loPct) || !Number.isFinite(hiPct) || hiPct <= loPct) return null
+  try {
+    return describeRange(livePool, loPct, hiPct)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 按新区间重算 Mint 数量：优先保留用户原本填的那一侧，另一侧按配平公式更新。
+ */
+export function remapMintAmountsForRange(opts: {
+  sqrtPriceX96: bigint
+  tickLower: number
+  tickUpper: number
+  amount0: bigint
+  amount1: bigint
+  liveTick: number
+}): { amount0: bigint; amount1: bigint } {
+  const { sqrtPriceX96, tickLower, tickUpper, liveTick } = opts
+  let { amount0, amount1 } = opts
+
+  // 单边：现价在区间上方 → 只要 token0；下方 → 只要 token1
+  if (liveTick >= tickUpper) {
+    if (amount0 <= 0n && amount1 > 0n) {
+      // 原先付的是 token1，翻到只收 token0——无法无兑换自动换边，清零 token1 避免错付
+      amount1 = 0n
+    } else {
+      amount1 = 0n
+    }
+    return { amount0, amount1 }
+  }
+  if (liveTick < tickLower) {
+    if (amount1 <= 0n && amount0 > 0n) {
+      amount0 = 0n
+    } else {
+      amount0 = 0n
+    }
+    return { amount0, amount1 }
+  }
+
+  // 现价落在区间内：用非零的那一侧（或较大侧）配平
+  const prefer0 = amount0 >= amount1
+  if (prefer0 && amount0 > 0n) {
+    const paired = pairAmountForRange({
+      sqrtPriceX96,
+      tickLower,
+      tickUpper,
+      amount: amount0,
+      side: 0,
+    })
+    return { amount0: paired.amount0, amount1: paired.amount1 }
+  }
+  if (amount1 > 0n) {
+    const paired = pairAmountForRange({
+      sqrtPriceX96,
+      tickLower,
+      tickUpper,
+      amount: amount1,
+      side: 1,
+    })
+    return { amount0: paired.amount0, amount1: paired.amount1 }
+  }
+  return { amount0, amount1 }
 }
 
 export async function findV3Pool(tokenA: Address, tokenB: Address, fee: number): Promise<Address | null> {
@@ -965,7 +1052,7 @@ export async function loadV4Pool(key: {
   }
 }
 
-async function getWethUsdPrice(): Promise<number> {
+export async function getWethUsdPrice(): Promise<number> {
   try {
     // Prefer 0.05% WETH/USDG pool
     const poolAddr = await findV3Pool(CONTRACTS.weth, getStableAddress(), 500)
@@ -976,6 +1063,49 @@ async function getWethUsdPrice(): Promise<number> {
     // If token0=WETH token1=USDG → price is USDG per WETH
     if (pool.token0.address.toLowerCase() === CONTRACTS.weth.toLowerCase()) return pool.price
     if (pool.token1.address.toLowerCase() === CONTRACTS.weth.toLowerCase()) return pool.price > 0 ? 1 / pool.price : 0
+    return 0
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * 任意代币的 USD 单价（用于 UI 把「报价本位」翻译成「U 本位」）。
+ *
+ * 只有三条来源，按可信度排序：
+ *   1. 稳定币本身 → 1
+ *   2. ETH / WETH → getWethUsdPrice()（WETH/稳定币池）
+ *   3. 其他币 → 找 币/稳定币 池；没有再找 币/WETH 池 × ethUsd
+ * 拿不到就返回 0，调用方必须把 0 当「未知」处理，不要拿 0 去乘/除。
+ */
+export async function getTokenUsdPrice(token: Address): Promise<number> {
+  try {
+    const stable = getStableAddress()
+    const addr = token.toLowerCase()
+    if (addr === stable.toLowerCase()) return 1
+    if (isEthLikeCurrency(token)) return clampUsd(await getWethUsdPrice())
+
+    const findAny = async (other: Address): Promise<number> => {
+      for (const f of FEE_TIERS) {
+        const pa = await findV3Pool(token, other, f).catch(() => null)
+        if (!pa) continue
+        const p = await loadV3Pool(pa).catch(() => null)
+        if (!p || !(p.price > 0)) continue
+        // price = token1 per token0，要的是 other per token
+        if (p.token0.address.toLowerCase() === addr) return p.price
+        if (p.token1.address.toLowerCase() === addr) return 1 / p.price
+      }
+      return 0
+    }
+
+    const perStable = await findAny(stable)
+    if (perStable > 0) return clampUsd(perStable)
+
+    const perEth = await findAny(CONTRACTS.weth)
+    if (perEth > 0) {
+      const ethUsd = await getWethUsdPrice()
+      if (ethUsd > 0) return clampUsd(perEth * ethUsd)
+    }
     return 0
   } catch {
     return 0
@@ -1230,6 +1360,76 @@ type Cashflow = {
   withdrawn1: bigint
   claimed0: bigint
   claimed1: bigint
+  /** 首次建仓所在区块，用于算持仓时长 / 手续费年化 */
+  openedAtBlock?: bigint
+}
+
+/** 区块号 → 出块时间戳（秒）。按链缓存到 localStorage，避免每次刷新重复请求 */
+const BLOCK_TS_KEY = 'rangedesk.blockTs.v1'
+const blockTsMem = new Map<string, number>()
+
+function readBlockTsCache(): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(BLOCK_TS_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as Record<string, number>
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+export async function getBlockTimestamp(blockNumber: bigint): Promise<number | null> {
+  const key = `${getActiveChainId()}-${blockNumber.toString()}`
+  const mem = blockTsMem.get(key)
+  if (mem != null) return mem
+  const disk = readBlockTsCache()[key]
+  if (disk != null) {
+    blockTsMem.set(key, disk)
+    return disk
+  }
+  try {
+    const block = await withTimeout(publicClient.getBlock({ blockNumber }), 12_000, '区块时间')
+    const ts = Number(block.timestamp)
+    if (!Number.isFinite(ts) || ts <= 0) return null
+    blockTsMem.set(key, ts)
+    try {
+      const all = readBlockTsCache()
+      all[key] = ts
+      // 只保留最近 400 条，防止无限增长
+      const entries = Object.entries(all)
+      const trimmed = entries.length > 400 ? Object.fromEntries(entries.slice(-400)) : all
+      localStorage.setItem(BLOCK_TS_KEY, JSON.stringify(trimmed))
+    } catch {
+      /* 配额满：仅内存缓存 */
+    }
+    return ts
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 手续费年化：累计手续费 / 本金 / 持仓天数 × 365。
+ * 口径说明：分母用成本本金（拿不到就退回当前本金），只有持仓 ≥ 6 小时才给数，
+ * 否则刚开仓的仓位会算出上千 % 的假年化。
+ */
+export function computeFeeApr(opts: {
+  totalFeesUsd: number
+  costBasisUsd: number
+  principalUsd: number
+  openedAt?: number
+}): { ageDays?: number; feeAprPct?: number } {
+  const { totalFeesUsd, costBasisUsd, principalUsd, openedAt } = opts
+  if (!openedAt || !Number.isFinite(openedAt)) return {}
+  const ageDays = (Date.now() / 1000 - openedAt) / 86400
+  if (!(ageDays > 0)) return {}
+  const basis = costBasisUsd > 0 ? costBasisUsd : principalUsd
+  if (!(basis > 0) || !(totalFeesUsd >= 0)) return { ageDays }
+  if (ageDays < 0.25) return { ageDays }
+  const apr = (totalFeesUsd / basis / ageDays) * 365 * 100
+  if (!Number.isFinite(apr) || apr < 0 || apr > 1e6) return { ageDays }
+  return { ageDays, feeAprPct: apr }
 }
 
 const FEE_CACHE_KEY = 'uniswap-lp-lifetime-fees-v2'
@@ -1523,7 +1723,10 @@ export async function loadPositionCashflow(tokenId: bigint): Promise<Cashflow> {
       }
     }
 
-    return { deposited0, deposited1, withdrawn0, withdrawn1, claimed0, claimed1 }
+    return {
+      deposited0, deposited1, withdrawn0, withdrawn1, claimed0, claimed1,
+      openedAtBlock: mintBlock ?? undefined,
+    }
   } catch (e) {
     console.warn('cashflow load failed', tokenId.toString(), e)
     return empty
@@ -2231,11 +2434,32 @@ export async function loadV4PositionCashflow(opts: {
       }
     }
 
-    return { deposited0, deposited1, withdrawn0, withdrawn1, claimed0, claimed1 }
+    return {
+      deposited0, deposited1, withdrawn0, withdrawn1, claimed0, claimed1,
+      openedAtBlock: mods.length ? mods[0].blockNumber : undefined,
+    }
   } catch (e) {
     console.warn('loadV4PositionCashflow failed', tokenId.toString(), e)
     return empty
   }
+}
+
+/** 用 cashflow 里的建仓区块补上持仓时长与手续费年化 */
+async function withPositionAge(
+  row: PositionRow,
+  cf: Cashflow,
+  principalUsd: number,
+): Promise<PositionRow> {
+  if (cf.openedAtBlock == null) return row
+  const ts = await getBlockTimestamp(cf.openedAtBlock)
+  if (ts == null) return row
+  const { ageDays, feeAprPct } = computeFeeApr({
+    totalFeesUsd: row.totalFeesUsd,
+    costBasisUsd: row.costBasisUsd,
+    principalUsd,
+    openedAt: ts,
+  })
+  return { ...row, openedAt: ts, ageDays, feeAprPct }
 }
 
 /**
@@ -2276,7 +2500,8 @@ export async function enrichPositionsLifetimeFees(
             liquidity: row.liquidity,
           }
           const pnl = enrichPnl(pool, wethUsd, principalUsd, unclaimedFeesUsd, cf)
-          next = mergeCachedLifetimeFees({ ...row, ...pnl }, unclaimedFeesUsd, wethUsd)
+          const merged = mergeCachedLifetimeFees({ ...row, ...pnl }, unclaimedFeesUsd, wethUsd)
+          next = await withPositionAge(merged, cf, principalUsd)
         } else if (row.version === 'v4' && row.poolId) {
           const cf = await withTimeout(
             loadV4PositionCashflow({
@@ -2305,7 +2530,8 @@ export async function enrichPositionsLifetimeFees(
             hooks: row.hooks,
           }
           const pnl = enrichPnl(pool, wethUsd, principalUsd, unclaimedFeesUsd, cf)
-          next = mergeCachedLifetimeFees({ ...row, ...pnl }, unclaimedFeesUsd, wethUsd)
+          const merged = mergeCachedLifetimeFees({ ...row, ...pnl }, unclaimedFeesUsd, wethUsd)
+          next = await withPositionAge(merged, cf, principalUsd)
         }
       } catch (e) {
         console.warn('enrich lifetime fees fail', row.tokenId.toString(), e)
@@ -3066,46 +3292,307 @@ export async function rebalanceV3(opts: {
   return { exitHash, mintHash, tickLower, tickUpper }
 }
 
+export type CompoundResult = {
+  /** 领取（或原子 multicall）的 hash */
+  claimHash: Hash
+  /** 加仓 hash；与 claim 同一笔时相同；未复投则为 null */
+  increaseHash: Hash | null
+  compounded: boolean
+  note: string
+}
+
+/**
+ * V3 领取并复投。
+ *
+ * 策略（应对波动 / 加仓易失败）：
+ * 1) 只用未领手续费作 desired，amountMin=0 —— 价怎么动都不因滑点失败，NPM 按现价能加多少加多少，多的留钱包
+ * 2) 优先 collect+increase 原子 multicall：加仓失败则整笔回滚，手续费仍在仓里
+ * 3) 原子失败再退回「先领后加」；加仓再失败 → 手续费已在钱包，返回 note 不抛错
+ * 4) 出区间且手续费全在用不上的那一侧 → 只领取
+ */
 export async function claimAndCompoundV3(opts: {
   walletClient: WalletClient
   owner: Address
   position: PositionRow
-}) {
+}): Promise<CompoundResult> {
   const { walletClient, owner, position } = opts
   if (position.version !== 'v3') throw new Error('需要 V3 仓位')
+
+  const fee0 = position.fees0
+  const fee1 = position.fees1
+  if (fee0 === 0n && fee1 === 0n) throw new Error('没有可复投的未领手续费')
+
+  let sqrt = position.sqrtPriceX96
+  if (position.poolAddress) {
+    try {
+      const slot0 = await publicClient.readContract({
+        address: position.poolAddress,
+        abi: v3PoolAbi,
+        functionName: 'slot0',
+      })
+      sqrt = (slot0 as readonly [bigint])[0]
+    } catch {
+      /* 用仓位缓存价 */
+    }
+  }
+
+  const liquidity = getLiquidityForAmounts(
+    sqrt,
+    position.tickLower,
+    position.tickUpper,
+    fee0,
+    fee1,
+  )
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200)
+
+  if (liquidity > 0n) {
+    if (fee0 > 0n) {
+      await ensureAllowance(walletClient, position.token0.address, owner, CONTRACTS.v3Npm, fee0)
+    }
+    if (fee1 > 0n) {
+      await ensureAllowance(walletClient, position.token1.address, owner, CONTRACTS.v3Npm, fee1)
+    }
+
+    try {
+      const hash = await walletClient.writeContract({
+        address: CONTRACTS.v3Npm,
+        abi: v3NpmAbi,
+        functionName: 'multicall',
+        args: [[
+          encodeFunctionData({
+            abi: v3NpmAbi,
+            functionName: 'collect',
+            args: [{
+              tokenId: position.tokenId,
+              recipient: owner,
+              amount0Max: MAX_UINT128,
+              amount1Max: MAX_UINT128,
+            }],
+          }),
+          encodeFunctionData({
+            abi: v3NpmAbi,
+            functionName: 'increaseLiquidity',
+            args: [{
+              tokenId: position.tokenId,
+              amount0Desired: fee0,
+              amount1Desired: fee1,
+              amount0Min: 0n,
+              amount1Min: 0n,
+              deadline,
+            }],
+          }),
+        ]],
+        chain: walletClient.chain,
+        account: owner,
+      })
+      await publicClient.waitForTransactionReceipt({ hash })
+      return {
+        claimHash: hash,
+        increaseHash: hash,
+        compounded: true,
+        note: '已领取并复投',
+      }
+    } catch (e) {
+      console.warn('V3 atomic compound failed, fallback to claim-then-increase', e)
+    }
+  }
+
   const claimHash = await claimV3({ walletClient, owner, tokenId: position.tokenId })
   await publicClient.waitForTransactionReceipt({ hash: claimHash })
 
+  if (liquidity <= 0n) {
+    return {
+      claimHash,
+      increaseHash: null,
+      compounded: false,
+      note: '已领取（当前区间加不进这些手续费，多半出区间且费在另一侧）',
+    }
+  }
+
   const [bal0, bal1] = await Promise.all([
-    publicClient.readContract({ address: position.token0.address, abi: erc20Abi, functionName: 'balanceOf', args: [owner] }),
-    publicClient.readContract({ address: position.token1.address, abi: erc20Abi, functionName: 'balanceOf', args: [owner] }),
+    publicClient.readContract({
+      address: position.token0.address,
+      abi: erc20Abi,
+      functionName: 'balanceOf',
+      args: [owner],
+    }),
+    publicClient.readContract({
+      address: position.token1.address,
+      abi: erc20Abi,
+      functionName: 'balanceOf',
+      args: [owner],
+    }),
   ])
-  // Prefer compounding only the claimed fee amounts (not entire wallet balance)
-  const use0 = position.fees0 > 0n ? position.fees0 : 0n
-  const use1 = position.fees1 > 0n ? position.fees1 : 0n
+  const amount0 = fee0 <= bal0 ? fee0 : bal0
+  const amount1 = fee1 <= bal1 ? fee1 : bal1
+  if (amount0 === 0n && amount1 === 0n) {
+    return {
+      claimHash,
+      increaseHash: null,
+      compounded: false,
+      note: '已领取（钱包余额不足以复投）',
+    }
+  }
+
+  try {
+    if (amount0 > 0n) {
+      await ensureAllowance(walletClient, position.token0.address, owner, CONTRACTS.v3Npm, amount0)
+    }
+    if (amount1 > 0n) {
+      await ensureAllowance(walletClient, position.token1.address, owner, CONTRACTS.v3Npm, amount1)
+    }
+    const increaseHash = await walletClient.writeContract({
+      address: CONTRACTS.v3Npm,
+      abi: v3NpmAbi,
+      functionName: 'increaseLiquidity',
+      args: [{
+        tokenId: position.tokenId,
+        amount0Desired: amount0,
+        amount1Desired: amount1,
+        amount0Min: 0n,
+        amount1Min: 0n,
+        deadline: BigInt(Math.floor(Date.now() / 1000) + 1200),
+      }],
+      chain: walletClient.chain,
+      account: owner,
+    })
+    return {
+      claimHash,
+      increaseHash,
+      compounded: true,
+      note: '已领取并复投',
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    return {
+      claimHash,
+      increaseHash: null,
+      compounded: false,
+      note: `已领取，复投失败（手续费在钱包，可手动加仓）：${msg.slice(0, 120)}`,
+    }
+  }
+}
+
+/**
+ * V4 领取并复投（两笔）。无法像 V3 那样稳妥做原子 multicall，所以：
+ * 先领到钱包（保底），再用手续费上限加仓；加仓失败不抛错，代币留在钱包。
+ */
+export async function claimAndCompoundV4(opts: {
+  walletClient: WalletClient
+  owner: Address
+  position: PositionRow
+  slippageBps?: number
+}): Promise<CompoundResult> {
+  const { walletClient, owner, position } = opts
+  if (position.version !== 'v4') throw new Error('需要 V4 仓位')
+
+  const fee0 = position.fees0
+  const fee1 = position.fees1
+  if (fee0 === 0n && fee1 === 0n) throw new Error('没有可复投的未领手续费')
+
+  // 略打折：未领估算 vs 链上实收常有偏差；宁可少加也不要从钱包补本金
+  const use0 = fee0 > 1n ? (fee0 * 98n) / 100n : fee0
+  const use1 = fee1 > 1n ? (fee1 * 98n) / 100n : fee1
+
+  let canCompound = false
+  try {
+    const live = position.poolId
+      ? await loadV4PoolById(position.poolId)
+      : null
+    const sqrt = live?.sqrtPriceX96 && live.sqrtPriceX96 > 0n
+      ? live.sqrtPriceX96
+      : position.sqrtPriceX96
+    canCompound = getLiquidityForAmounts(
+      sqrt,
+      position.tickLower,
+      position.tickUpper,
+      use0,
+      use1,
+    ) > 0n
+  } catch {
+    canCompound = use0 > 0n || use1 > 0n
+  }
+
+  const claimHash = await claimV4({ walletClient, owner, position })
+  await publicClient.waitForTransactionReceipt({ hash: claimHash })
+
+  if (!canCompound) {
+    return {
+      claimHash,
+      increaseHash: null,
+      compounded: false,
+      note: '已领取（当前区间加不进这些手续费）',
+    }
+  }
+
+  const gasReserve = 10n ** 15n
+  const readBal = async (token: Address): Promise<bigint> => {
+    if (isNativeCurrency(token)) {
+      const eth = await publicClient.getBalance({ address: owner })
+      return eth > gasReserve ? eth - gasReserve : 0n
+    }
+    return publicClient.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: 'balanceOf',
+      args: [owner],
+    })
+  }
+  const [bal0, bal1] = await Promise.all([
+    readBal(position.token0.address),
+    readBal(position.token1.address),
+  ])
   const amount0 = use0 <= bal0 ? use0 : bal0
   const amount1 = use1 <= bal1 ? use1 : bal1
-  if (amount0 === 0n && amount1 === 0n) return { claimHash, increaseHash: null as `0x${string}` | null }
 
-  await ensureAllowance(walletClient, position.token0.address, owner, CONTRACTS.v3Npm, amount0)
-  await ensureAllowance(walletClient, position.token1.address, owner, CONTRACTS.v3Npm, amount1)
+  if (amount0 === 0n && amount1 === 0n) {
+    return {
+      claimHash,
+      increaseHash: null,
+      compounded: false,
+      note: '已领取（余额不足以复投）',
+    }
+  }
 
-  const increaseHash = await walletClient.writeContract({
-    address: CONTRACTS.v3Npm,
-    abi: v3NpmAbi,
-    functionName: 'increaseLiquidity',
-    args: [{
-      tokenId: position.tokenId,
-      amount0Desired: amount0,
-      amount1Desired: amount1,
-      amount0Min: 0n,
-      amount1Min: 0n,
-      deadline: BigInt(Math.floor(Date.now() / 1000) + 1200),
-    }],
-    chain: walletClient.chain,
-    account: owner,
-  })
-  return { claimHash, increaseHash }
+  try {
+    const increaseHash = await increaseV4Liquidity({
+      walletClient,
+      owner,
+      position,
+      amount0,
+      amount1,
+      useNativeEth: isNativeCurrency(position.token0.address) || isNativeCurrency(position.token1.address),
+      slippageBps: Math.max(opts.slippageBps ?? 300, 500),
+      capToProvided: true,
+    })
+    return {
+      claimHash,
+      increaseHash: increaseHash as Hash,
+      compounded: true,
+      note: '已领取并复投（V4 两笔）',
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    return {
+      claimHash,
+      increaseHash: null,
+      compounded: false,
+      note: `已领取，复投失败（手续费在钱包，可手动加仓）：${msg.slice(0, 120)}`,
+    }
+  }
+}
+
+/** 统一入口：按仓位版本领取并复投 */
+export async function claimAndCompound(opts: {
+  walletClient: WalletClient
+  owner: Address
+  position: PositionRow
+  slippageBps?: number
+}): Promise<CompoundResult> {
+  if (opts.position.version === 'v4') {
+    return claimAndCompoundV4(opts)
+  }
+  return claimAndCompoundV3(opts)
 }
 
 export function ticksFromPrices(
@@ -3155,6 +3642,57 @@ export function positionAsPool(p: PositionRow): PoolInfo {
     liquidity: p.liquidity,
     hooks: p.hooks,
   }
+}
+
+/** 仓位的一条腿：某个代币在这个仓位里的本金、未领费、占比 */
+export type PositionLeg = {
+  token: TokenMeta
+  /** 本金数量（raw） */
+  amount: bigint
+  amountUsd: number
+  /** 未领手续费数量（raw） */
+  fees: bigint
+  feesUsd: number
+  /** 本金占仓位价值的百分比 */
+  pct: number
+  /**
+   * 这条腿是池子里的 token0 还是 token1。
+   * 配比条的两个颜色一直是「a = token0 / b = token1」，而下面的腿是按 coin/quote 排的，
+   * 两者顺序可能相反。颜色得跟着 slot 走，不能跟着数组下标走，否则同一个代币
+   * 在配比条里是 a 色、在腿列表里是 b 色。
+   */
+  slot: 0 | 1
+}
+
+/**
+ * 把仓位拆成两条腿，顺序跟标题一致。
+ *
+ * 必须按 coin/quote 排，不能按 token0/token1 排：标题写的是 getCoinQuote 给的
+ * coin/quote（比如 NVDA / ETH），而 invert 为真时 token0 恰好是 ETH ——
+ * 直接按 token0/token1 列数量，两个数就跟标题左右颠倒了，读的人会把 ETH 的量
+ * 当成 NVDA 的量。这里统一出口，卡片和详情都用它，方向只在一处决定。
+ */
+export function getPositionLegs(p: PositionRow): [PositionLeg, PositionLeg] {
+  const { invert } = getCoinQuote(positionAsPool(p))
+  const leg0: PositionLeg = {
+    token: p.token0,
+    amount: p.amount0,
+    amountUsd: p.amount0Usd,
+    fees: p.fees0,
+    feesUsd: p.fees0Usd,
+    pct: p.pct0,
+    slot: 0,
+  }
+  const leg1: PositionLeg = {
+    token: p.token1,
+    amount: p.amount1,
+    amountUsd: p.amount1Usd,
+    fees: p.fees1,
+    feesUsd: p.fees1Usd,
+    pct: p.pct1,
+    slot: 1,
+  }
+  return invert ? [leg1, leg0] : [leg0, leg1]
 }
 
 /** 持仓卡片用：与建仓页一致的币/报价方向与区间价 */
@@ -3318,6 +3856,137 @@ export function ticksFromCoinPrices(pool: PoolInfo, coinLower: number, coinUpper
     invert: quote.invert,
     inRangePreview: pool.tick >= t.tickLower && pool.tick < t.tickUpper,
   }
+}
+
+/* ─────────────────── 按代币合约发现池子 ─────────────────── */
+
+export type DiscoveredPool = {
+  pool: PoolInfo
+  /** 对手币（WETH / 稳定币 / …） */
+  quoteSymbol: string
+  /** 币价：一个目标币值多少对手币 */
+  coinPrice: number
+  /** 池内两侧余额折算的 USD；V4 拿不到就为 null，用 liquidity 比大小 */
+  tvlUsd: number | null
+  liquidity: bigint
+}
+
+/** 目标币和哪些币配对值得扫：WETH、稳定币、原生 ETH（V4） */
+function quoteCandidates(target: Address): Address[] {
+  const t = target.toLowerCase()
+  const out: Address[] = []
+  const push = (a: Address) => {
+    if (a.toLowerCase() !== t && !out.some((x) => x.toLowerCase() === a.toLowerCase())) out.push(a)
+  }
+  push(CONTRACTS.weth)
+  push(getStableAddress())
+  return out
+}
+
+async function v3PoolTvlUsd(pool: PoolInfo, wethUsd: number): Promise<number | null> {
+  if (!pool.poolAddress) return null
+  try {
+    const [b0, b1] = await Promise.all([
+      publicClient.readContract({
+        address: pool.token0.address,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [pool.poolAddress],
+      }),
+      publicClient.readContract({
+        address: pool.token1.address,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [pool.poolAddress],
+      }),
+    ])
+    const u0 = tokenUsd(
+      pool.token0.address,
+      b0,
+      pool.token0.decimals,
+      pool.price,
+      pool.token0.address,
+      pool.token1.address,
+      wethUsd,
+    )
+    const u1 = tokenUsd(
+      pool.token1.address,
+      b1,
+      pool.token1.decimals,
+      pool.price,
+      pool.token0.address,
+      pool.token1.address,
+      wethUsd,
+    )
+    const total = clampUsd(u0 + u1)
+    return total > 0 ? total : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 输入一个 ERC-20 合约地址，扫出它所有能用的池子（V3 全 fee tier + V4 常用 fee），
+ * 按池子深度从大到小排。给「粘贴代币合约 → 选一个池子」那个流程用。
+ */
+export async function discoverPoolsByToken(
+  token: Address,
+  opts?: { includeV4?: boolean; onStatus?: (s: string) => void },
+): Promise<DiscoveredPool[]> {
+  const includeV4 = opts?.includeV4 ?? true
+  const say = opts?.onStatus
+  const meta = await resolveTokenMeta(token)
+  const quotes = quoteCandidates(token)
+
+  say?.(`扫描 ${meta.symbol} 的 V3 池…`)
+  const v3Lists = await Promise.all(quotes.map((q) => scanV3Pools(token, q).catch(() => [])))
+  let pools: PoolInfo[] = v3Lists.flat()
+
+  if (includeV4) {
+    say?.(`扫描 ${meta.symbol} 的 V4 池…`)
+    const v4Lists = await Promise.all(quotes.map((q) => scanV4Pools(token, q).catch(() => [])))
+    pools = [...pools, ...v4Lists.flat()]
+    // V4 原生 ETH 池：currency0 = address(0)
+    try {
+      const nativeList = await scanV4Pools(zeroAddress, token)
+      pools = [...pools, ...nativeList]
+    } catch {
+      /* 没有就算了 */
+    }
+  }
+
+  // 去重（同一个池可能被两个 quote 方向扫到）
+  const seen = new Set<string>()
+  const unique = pools.filter((p) => {
+    const k = `${p.version}-${(p.poolAddress ?? p.poolId ?? '').toLowerCase()}-${p.fee}-${p.tickSpacing}`
+    if (seen.has(k)) return false
+    seen.add(k)
+    return true
+  })
+
+  say?.(`读取 ${unique.length} 个池的深度…`)
+  const wethUsd = await getWethUsdPrice()
+
+  const rows = await Promise.all(
+    unique.map(async (pool): Promise<DiscoveredPool> => {
+      const q = getCoinQuote(pool)
+      // getCoinQuote 按 WETH/稳定币的习惯定 coin/quote，但这里的「目标币」是用户输入的那个。
+      // 如果它被当成了 quote，就把价格倒过来，保证 coinPrice 是「1 个目标币 = 多少对手币」。
+      const targetIsCoin = q.coin.address.toLowerCase() === token.toLowerCase()
+      const coinPrice = targetIsCoin ? q.spot : q.spot > 0 ? 1 / q.spot : 0
+      const quoteSymbol = targetIsCoin ? q.quote.symbol : q.coin.symbol
+      const tvlUsd = pool.version === 'v3' ? await v3PoolTvlUsd(pool, wethUsd) : null
+      return { pool, quoteSymbol, coinPrice, tvlUsd, liquidity: pool.liquidity }
+    }),
+  )
+
+  rows.sort((a, b) => {
+    if (a.tvlUsd != null && b.tvlUsd != null) return b.tvlUsd - a.tvlUsd
+    if (a.tvlUsd != null) return -1
+    if (b.tvlUsd != null) return 1
+    return a.liquidity === b.liquidity ? 0 : a.liquidity > b.liquidity ? -1 : 1
+  })
+  return rows
 }
 
 export { formatAmount, formatAmountExact, rangeFromPercent }

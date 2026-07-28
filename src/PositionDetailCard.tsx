@@ -1,6 +1,7 @@
 import { useMemo, type ReactNode } from 'react'
-import { formatAmount, getPositionCoinPrices, type PositionRow } from './lp'
-import { formatPrice, formatUsd } from './math'
+import { getPositionCoinPrices, type PositionRow } from './lp'
+import { formatAge, formatPrice, formatUsd } from './math'
+import { PositionLegs } from './PositionLegs'
 
 function formatPnlAmount(n: number): string {
   if (!Number.isFinite(n) || Math.abs(n) > 1e11) return '—'
@@ -24,6 +25,7 @@ export type PositionDetailCardProps = {
   busy?: boolean
   children?: ReactNode
   onCollect: () => void
+  onCompound: () => void
   onClose: () => void
   onRebalance: () => void
   onCopyId?: () => void
@@ -35,6 +37,7 @@ export function PositionDetailCard({
   busy,
   children,
   onCollect,
+  onCompound,
   onClose,
   onRebalance,
   onCopyId,
@@ -63,10 +66,10 @@ export function PositionDetailCard({
   const toUpperPct = spot > 0 ? ((hi - spot) / spot) * 100 : 0
 
   const rangeHint = p.inRange
-    ? `in range · ${Math.max(0, toLowerPct).toFixed(1)}% to lower · ${Math.max(0, toUpperPct).toFixed(1)}% to upper`
+    ? `区间内 · 距下限 ${Math.max(0, toLowerPct).toFixed(1)}% · 距上限 ${Math.max(0, toUpperPct).toFixed(1)}%`
     : spot < lo
-      ? `out of range · 低于下限 ${formatPrice(lo)}`
-      : `out of range · 高于上限 ${formatPrice(hi)}`
+      ? `已出区间 · 低于下限 ${formatPrice(lo)}`
+      : `已出区间 · 高于上限 ${formatPrice(hi)}`
 
   // 现价左侧偏 quote（更像 token1/稳定币侧），右侧偏 coin——与列表 bar-a/b 一致用 token0/token1 色
   const splitAt = Math.max(0, Math.min(SEGMENTS, Math.round((markerPct / 100) * SEGMENTS)))
@@ -85,7 +88,7 @@ export function PositionDetailCard({
         <div className="pdc-head-actions">
           {onCopyId && (
             <button type="button" className="btn ghost tight" onClick={onCopyId}>
-              复制 ID
+              复制编号
             </button>
           )}
           {poolHref && (
@@ -103,21 +106,17 @@ export function PositionDetailCard({
         </span>
         <span className={`pdc-badge range ${p.inRange ? 'in' : 'out'}`}>
           <i className="pdc-dot" />
-          {p.inRange ? 'in range' : 'out of range'}
+          {p.inRange ? '区间内' : '已出区间'}
         </span>
       </div>
 
       <div className={`pdc-range ${p.inRange ? 'in' : 'out'}`}>
-        <div className="pdc-range-legend">
-          <span>
-            <i className="dot a" />
-            {p.token0.symbol}
-          </span>
-          <span>
-            <i className="dot b" />
-            {p.token1.symbol}
-          </span>
-        </div>
+        {/*
+         * 这条是价格轴，不是配比条。分段只表示现价把区间切在哪儿（左＝已走过），
+         * 曾经这里挂着 token0/token1 的图例 + 代币色，于是 152–181 里现价 178.9
+         * 的仓位被画成「26/28 段是 token0」，而真实配比是 5/95 —— 正好反过来。
+         * 配比是另一回事，放在下面 .pdc-mix 单独一行。
+         */}
         <div className="pdc-seg-wrap">
           <div
             className="pdc-spot-tag"
@@ -129,7 +128,7 @@ export function PositionDetailCard({
             {Array.from({ length: SEGMENTS }, (_, i) => (
               <span
                 key={i}
-                className={`pdc-seg ${i < splitAt ? 'a' : 'b'}`}
+                className={`pdc-seg ${i < splitAt ? 'past' : 'ahead'}`}
               />
             ))}
           </div>
@@ -146,58 +145,93 @@ export function PositionDetailCard({
         <p className="pdc-range-hint">{rangeHint}</p>
       </div>
 
-      <div className="pdc-grid">
-        <div className="pdc-cell">
-          <span className="pdc-k">Value</span>
+      {/*
+       * 这里原来是单独一行配比（条 + token0/token1 两个图例）。删了：条和图例都并进了
+       * 下面的逐币明细，那张表每行本来就有色点、代币名、百分比 —— 留着就是同一组数字
+       * 在一张卡上印两遍，而且顺序还不一样（这里按 pct0/pct1，明细按标题的 coin/quote）。
+       */}
+      {/*
+       * 指标条：一排五格，不再是 2 列 × 4 行的格子墙。
+       *
+       * 原来八个格子铺在 1118px 宽的卡上，每格 528px 而里面的数只有 48~135px 宽 ——
+       * 量出来每格空着 393~480px，「持仓价值」和它右边的「未领手续费」之间隔了小半个屏幕，
+       * 竖着还占四行。八个数横过来一排，每格 210px 左右，正好装得下最长的 US$118.00。
+       *
+       * 同时删掉三个本来就在屏幕上的格子：
+       *   - 下限价 / 上限价：上面价格轴的两端已经印了 0.0002941 和 0.000339，
+       *     单位也标了（探针数出这两串各出现两次），隔 150px 再印一遍没有新信息。
+       *   - 盈亏：卡头的徽章已经是「▲ +$4.02 (+3.41%)」，还带涨跌色，比灰底格子显眼。
+       */}
+      <div className="pdc-stats">
+        <div className="pdc-stat">
+          <span className="pdc-k">持仓价值</span>
           <span className="pdc-v">{formatUsd(p.totalUsd)}</span>
         </div>
-        <div className="pdc-cell">
-          <span className="pdc-k">Unclaimed fees</span>
+        <div className="pdc-stat">
+          <span className="pdc-k">未领手续费</span>
           <span className="pdc-v ok">{formatUsd(unclaimedUsd)}</span>
         </div>
-        <div className="pdc-cell">
-          <span className="pdc-k">PnL</span>
-          <span className={`pdc-v ${pnlUp ? 'ok' : 'bad'}`}>{formatPnlAmount(p.pnlUsd)}{pnlPct ? ` (${pnlPct})` : ''}</span>
-        </div>
-        <div className="pdc-cell">
-          <span className="pdc-k">Deposited</span>
+        <div className="pdc-stat">
+          <span className="pdc-k">已存入</span>
           <span className="pdc-v">{deposited > 0 ? formatUsd(deposited) : '—'}</span>
         </div>
-        <div className="pdc-cell">
-          <span className="pdc-k">{p.token0.symbol}</span>
-          <span className="pdc-v mono">{formatAmount(p.amount0, p.token0.decimals, 4)}</span>
+        <div className="pdc-stat">
+          <span className="pdc-k">手续费年化</span>
+          <span className={`pdc-v ${p.feeAprPct != null ? 'ok' : ''}`}>
+            {p.feeAprPct != null && Number.isFinite(p.feeAprPct)
+              ? `${p.feeAprPct >= 100 ? Math.round(p.feeAprPct) : p.feeAprPct.toFixed(1)}%`
+              : '—'}
+          </span>
         </div>
-        <div className="pdc-cell">
-          <span className="pdc-k">{p.token1.symbol}</span>
-          <span className="pdc-v mono">{formatAmount(p.amount1, p.token1.decimals, 4)}</span>
-        </div>
-        <div className="pdc-cell">
-          <span className="pdc-k">Min price ({cq.priceUnit})</span>
-          <span className="pdc-v mono">{formatPrice(lo)}</span>
-        </div>
-        <div className="pdc-cell">
-          <span className="pdc-k">Max price ({cq.priceUnit})</span>
-          <span className="pdc-v mono">{formatPrice(hi)}</span>
+        <div className="pdc-stat">
+          <span className="pdc-k">持仓时长</span>
+          <span className="pdc-v">{formatAge(p.ageDays)}</span>
         </div>
       </div>
 
+      {/*
+       * 逐币明细。原来这里是 pdc-grid 里两个孤立的格子（只有 token0 / token1 的数量，
+       * 没有对应的美元值），而手续费只有一个合并的「未领手续费 US$xx」——
+       * 领出来会拿到几个 NVDA、几个 USDG，卡上答不出来。
+       * 拆成一张表：本金数量 / 本金价值 / 未领费数量 / 未领费价值，四列对齐。
+       */}
+      <PositionLegs position={p} variant="detail" />
+
       <div className="pdc-actions">
-        <button type="button" className="btn primary pdc-rebal" disabled={busy} onClick={onRebalance}>
-          Rebalance
+        <button type="button" className="btn pdc-rebal" disabled={busy} onClick={onRebalance}>
+          重设区间
         </button>
-        <button type="button" className="btn" disabled={busy} onClick={onCollect}>
-          Collect fees
+        <button
+          type="button"
+          className="btn"
+          disabled={busy || unclaimedUsd <= 0}
+          onClick={onCollect}
+          title={unclaimedUsd <= 0 ? '暂无未领手续费' : undefined}
+        >
+          领取手续费
+        </button>
+        <button
+          type="button"
+          className="btn primary"
+          disabled={busy || unclaimedUsd <= 0}
+          onClick={onCompound}
+          title={
+            unclaimedUsd <= 0
+              ? '暂无未领手续费'
+              : '仅用未领手续费加回本仓；配不平的一边留在钱包；复投失败时手续费仍在钱包'
+          }
+        >
+          领取并复投
         </button>
         <button type="button" className="btn danger-outline" disabled={busy} onClick={onClose}>
-          Close
+          关闭仓位
         </button>
       </div>
 
       {children && (
-        <details className="pdc-more">
-          <summary>加仓 / 部分撤出</summary>
-          <div className="pdc-more-body">{children}</div>
-        </details>
+        <div className="pdc-manage">
+          {children}
+        </div>
       )}
     </div>
   )

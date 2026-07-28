@@ -16,6 +16,7 @@ import {
   type SupportedChainId,
 } from './chain'
 import { loadCustomRpcUrl } from './rpcSettings'
+import { getActiveAccount, type LocalAccount } from './signer'
 
 function getReadRpcUrls(): string[] {
   const cfg = getActiveChainConfig()
@@ -121,6 +122,59 @@ export async function ensureActiveChain(): Promise<void> {
 
 /** @deprecated 用 ensureActiveChain */
 export const ensureRobinhoodChain = ensureActiveChain
+
+/**
+ * 本地私钥钱包客户端。
+ *
+ * lp.ts / v4.ts 里 32 处写调用都传 `account: owner`（一个 Address 字符串）。
+ * viem 看到字符串 account 会当成 JSON-RPC 账户走 eth_sendTransaction —— 本地私钥没有
+ * 可解锁账户，必然失败。这里用 Proxy 包一层：凡是传进来的 account 是字符串且等于本地
+ * 地址，就替换成真正的 Account 对象，于是本地签名 + eth_sendRawTransaction。
+ * 这样上层链上逻辑一行都不用改。
+ */
+function wrapLocalClient(base: WalletClient, account: LocalAccount): WalletClient {
+  const sameAddr = (v: unknown) =>
+    typeof v === 'string' && v.toLowerCase() === account.address.toLowerCase()
+
+  const fix = (args: unknown) => {
+    if (!args || typeof args !== 'object') return args
+    const o = args as Record<string, unknown>
+    if (sameAddr(o.account) || o.account == null) return { ...o, account }
+    return o
+  }
+
+  return new Proxy(base, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver)
+      if (typeof value !== 'function') return value
+      // 所有写入类方法的第一个参数都是 options 对象
+      if (
+        prop === 'writeContract'
+        || prop === 'sendTransaction'
+        || prop === 'signTypedData'
+        || prop === 'signMessage'
+        || prop === 'deployContract'
+      ) {
+        return (args: unknown, ...rest: unknown[]) =>
+          (value as (...a: unknown[]) => unknown).call(target, fix(args), ...rest)
+      }
+      return (value as (...a: unknown[]) => unknown).bind(target)
+    },
+  }) as WalletClient
+}
+
+/** 用已解锁的本地私钥建 walletClient；transport 走只读 RPC（自建节点优先） */
+export function makeLocalWalletClient(): { address: Address; walletClient: WalletClient } {
+  const account = getActiveAccount()
+  if (!account) throw new Error('本地私钥未解锁')
+  refreshPublicClient()
+  const base = createWalletClient({
+    account,
+    chain: getActiveChainConfig().chain,
+    transport: makeReadTransport(),
+  })
+  return { address: account.address, walletClient: wrapLocalClient(base, account) }
+}
 
 export async function connectWallet(): Promise<{ address: Address; walletClient: WalletClient }> {
   if (!window.ethereum) throw new Error('请安装 MetaMask / Rabby')

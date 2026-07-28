@@ -22,14 +22,29 @@ function trimPriceZeros(s: string): string {
   return trimmed.length ? trimmed : '0'
 }
 
-/** Human price — 一律用小数展示，不用科学计数法 */
+/** Human price — 大数缩写，避免天文数字把 UI 撑爆 */
 export function formatPrice(price: number, _digits = 6): string {
   if (!Number.isFinite(price) || price <= 0) return '—'
-  if (price >= 1_000_000) {
-    return price.toLocaleString('en-US', { maximumFractionDigits: 0 })
+  // ≥ 1e12：科学计数（全区间上限常见）
+  if (price >= 1e12) {
+    return price.toExponential(2).replace('e+', 'e')
   }
+  if (price >= 1e9) return `${trimPriceZeros((price / 1e9).toFixed(2))}B`
+  if (price >= 1e6) return `${trimPriceZeros((price / 1e6).toFixed(2))}M`
   if (price >= 1000) {
     return price.toLocaleString('en-US', { maximumFractionDigits: 2 })
+  }
+  /*
+   * 1 ~ 1000 这一段以前直接给 6 位小数，于是 169.889103 —— 三位整数配六位小数
+   * 是九位有效数字，价格区间读起来全是噪声。按量级继续往下铺台阶：
+   *   ≥100 → 2 位（169.89）      ≥10 → 3 位（22.418）
+   * 1 ~ 10 仍留 6 位，因为稳定币对就在这一段，1.000001 和 1.0 的差别不能被抹掉。
+   */
+  if (price >= 100) {
+    return trimPriceZeros(price.toFixed(2))
+  }
+  if (price >= 10) {
+    return trimPriceZeros(price.toFixed(3))
   }
   if (price >= 1) {
     return trimPriceZeros(price.toFixed(6))
@@ -253,6 +268,21 @@ export function formatAmount(raw: bigint, decimals: number, digits = 6): string 
   return `${neg ? '-' : ''}${wholeStr}${fracStr ? '.' + fracStr : ''}`
 }
 
+/** 列表卡用：大数量缩写成 K/M/B，避免一行被撑开 */
+export function formatAmountCompact(raw: bigint, decimals: number): string {
+  if (raw === 0n) return '0'
+  const n = rawToNumber(raw, decimals)
+  if (!Number.isFinite(n)) return formatAmount(raw, decimals, 2)
+  const abs = Math.abs(n)
+  const sign = n < 0 ? '-' : ''
+  if (abs >= 1e9) return `${sign}${trimPriceZeros((abs / 1e9).toFixed(2))}B`
+  if (abs >= 1e6) return `${sign}${trimPriceZeros((abs / 1e6).toFixed(2))}M`
+  if (abs >= 1e4) return `${sign}${trimPriceZeros((abs / 1e3).toFixed(2))}K`
+  if (abs >= 100) return `${sign}${trimPriceZeros(abs.toFixed(2))}`
+  if (abs >= 1) return `${sign}${trimPriceZeros(abs.toFixed(4))}`
+  return formatAmount(raw, decimals, 4)
+}
+
 /** 输入框/配对用：完整精度、无千分位，避免截断导致 Mint 滑点误杀 */
 export function formatAmountExact(raw: bigint, decimals: number): string {
   if (raw === 0n) return '0'
@@ -289,7 +319,27 @@ export function formatUsd(n: number): string {
   if (!Number.isFinite(n) || n < 0) return '—'
   // 明显异常的天文数字（fee growth 算炸）不展示
   if (n > 1e11) return '—'
-  return `US$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  /*
+   * 前缀是 `$` 不是 `US$`。两个原因，宽度那个是硬的：
+   *   · 等宽体下「US$26,140.20」要 94px，「$26,140.20」只要 78px。逐币明细在
+   *     1024 单列卡里那一格最多给到 91.5px —— 带 US 的版本必被省略号切掉，
+   *     而金额被截是错的信息，不是难看而已。
+   *   · Uniswap / Meteora / Raydium 印的都是 `$`。全站只有一种计价货币，
+   *     「US」这两个字符不携带任何信息。
+   */
+  return `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+
+/**
+ * 持仓时长。列表卡和详情卡共用 —— 之前详情卡自己搓了一套 `122d`，
+ * 同一个仓位在两个地方显示成「4.0 个月」和「122d」。
+ */
+export function formatAge(days?: number): string {
+  if (days == null || !Number.isFinite(days) || days < 0) return '—'
+  if (days < 1 / 24) return '刚建仓'
+  if (days < 1) return `${Math.round(days * 24)} 小时`
+  if (days < 60) return `${days < 10 ? days.toFixed(1) : Math.round(days)} 天`
+  return `${(days / 30.44).toFixed(1)} 个月`
 }
 
 export const MAX_UINT128 = 2n ** 128n - 1n
