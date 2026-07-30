@@ -142,8 +142,117 @@ export type PositionRow = {
   sqrtPriceX96: bigint
 }
 
+/** 同一物理池的稳定键：V3=池地址，V4=poolId；缺失时回退 token/fee/spacing */
+export function positionPoolKey(p: PositionRow): string {
+  if (p.version === 'v3' && p.poolAddress) {
+    return `v3:${p.poolAddress.toLowerCase()}`
+  }
+  if (p.version === 'v4' && p.poolId) {
+    return `v4:${p.poolId.toLowerCase()}`
+  }
+  const t0 = p.token0.address.toLowerCase()
+  const t1 = p.token1.address.toLowerCase()
+  const hooks = (p.hooks ?? '0x0000000000000000000000000000000000000000').toLowerCase()
+  return `${p.version}:${t0}:${t1}:${p.fee}:${p.tickSpacing}:${hooks}`
+}
+
+export type PoolFeeSummary = {
+  key: string
+  version: 'v3' | 'v4'
+  pair: string
+  fee: number
+  tickSpacing: number
+  poolAddress?: Address
+  poolId?: `0x${string}`
+  positionCount: number
+  inRangeCount: number
+  totalUsd: number
+  unclaimedUsd: number
+  claimedUsd: number
+  totalFeesUsd: number
+  /** 价值加权年化；无数据时 undefined */
+  feeAprPct?: number
+  token0Symbol: string
+  token1Symbol: string
+}
+
+/** 按池汇总「我的」手续费（未领 + 已领/复投） */
+export function aggregateFeesByPool(positions: PositionRow[]): PoolFeeSummary[] {
+  const map = new Map<string, {
+    sample: PositionRow
+    positionCount: number
+    inRangeCount: number
+    totalUsd: number
+    unclaimedUsd: number
+    claimedUsd: number
+    totalFeesUsd: number
+    aprWeight: number
+    aprSum: number
+  }>()
+
+  for (const p of positions) {
+    const key = positionPoolKey(p)
+    const unclaimed = p.fees0Usd + p.fees1Usd
+    let row = map.get(key)
+    if (!row) {
+      row = {
+        sample: p,
+        positionCount: 0,
+        inRangeCount: 0,
+        totalUsd: 0,
+        unclaimedUsd: 0,
+        claimedUsd: 0,
+        totalFeesUsd: 0,
+        aprWeight: 0,
+        aprSum: 0,
+      }
+      map.set(key, row)
+    }
+    row.positionCount += 1
+    if (p.inRange) row.inRangeCount += 1
+    row.totalUsd += p.totalUsd
+    row.unclaimedUsd += unclaimed
+    row.claimedUsd += p.claimedFeesUsd
+    row.totalFeesUsd += p.totalFeesUsd
+    if (p.feeAprPct != null && Number.isFinite(p.feeAprPct) && p.totalUsd > 0) {
+      row.aprWeight += p.totalUsd
+      row.aprSum += p.feeAprPct * p.totalUsd
+    }
+  }
+
+  const list: PoolFeeSummary[] = []
+  for (const [key, row] of map) {
+    const p = row.sample
+    list.push({
+      key,
+      version: p.version,
+      pair: `${p.token0.symbol}/${p.token1.symbol}`,
+      fee: p.fee,
+      tickSpacing: p.tickSpacing,
+      poolAddress: p.poolAddress,
+      poolId: p.poolId,
+      positionCount: row.positionCount,
+      inRangeCount: row.inRangeCount,
+      totalUsd: row.totalUsd,
+      unclaimedUsd: row.unclaimedUsd,
+      claimedUsd: row.claimedUsd,
+      totalFeesUsd: row.totalFeesUsd,
+      feeAprPct: row.aprWeight > 0 ? row.aprSum / row.aprWeight : undefined,
+      token0Symbol: p.token0.symbol,
+      token1Symbol: p.token1.symbol,
+    })
+  }
+
+  list.sort((a, b) => b.totalFeesUsd - a.totalFeesUsd || b.totalUsd - a.totalUsd)
+  return list
+}
+
 async function resolveToken(address: Address): Promise<TokenMeta> {
   if (address.toLowerCase() === '0x0000000000000000000000000000000000000000') {
+    // Arc 原生 gas 是 USDC（18 位内部精度），不是 ETH
+    if (getActiveChainId() === 5042) {
+      return { address, symbol: 'USDC', decimals: 18 }
+    }
     return { address, symbol: 'ETH', decimals: 18 }
   }
   const known = KNOWN_TOKENS[address.toLowerCase()]
@@ -169,6 +278,39 @@ export async function getErc20Balance(token: Address, owner: Address): Promise<b
 
 export async function getNativeBalance(owner: Address): Promise<bigint> {
   return publicClient.getBalance({ address: owner })
+}
+
+/**
+ * Arc：原生 USDC(18) 与 ERC-20 USDC(6) 是同一资产。
+ * Circle 建议 UI / 应用逻辑用 ERC-20 balanceOf + 6 位；用 getBalance+18 和钱包显示会对不上。
+ */
+export function isArcUsdcErc20(token: Address): boolean {
+  if (getActiveChainId() !== 5042) return false
+  return token.toLowerCase() === getStableAddress().toLowerCase()
+}
+
+/** 读代币余额（raw）+ 展示用 decimals */
+export async function getTokenBalanceView(
+  token: Address,
+  owner: Address,
+): Promise<{ raw: bigint; decimals: number; symbol: string }> {
+  if (isNativeCurrency(token) || token.toLowerCase() === '0x0000000000000000000000000000000000000000') {
+    if (getActiveChainId() === 5042) {
+      // 原生侧改读 ERC-20 USDC，与钱包一致
+      const stable = getStableAddress()
+      const raw = await getErc20Balance(stable, owner)
+      return { raw, decimals: 6, symbol: 'USDC' }
+    }
+    const raw = await getNativeBalance(owner)
+    return { raw, decimals: 18, symbol: 'ETH' }
+  }
+  if (isArcUsdcErc20(token)) {
+    const raw = await getErc20Balance(token, owner)
+    return { raw, decimals: 6, symbol: 'USDC' }
+  }
+  const meta = await resolveToken(token)
+  const raw = await getErc20Balance(token, owner)
+  return { raw, decimals: meta.decimals, symbol: meta.symbol }
 }
 
 /** 缓存池子静态元数据，刷新时只重读 slot0/liquidity */
@@ -1443,25 +1585,48 @@ export function computeFeeApr(opts: {
   return { ageDays, feeAprPct: apr }
 }
 
-const FEE_CACHE_KEY = 'uniswap-lp-lifetime-fees-v2'
-const FEE_CACHE_KEY_LEGACY = 'uniswap-lp-lifetime-fees-v1'
+/**
+ * v4：已领以「未领下降」为主（链上事件在 Arc/V4 原生币经常扫不到）。
+ * lastFees* 记录上次见到的未领；下降部分累加进 claimed。
+ */
+const FEE_CACHE_KEY = 'uniswap-lp-lifetime-fees-v4'
 
 type FeeCacheEntry = {
   claimed0: string
   claimed1: string
+  claimedUsd: number
+  /** 上次见到的未领手续费（raw） */
+  lastFees0: string
+  lastFees1: string
+  /**
+   * 应用内刚记账领取：等链上未领归零前，
+   * 不把仍残留的未领导入 lastFees，避免归零时再 delta 一次造成双计。
+   */
+  awaitFeeClear?: boolean
   updatedAt: number
+}
+
+function feeCacheKey(row: Pick<PositionRow, 'version' | 'tokenId'>): string {
+  return `${getActiveChainId()}-${row.version}-${row.tokenId.toString()}`
 }
 
 function readFeeCache(): Record<string, FeeCacheEntry> {
   try {
-    const raw = localStorage.getItem(FEE_CACHE_KEY) ?? localStorage.getItem(FEE_CACHE_KEY_LEGACY)
+    const raw = localStorage.getItem(FEE_CACHE_KEY)
     if (!raw) return {}
-    const parsed = JSON.parse(raw) as Record<string, FeeCacheEntry & { claimedFeesUsd?: number }>
+    const parsed = JSON.parse(raw) as Record<string, Partial<FeeCacheEntry>>
     if (!parsed || typeof parsed !== 'object') return {}
     const out: Record<string, FeeCacheEntry> = {}
     for (const [k, v] of Object.entries(parsed)) {
-      if (v?.claimed0 != null && v?.claimed1 != null) {
-        out[k] = { claimed0: v.claimed0, claimed1: v.claimed1, updatedAt: v.updatedAt ?? 0 }
+      if (v?.claimed0 == null || v?.claimed1 == null) continue
+      out[k] = {
+        claimed0: v.claimed0,
+        claimed1: v.claimed1,
+        claimedUsd: typeof v.claimedUsd === 'number' ? v.claimedUsd : 0,
+        lastFees0: v.lastFees0 ?? '',
+        lastFees1: v.lastFees1 ?? '',
+        awaitFeeClear: Boolean(v.awaitFeeClear),
+        updatedAt: v.updatedAt ?? 0,
       }
     }
     return out
@@ -1474,16 +1639,21 @@ function writeFeeCacheEntry(key: string, entry: FeeCacheEntry) {
   try {
     const all = readFeeCache()
     const prev = all[key]
-    if (
-      prev
-      && BigInt(prev.claimed0) >= BigInt(entry.claimed0)
-      && BigInt(prev.claimed1) >= BigInt(entry.claimed1)
-    ) {
-      return
+    let claimed0 = entry.claimed0
+    let claimed1 = entry.claimed1
+    let claimedUsd = entry.claimedUsd
+    if (prev && prev.claimedUsd > claimedUsd + 1e-9) {
+      claimed0 = prev.claimed0
+      claimed1 = prev.claimed1
+      claimedUsd = prev.claimedUsd
     }
     all[key] = {
-      claimed0: prev && BigInt(prev.claimed0) > BigInt(entry.claimed0) ? prev.claimed0 : entry.claimed0,
-      claimed1: prev && BigInt(prev.claimed1) > BigInt(entry.claimed1) ? prev.claimed1 : entry.claimed1,
+      claimed0,
+      claimed1,
+      claimedUsd,
+      lastFees0: entry.lastFees0,
+      lastFees1: entry.lastFees1,
+      awaitFeeClear: entry.awaitFeeClear,
       updatedAt: Date.now(),
     }
     localStorage.setItem(FEE_CACHE_KEY, JSON.stringify(all))
@@ -1504,35 +1674,106 @@ function computeClaimedFeesUsd(
   )
 }
 
+/**
+ * 合并已领：
+ * 1) 链上扫到的 row.claimed*
+ * 2) 本地缓存 high-water
+ * 3) 未领 raw 下降 → 视为刚领走（主路径，不依赖事件）
+ */
 function mergeCachedLifetimeFees(row: PositionRow, unclaimedFeesUsd: number, wethUsd: number): PositionRow {
-  const key = `${row.version}-${row.tokenId.toString()}`
+  const key = feeCacheKey(row)
   const cached = readFeeCache()[key]
-  const claimed0 = cached && BigInt(cached.claimed0) > row.claimed0 ? BigInt(cached.claimed0) : row.claimed0
-  const claimed1 = cached && BigInt(cached.claimed1) > row.claimed1 ? BigInt(cached.claimed1) : row.claimed1
-  const claimedFeesUsd = computeClaimedFeesUsd(row, claimed0, claimed1, wethUsd)
-  if (
-    claimed0 === row.claimed0
-    && claimed1 === row.claimed1
-    && claimedFeesUsd === row.claimedFeesUsd
-    && row.totalFeesUsd === clampUsd(unclaimedFeesUsd + claimedFeesUsd)
-  ) {
-    return row
+
+  let claimed0 = row.claimed0
+  let claimed1 = row.claimed1
+  if (cached) {
+    const c0 = BigInt(cached.claimed0)
+    const c1 = BigInt(cached.claimed1)
+    if (c0 > claimed0) claimed0 = c0
+    if (c1 > claimed1) claimed1 = c1
   }
-  return {
+
+  const awaiting = Boolean(cached?.awaitFeeClear)
+  const chainCleared = row.fees0 === 0n && row.fees1 === 0n
+
+  if (!awaiting) {
+    const hasLast = Boolean(cached && cached.lastFees0 !== '' && cached.lastFees1 !== '')
+    if (hasLast && cached) {
+      const last0 = BigInt(cached.lastFees0)
+      const last1 = BigInt(cached.lastFees1)
+      if (last0 > row.fees0) claimed0 += last0 - row.fees0
+      if (last1 > row.fees1) claimed1 += last1 - row.fees1
+    }
+  }
+
+  const claimedFeesUsd = computeClaimedFeesUsd(row, claimed0, claimed1, wethUsd)
+  const next: PositionRow = {
     ...row,
     claimed0,
     claimed1,
     claimedFeesUsd,
     totalFeesUsd: clampUsd(unclaimedFeesUsd + claimedFeesUsd),
   }
+
+  writeFeeCacheEntry(key, {
+    claimed0: next.claimed0.toString(),
+    claimed1: next.claimed1.toString(),
+    claimedUsd: next.claimedFeesUsd,
+    // 等待链上归零期间锁死 lastFees=0，避免 stale 未领导致二次 delta
+    lastFees0: awaiting && !chainCleared ? '0' : row.fees0.toString(),
+    lastFees1: awaiting && !chainCleared ? '0' : row.fees1.toString(),
+    awaitFeeClear: awaiting && !chainCleared,
+    updatedAt: Date.now(),
+  })
+
+  return next
 }
 
 function persistLifetimeFees(row: PositionRow) {
-  writeFeeCacheEntry(`${row.version}-${row.tokenId.toString()}`, {
+  const prev = readFeeCache()[feeCacheKey(row)]
+  writeFeeCacheEntry(feeCacheKey(row), {
     claimed0: row.claimed0.toString(),
     claimed1: row.claimed1.toString(),
+    claimedUsd: row.claimedFeesUsd,
+    lastFees0: row.fees0.toString(),
+    lastFees1: row.fees1.toString(),
+    awaitFeeClear: prev?.awaitFeeClear && !(row.fees0 === 0n && row.fees1 === 0n),
     updatedAt: Date.now(),
   })
+}
+
+/**
+ * 应用内领取/复投成功后立刻记账：把当前未领累加进已领。
+ * 不依赖后续事件扫描（Arc/V4 原生币尤其需要）。
+ */
+export function recordPositionClaim(
+  row: PositionRow,
+  wethUsd: number,
+): PositionRow {
+  const claimed0 = row.claimed0 + row.fees0
+  const claimed1 = row.claimed1 + row.fees1
+  const claimedFeesUsd = computeClaimedFeesUsd(row, claimed0, claimed1, wethUsd)
+  const next: PositionRow = {
+    ...row,
+    fees0: 0n,
+    fees1: 0n,
+    fees0Usd: 0,
+    fees1Usd: 0,
+    claimed0,
+    claimed1,
+    claimedFeesUsd,
+    totalFeesUsd: claimedFeesUsd,
+  }
+  writeFeeCacheEntry(feeCacheKey(next), {
+    claimed0: next.claimed0.toString(),
+    claimed1: next.claimed1.toString(),
+    claimedUsd: next.claimedFeesUsd,
+    lastFees0: '0',
+    lastFees1: '0',
+    awaitFeeClear: true,
+    updatedAt: Date.now(),
+  })
+  return next
 }
 
 /** 分块拉日志，避免 fromBlock=0 一次扫挂死；默认 9k 兼容 Alchemy 等 10k 限制 */
@@ -1691,48 +1932,33 @@ export async function loadPositionCashflow(tokenId: bigint): Promise<Cashflow> {
 
     let deposited0 = 0n
     let deposited1 = 0n
-    const incByTx = new Map<string, { a0: bigint; a1: bigint }>()
     for (const l of inc) {
-      const a0 = l.args.amount0 ?? 0n
-      const a1 = l.args.amount1 ?? 0n
-      deposited0 += a0
-      deposited1 += a1
-      const prev = incByTx.get(l.transactionHash) ?? { a0: 0n, a1: 0n }
-      incByTx.set(l.transactionHash, { a0: prev.a0 + a0, a1: prev.a1 + a1 })
+      deposited0 += l.args.amount0 ?? 0n
+      deposited1 += l.args.amount1 ?? 0n
     }
 
     let withdrawn0 = 0n
     let withdrawn1 = 0n
-    const decByTx = new Map<string, { a0: bigint; a1: bigint }>()
     for (const l of dec) {
-      const a0 = l.args.amount0 ?? 0n
-      const a1 = l.args.amount1 ?? 0n
-      withdrawn0 += a0
-      withdrawn1 += a1
-      const prev = decByTx.get(l.transactionHash) ?? { a0: 0n, a1: 0n }
-      decByTx.set(l.transactionHash, { a0: prev.a0 + a0, a1: prev.a1 + a1 })
+      withdrawn0 += l.args.amount0 ?? 0n
+      withdrawn1 += l.args.amount1 ?? 0n
     }
 
     /**
-     * 历史已领（含复投）：
-     * - 纯 Claim：全部 Collect
-     * - 撤出+Collect：Collect 减掉同笔 Decrease 本金
-     * - 复投（Collect + Increase）：仍计满 Collect，即使币又加回仓位
+     * 历史已领（含复投）= ΣCollect − ΣDecrease
+     * - 纯 Claim：无 Decrease，Collect 全算已领
+     * - 同笔/分笔撤出再 Collect：超出已撤本金的部分才是手续费
+     *   （旧逻辑按同 tx 配对，分两笔时会把本金算进已领）
+     * - 复投：Collect 后 Increase，Collect 仍计入已领
      */
-    let claimed0 = 0n
-    let claimed1 = 0n
+    let collected0 = 0n
+    let collected1 = 0n
     for (const l of col) {
-      const c0 = l.args.amount0 ?? 0n
-      const c1 = l.args.amount1 ?? 0n
-      const d = decByTx.get(l.transactionHash)
-      if (d) {
-        claimed0 += c0 > d.a0 ? c0 - d.a0 : 0n
-        claimed1 += c1 > d.a1 ? c1 - d.a1 : 0n
-      } else {
-        claimed0 += c0
-        claimed1 += c1
-      }
+      collected0 += l.args.amount0 ?? 0n
+      collected1 += l.args.amount1 ?? 0n
     }
+    const claimed0 = collected0 > withdrawn0 ? collected0 - withdrawn0 : 0n
+    const claimed1 = collected1 > withdrawn1 ? collected1 - withdrawn1 : 0n
 
     return {
       deposited0, deposited1, withdrawn0, withdrawn1, claimed0, claimed1,
@@ -2315,10 +2541,14 @@ async function feeTokenMovesInTx(
     const t0 = token0.toLowerCase()
     const t1 = token1.toLowerCase()
     const weth = CONTRACTS.weth.toLowerCase()
+    const stable = getStableAddress().toLowerCase()
+    // Arc 原生币是 USDC：池子里是 address(0)，实际转账可能是原生或 ERC-20 USDC
+    const matchNative = (token: string) =>
+      token === weth || token === stable || token === '0x0000000000000000000000000000000000000000'
     const match0 = (token: string) =>
-      token === t0 || (t0 === '0x0000000000000000000000000000000000000000' && token === weth)
+      token === t0 || (t0 === '0x0000000000000000000000000000000000000000' && matchNative(token))
     const match1 = (token: string) =>
-      token === t1 || (t1 === '0x0000000000000000000000000000000000000000' && token === weth)
+      token === t1 || (t1 === '0x0000000000000000000000000000000000000000' && matchNative(token))
     for (const log of receipt.logs) {
       try {
         const d = decodeEventLog({
@@ -2424,20 +2654,14 @@ export async function loadV4PositionCashflow(opts: {
       if (m.liquidityDelta > 0n) {
         deposited0 += amount0
         deposited1 += amount1
-        // 复投且手续费先进钱包：同笔 Transfer→owner 计为历史已领（不要把打进 PM 的加仓本金当手续费）
-        if (!claimedTx.has(m.transactionHash)) {
-          const got = await feeTokenMovesInTx(m.transactionHash, owner, token0, token1)
-          if (got.toOwner0 > 0n || got.toOwner1 > 0n) {
-            claimed0 += got.toOwner0
-            claimed1 += got.toOwner1
-            claimedTx.add(m.transactionHash)
-          }
-        }
+        // 加仓/Mint 不再把 Transfer→owner（常见是退款/找零）算进已领。
+        // 复投手续费应出现在同仓的 delta=0 ModifyLiquidity（领取）里。
       } else {
         withdrawn0 += amount0
         withdrawn1 += amount1
         if (!claimedTx.has(m.transactionHash)) {
           const got = await transfersToOwnerInTx(m.transactionHash, owner, token0, token1)
+          // 同笔撤出：进钱包超出本金估算的部分才是手续费；估算偏差时宁可少计
           if (got.amount0 > amount0) claimed0 += got.amount0 - amount0
           if (got.amount1 > amount1) claimed1 += got.amount1 - amount1
           claimedTx.add(m.transactionHash)
@@ -2660,6 +2884,35 @@ export async function loadV4Positions(
   return settled.filter((r): r is PositionRow => r !== null)
 }
 
+/** 会话内已确认的 ERC20 授权，避免 Arc 读不到 allowance / receipt 时卡死 */
+const sessionErc20Ok = new Set<string>()
+
+function erc20AllowKey(token: Address, owner: Address, spender: Address) {
+  return `${token.toLowerCase()}:${owner.toLowerCase()}:${spender.toLowerCase()}`
+}
+
+async function getReceiptViaWallet(hash: `0x${string}`): Promise<'success' | 'reverted' | null> {
+  const eth = typeof window !== 'undefined' ? window.ethereum : undefined
+  if (!eth?.request) return null
+  try {
+    const raw = (await eth.request({
+      method: 'eth_getTransactionReceipt',
+      params: [hash],
+    })) as { status?: string } | null
+    if (!raw) return null
+    const s = (raw.status ?? '').toLowerCase()
+    if (s === '0x1' || s === '1') return 'success'
+    if (s === '0x0' || s === '0') return 'reverted'
+    return 'success'
+  } catch {
+    return null
+  }
+}
+
+/**
+ * V3 授权：发出 approve 后优先用钱包 receipt / allowance 确认；
+ * Arc 上公共 RPC 经常卡死，超时也继续下一步（会话缓存防重复授权）。
+ */
 async function ensureAllowance(
   walletClient: WalletClient,
   token: Address,
@@ -2668,15 +2921,30 @@ async function ensureAllowance(
   amount: bigint,
   onStatus?: (msg: string) => void,
 ) {
-  if (amount === 0n) return
-  const allowance = await publicClient.readContract({
-    address: token,
-    abi: erc20Abi,
-    functionName: 'allowance',
-    args: [owner, spender],
-  })
-  if (allowance >= amount) return
-  // 默认无限授权，避免每次加仓都再签一次 approve
+  if (amount === 0n || isNativeEth(token)) return
+  const key = erc20AllowKey(token, owner, spender)
+  if (sessionErc20Ok.has(key)) return
+
+  let allowance = 0n
+  try {
+    allowance = await withTimeout(
+      publicClient.readContract({
+        address: token,
+        abi: erc20Abi,
+        functionName: 'allowance',
+        args: [owner, spender],
+      }),
+      4_000,
+      '读取授权',
+    )
+  } catch {
+    allowance = 0n
+  }
+  if (allowance >= amount) {
+    sessionErc20Ok.add(key)
+    return
+  }
+
   onStatus?.('需要授权代币，请在钱包确认…')
   const MAX_UINT256 = 2n ** 256n - 1n
   const hash = await walletClient.writeContract({
@@ -2684,18 +2952,59 @@ async function ensureAllowance(
     abi: erc20Abi,
     functionName: 'approve',
     args: [spender, MAX_UINT256],
-    // 跳过 estimateGas，加快弹窗
-    gas: 80_000n,
+    gas: 100_000n,
     chain: walletClient.chain,
     account: owner,
   })
-  onStatus?.('等待授权上链…')
-  await publicClient.waitForTransactionReceipt({
-    hash,
-    confirmations: 1,
-    pollingInterval: 400,
-    timeout: 60_000,
-  })
+  onStatus?.(`授权已提交 ${hash.slice(0, 10)}…，确认生效中`)
+
+  const start = Date.now()
+  let confirmed = false
+  while (Date.now() - start < 14_000) {
+    const viaWallet = await getReceiptViaWallet(hash)
+    if (viaWallet === 'reverted') {
+      throw new Error(`授权交易失败（已回滚）${hash.slice(0, 10)}…`)
+    }
+    if (viaWallet === 'success') {
+      confirmed = true
+      break
+    }
+    try {
+      const a = await withTimeout(
+        publicClient.readContract({
+          address: token,
+          abi: erc20Abi,
+          functionName: 'allowance',
+          args: [owner, spender],
+        }),
+        4_000,
+        '读取授权',
+      )
+      if (a >= amount) {
+        confirmed = true
+        break
+      }
+    } catch {
+      /* RPC 抖一下 */
+    }
+    try {
+      const r = await publicClient.getTransactionReceipt({ hash })
+      if (r.status === 'reverted') throw new Error(`授权交易失败（已回滚）${hash.slice(0, 10)}…`)
+      if (r.status === 'success') {
+        confirmed = true
+        break
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (/回滚|reverted/i.test(msg)) throw e
+    }
+    await new Promise((r) => setTimeout(r, 450))
+  }
+
+  // 即使用户已确认，Arc 也可能读不到 —— 缓存并继续，避免点三次
+  sessionErc20Ok.add(key)
+  onStatus?.(confirmed ? '代币授权已生效' : '授权已提交，继续下一步…')
+  if (!confirmed) await new Promise((r) => setTimeout(r, 1200))
 }
 
 function isWeth(addr: Address) {
@@ -2789,25 +3098,43 @@ async function writeMintOrIncrease(opts: {
     account: owner,
   })
 
-  // 退回多余 ETH（若有）
+  // 退回多余 ETH（若有）；Arc 上不等死 receipt，软等后尝试 refund
   if (value > 0n) {
-    await publicClient.waitForTransactionReceipt({ hash })
-    try {
-      const refundGas = await publicClient.estimateGas({
-        account: owner,
-        to: CONTRACTS.v3Npm,
-        data: encodeFunctionData({ abi: v3NpmAbi, functionName: 'refundETH' }),
-      })
-      await walletClient.writeContract({
-        address: CONTRACTS.v3Npm,
-        abi: v3NpmAbi,
-        functionName: 'refundETH',
-        gas: (refundGas * 130n) / 100n,
-        chain: walletClient.chain,
-        account: owner,
-      })
-    } catch {
-      /* 无多余 ETH 时可忽略 */
+    onStatus?.('Mint 已提交，尝试退回多余 ETH…')
+    const start = Date.now()
+    let mined = false
+    while (Date.now() - start < 12_000) {
+      const via = await getReceiptViaWallet(hash)
+      if (via === 'success') {
+        mined = true
+        break
+      }
+      if (via === 'reverted') break
+      try {
+        const r = await publicClient.getTransactionReceipt({ hash })
+        if (r.status === 'success') {
+          mined = true
+          break
+        }
+        if (r.status === 'reverted') break
+      } catch {
+        /* pending */
+      }
+      await new Promise((r) => setTimeout(r, 500))
+    }
+    if (mined) {
+      try {
+        await walletClient.writeContract({
+          address: CONTRACTS.v3Npm,
+          abi: v3NpmAbi,
+          functionName: 'refundETH',
+          gas: 80_000n,
+          chain: walletClient.chain,
+          account: owner,
+        })
+      } catch {
+        /* 无多余 ETH 时可忽略 */
+      }
     }
   }
 
@@ -2920,15 +3247,13 @@ export async function mintV3Position(opts: {
     }
   }
 
-  // 授权并行；纯 ETH 单边通常可跳过
-  await Promise.all([
-    (!(useNative && wethIs0) && use0 > 0n)
-      ? ensureAllowance(walletClient, usePool.token0.address, owner, CONTRACTS.v3Npm, use0, onStatus)
-      : Promise.resolve(),
-    (!(useNative && wethIs1) && use1 > 0n)
-      ? ensureAllowance(walletClient, usePool.token1.address, owner, CONTRACTS.v3Npm, use1, onStatus)
-      : Promise.resolve(),
-  ])
+  // 串行授权：先 token0 再 token1，避免双弹窗抢焦点；Arc 上软确认不卡死
+  if (!(useNative && wethIs0) && use0 > 0n) {
+    await ensureAllowance(walletClient, usePool.token0.address, owner, CONTRACTS.v3Npm, use0, onStatus)
+  }
+  if (!(useNative && wethIs1) && use1 > 0n) {
+    await ensureAllowance(walletClient, usePool.token1.address, owner, CONTRACTS.v3Npm, use1, onStatus)
+  }
 
   const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200)
   // 数量已与链上公式对齐：amountMin 用 0，杜绝假滑点；多余 desired 不会被多扣
@@ -3496,8 +3821,9 @@ export async function claimAndCompoundV4(opts: {
   owner: Address
   position: PositionRow
   slippageBps?: number
+  onStatus?: (msg: string) => void
 }): Promise<CompoundResult> {
-  const { walletClient, owner, position } = opts
+  const { walletClient, owner, position, onStatus } = opts
   if (position.version !== 'v4') throw new Error('需要 V4 仓位')
 
   const fee0 = position.fees0
@@ -3527,8 +3853,25 @@ export async function claimAndCompoundV4(opts: {
     canCompound = use0 > 0n || use1 > 0n
   }
 
+  onStatus?.('领取 V4 手续费…')
   const claimHash = await claimV4({ walletClient, owner, position })
-  await publicClient.waitForTransactionReceipt({ hash: claimHash })
+  onStatus?.(`领取已提交 ${claimHash.slice(0, 10)}…，等待上链`)
+  try {
+    await withTimeout(
+      publicClient.waitForTransactionReceipt({
+        hash: claimHash,
+        confirmations: 1,
+        pollingInterval: 600,
+        timeout: 25_000,
+      }),
+      28_000,
+      '领取确认',
+    )
+  } catch {
+    // Arc 上 receipt 常读不到：稍等再复投，避免整条链路卡死
+    onStatus?.('领取确认偏慢，继续尝试复投…')
+    await new Promise((r) => setTimeout(r, 1500))
+  }
 
   if (!canCompound) {
     return {
@@ -3578,6 +3921,7 @@ export async function claimAndCompoundV4(opts: {
       useNativeEth: isNativeCurrency(position.token0.address) || isNativeCurrency(position.token1.address),
       slippageBps: Math.max(opts.slippageBps ?? 300, 500),
       capToProvided: true,
+      onStatus,
     })
     return {
       claimHash,
@@ -3602,6 +3946,7 @@ export async function claimAndCompound(opts: {
   owner: Address
   position: PositionRow
   slippageBps?: number
+  onStatus?: (msg: string) => void
 }): Promise<CompoundResult> {
   if (opts.position.version === 'v4') {
     return claimAndCompoundV4(opts)

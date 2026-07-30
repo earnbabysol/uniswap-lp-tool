@@ -172,6 +172,14 @@ export function PositionDetailCard({
           <span className="pdc-v ok">{formatUsd(unclaimedUsd)}</span>
         </div>
         <div className="pdc-stat">
+          <span className="pdc-k">已领手续费</span>
+          <span className="pdc-v ok">{formatUsd(p.claimedFeesUsd)}</span>
+        </div>
+        <div className="pdc-stat">
+          <span className="pdc-k">累计手续费</span>
+          <span className="pdc-v ok">{formatUsd(p.totalFeesUsd)}</span>
+        </div>
+        <div className="pdc-stat">
           <span className="pdc-k">已存入</span>
           <span className="pdc-v">{deposited > 0 ? formatUsd(deposited) : '—'}</span>
         </div>

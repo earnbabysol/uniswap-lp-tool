@@ -10,6 +10,7 @@ import {
   type WalletClient,
 } from 'viem'
 import { CONTRACTS, chainHasWrappedNative } from './chain'
+import { withTimeout } from './async'
 import { erc20Abi, permit2Abi, v4PositionManagerAbi } from './abis'
 import {
   getAmount0ForLiquidity,
@@ -239,51 +240,304 @@ function maxAmountsForLiquidity(opts: {
   }
 }
 
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+/** 会话内已确认的授权，避免 Arc RPC 读不到 allowance 时反复卡死 */
+const sessionErc20Permit2Ok = new Set<string>()
+const sessionPermit2PmOk = new Set<string>()
+
+function erc20Permit2Key(token: Address, owner: Address) {
+  return `${token.toLowerCase()}:${owner.toLowerCase()}:p2`
+}
+function permit2PmKey(token: Address, owner: Address) {
+  return `${token.toLowerCase()}:${owner.toLowerCase()}:pm`
+}
+
+/** 优先走钱包 eth_getTransactionReceipt（Arc 公共 RPC 经常读不到） */
+async function getReceiptViaWallet(hash: `0x${string}`): Promise<{ status: 'success' | 'reverted' } | null> {
+  const eth = typeof window !== 'undefined' ? window.ethereum : undefined
+  if (!eth?.request) return null
+  try {
+    const raw = (await eth.request({
+      method: 'eth_getTransactionReceipt',
+      params: [hash],
+    })) as { status?: string } | null
+    if (!raw) return null
+    const s = (raw.status ?? '').toLowerCase()
+    if (s === '0x1' || s === '1') return { status: 'success' }
+    if (s === '0x0' || s === '0') return { status: 'reverted' }
+    // 有些节点有 receipt 但无 status 字段，当作已上链成功
+    return { status: 'success' }
+  } catch {
+    return null
+  }
+}
+
+/** 软等 receipt：失败不抛，Arc 上 receipt 经常读不到 */
+async function waitTxReceiptSoft(hash: `0x${string}`, timeoutMs = 20_000) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    const viaWallet = await getReceiptViaWallet(hash)
+    if (viaWallet) {
+      if (viaWallet.status === 'reverted') {
+        throw new Error(`交易失败（已回滚）${hash.slice(0, 10)}…`)
+      }
+      return viaWallet
+    }
+    try {
+      const r = await publicClient.getTransactionReceipt({ hash })
+      if (r) {
+        if (r.status === 'reverted') throw new Error(`交易失败（已回滚）${hash.slice(0, 10)}…`)
+        return r
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (/回滚|reverted/i.test(msg)) throw e
+    }
+    await sleep(500)
+  }
+  return null
+}
+
+/** Arc 等慢/烂 RPC：等 receipt；超时抛带 hash 的提示（用于最终业务交易） */
+async function waitTxReceipt(hash: `0x${string}`, label = '等待上链') {
+  const soft = await waitTxReceiptSoft(hash, 60_000)
+  if (soft) return soft
+  throw new Error(
+    `${label}超时（${hash.slice(0, 10)}…）。交易可能已发出，请到区块浏览器确认后再刷新。`,
+  )
+}
+
+/**
+ * 授权确认：receipt（钱包优先）或链上状态任一成功即继续。
+ * 超过 softMs 仍无信号也返回 false（调用方会继续下一步，避免卡死）。
+ */
+async function waitApprovalReady(opts: {
+  hash: `0x${string}`
+  label: string
+  onStatus?: (msg: string) => void
+  check: () => Promise<boolean>
+  /** 硬等上限；超时返回 false，由调用方乐观继续 */
+  timeoutMs?: number
+}): Promise<boolean> {
+  const timeoutMs = opts.timeoutMs ?? 12_000
+  const start = Date.now()
+  let n = 0
+  opts.onStatus?.(`${opts.label}…`)
+
+  while (Date.now() - start < timeoutMs) {
+    n += 1
+    if (n === 1 || n % 4 === 0) opts.onStatus?.(`${opts.label}…`)
+
+    const viaWallet = await getReceiptViaWallet(opts.hash)
+    if (viaWallet?.status === 'reverted') {
+      throw new Error(`授权交易失败（已回滚）${opts.hash.slice(0, 10)}…`)
+    }
+    if (viaWallet?.status === 'success') {
+      try {
+        if (await opts.check()) return true
+      } catch {
+        /* ignore */
+      }
+      await sleep(300)
+      return true
+    }
+
+    try {
+      if (await opts.check()) return true
+    } catch {
+      /* RPC 抖一下 */
+    }
+
+    try {
+      const r = await publicClient.getTransactionReceipt({ hash: opts.hash })
+      if (r?.status === 'reverted') {
+        throw new Error(`授权交易失败（已回滚）${opts.hash.slice(0, 10)}…`)
+      }
+      if (r?.status === 'success') {
+        try {
+          if (await opts.check()) return true
+        } catch {
+          /* ignore */
+        }
+        await sleep(300)
+        return true
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (/回滚|reverted/i.test(msg)) throw e
+    }
+
+    await sleep(400)
+  }
+
+  try {
+    if (await opts.check()) return true
+  } catch {
+    /* ignore */
+  }
+  return false
+}
+
+/** estimateGas 超过 raceMs 就用 fallback，避免 Arc 上一直卡在「创建中」 */
+async function estimateGasQuick(opts: {
+  account: Address
+  to: Address
+  data: `0x${string}`
+  value?: bigint
+  fallback: bigint
+  raceMs?: number
+}): Promise<bigint> {
+  const { account, to, data, value, fallback, raceMs = 1500 } = opts
+  try {
+    const estimated = await Promise.race([
+      publicClient
+        .estimateGas({
+          account,
+          to,
+          data,
+          value: value && value > 0n ? value : undefined,
+        })
+        .then((g) => (g * 130n) / 100n),
+      new Promise<bigint>((resolve) => {
+        setTimeout(() => resolve(fallback), raceMs)
+      }),
+    ])
+    return estimated < 21_000n ? fallback : estimated
+  } catch (e) {
+    const raw = e instanceof Error ? e.message : String(e)
+    if (/MaximumAmountExceeded/i.test(raw)) throw e
+    return fallback
+  }
+}
+
+async function readErc20Allowance(token: Address, owner: Address, spender: Address): Promise<bigint> {
+  return withTimeout(
+    publicClient.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: 'allowance',
+      args: [owner, spender],
+    }),
+    4_000,
+    '读取授权',
+  )
+}
+
+async function readPermit2Allowance(
+  owner: Address,
+  token: Address,
+): Promise<readonly [bigint, number, number]> {
+  return withTimeout(
+    publicClient.readContract({
+      address: CONTRACTS.permit2,
+      abi: permit2Abi,
+      functionName: 'allowance',
+      args: [owner, token, CONTRACTS.v4PositionManager],
+    }),
+    4_000,
+    '读取 Permit2',
+  ) as Promise<readonly [bigint, number, number]>
+}
+
+/**
+ * V4 授权：ERC20→Permit2，再 Permit2→PositionManager。
+ * Arc：钱包 receipt 优先；会话缓存已授权，避免 RPC 读不到 allowance 时卡死/点三次。
+ */
 async function ensurePermit2(
   walletClient: WalletClient,
   token: Address,
   owner: Address,
   amount: bigint,
+  onStatus?: (msg: string) => void,
 ) {
   if (isNativeCurrency(token) || amount <= 0n) return
 
-  const allowance = await publicClient.readContract({
-    address: token,
-    abi: erc20Abi,
-    functionName: 'allowance',
-    args: [owner, CONTRACTS.permit2],
-  })
+  const eKey = erc20Permit2Key(token, owner)
+  const pKey = permit2PmKey(token, owner)
+
+  let allowance = 0n
+  if (!sessionErc20Permit2Ok.has(eKey)) {
+    try {
+      allowance = await readErc20Allowance(token, owner, CONTRACTS.permit2)
+    } catch {
+      allowance = 0n
+    }
+  } else {
+    allowance = amount // 本会话已确认过
+  }
+
   if (allowance < amount) {
+    onStatus?.('需要授权代币给 Permit2，请在钱包确认…')
     const hash = await walletClient.writeContract({
       address: token,
       abi: erc20Abi,
       functionName: 'approve',
       args: [CONTRACTS.permit2, (1n << 256n) - 1n],
+      gas: 100_000n,
       chain: walletClient.chain,
       account: owner,
     })
-    await publicClient.waitForTransactionReceipt({ hash })
+    onStatus?.(`代币授权已提交 ${hash.slice(0, 10)}…，确认生效中`)
+    const ok = await waitApprovalReady({
+      hash,
+      label: '确认代币授权生效',
+      onStatus,
+      timeoutMs: 14_000,
+      check: async () => (await readErc20Allowance(token, owner, CONTRACTS.permit2)) >= amount,
+    })
+    // 即使用户钱包已确认，Arc 也可能读不到 receipt/allowance —— 缓存并继续弹下一笔
+    sessionErc20Permit2Ok.add(eKey)
+    onStatus?.(ok ? '代币授权已生效' : '代币授权已提交，继续 Permit2…')
+    // 给节点一点传播时间，再弹下一笔，降低「授权未生效」失败率
+    if (!ok) await sleep(1200)
+  } else {
+    sessionErc20Permit2Ok.add(eKey)
   }
 
   const now = Math.floor(Date.now() / 1000)
-  const existing = await publicClient.readContract({
-    address: CONTRACTS.permit2,
-    abi: permit2Abi,
-    functionName: 'allowance',
-    args: [owner, token, CONTRACTS.v4PositionManager],
-  })
-  const [allowedAmount, expiration] = existing as readonly [bigint, number, number]
-  if (allowedAmount >= amount && Number(expiration) > now + 60) return
+  let needPermit2 = !sessionPermit2PmOk.has(pKey)
+  if (needPermit2) {
+    try {
+      const [allowedAmount, expiration] = await readPermit2Allowance(owner, token)
+      if (allowedAmount >= amount && Number(expiration) > now + 60) {
+        needPermit2 = false
+        sessionPermit2PmOk.add(pKey)
+      }
+    } catch {
+      /* 读失败则走授权 */
+    }
+  }
+  if (!needPermit2) return
 
+  onStatus?.('需要 Permit2 授权 PositionManager，请在钱包确认…')
   const hash2 = await walletClient.writeContract({
     address: CONTRACTS.permit2,
     abi: permit2Abi,
     functionName: 'approve',
     args: [token, CONTRACTS.v4PositionManager, maxUint160, Number(maxUint48)],
+    gas: 120_000n,
     chain: walletClient.chain,
     account: owner,
   })
-  await publicClient.waitForTransactionReceipt({ hash: hash2 })
+  onStatus?.(`Permit2 授权已提交 ${hash2.slice(0, 10)}…，确认生效中`)
+  const ok2 = await waitApprovalReady({
+    hash: hash2,
+    label: '确认 Permit2 授权生效',
+    onStatus,
+    timeoutMs: 14_000,
+    check: async () => {
+      const [amt, exp] = await readPermit2Allowance(owner, token)
+      return amt >= amount && Number(exp) > Math.floor(Date.now() / 1000) + 30
+    },
+  })
+  sessionPermit2PmOk.add(pKey)
+  onStatus?.(ok2 ? 'Permit2 授权已生效' : 'Permit2 已提交，继续交易…')
+  if (!ok2) await sleep(1200)
 }
 
 async function writeModifyLiquidities(opts: {
@@ -292,21 +546,24 @@ async function writeModifyLiquidities(opts: {
   unlockData: `0x${string}`
   value?: bigint
   action: string
+  onStatus?: (msg: string) => void
 }) {
-  const { walletClient, owner, unlockData, value = 0n, action } = opts
+  const { walletClient, owner, unlockData, value = 0n, action, onStatus } = opts
   const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200)
   const data = encodeFunctionData({
     abi: v4PositionManagerAbi,
     functionName: 'modifyLiquidities',
     args: [unlockData, deadline],
   })
+  onStatus?.(`准备 ${action}…`)
   let gas: bigint
   try {
-    gas = await publicClient.estimateGas({
+    gas = await estimateGasQuick({
       account: owner,
       to: CONTRACTS.v4PositionManager,
       data,
-      value: value > 0n ? value : undefined,
+      value,
+      fallback: 1_800_000n,
     })
   } catch (e) {
     const raw = e instanceof Error ? e.message : String(e)
@@ -317,13 +574,14 @@ async function writeModifyLiquidities(opts: {
     }
     throw new Error(`${action} 失败：${raw.slice(0, 220)}`)
   }
+  onStatus?.(`请在钱包确认 ${action}…`)
   return walletClient.writeContract({
     address: CONTRACTS.v4PositionManager,
     abi: v4PositionManagerAbi,
     functionName: 'modifyLiquidities',
     args: [unlockData, deadline],
     value: value > 0n ? value : undefined,
-    gas: (gas * 130n) / 100n,
+    gas,
     chain: walletClient.chain,
     account: owner,
   })
@@ -458,7 +716,7 @@ async function ensureWethBalance(opts: {
   useNativeEth: boolean
 }) {
   const { walletClient, owner, currency0, currency1, amount0, amount1, useNativeEth } = opts
-  if (!useNativeEth) return
+  if (!useNativeEth || !chainHasWrappedNative()) return
   let need = 0n
   if (currency0.toLowerCase() === CONTRACTS.weth.toLowerCase()) need = amount0
   if (currency1.toLowerCase() === CONTRACTS.weth.toLowerCase() && amount1 > need) need = amount1
@@ -471,7 +729,7 @@ async function ensureWethBalance(opts: {
   })
   if (bal >= need) return
   const hash = await wrapEth({ walletClient, owner, amount: need - bal })
-  await publicClient.waitForTransactionReceipt({ hash })
+  await waitTxReceipt(hash, 'Wrap ETH 确认')
 }
 
 export async function mintV4Position(opts: {
@@ -485,8 +743,9 @@ export async function mintV4Position(opts: {
   percent?: number
   useNativeEth?: boolean
   slippageBps?: number
+  onStatus?: (msg: string) => void
 }) {
-  const { walletClient, owner } = opts
+  const { walletClient, owner, onStatus } = opts
   const slippageBps = opts.slippageBps ?? 300
   const useNativeEth = Boolean(opts.useNativeEth)
   if (opts.pool.version !== 'v4' || !opts.pool.poolId) throw new Error('需要 V4 池')
@@ -571,8 +830,8 @@ export async function mintV4Position(opts: {
   })
 
   // 原生 ETH 侧不走 Permit2
-  await ensurePermit2(walletClient, key.currency0, owner, nativeIs0 ? 0n : amount0Max)
-  await ensurePermit2(walletClient, key.currency1, owner, nativeIs1 ? 0n : amount1Max)
+  await ensurePermit2(walletClient, key.currency0, owner, nativeIs0 ? 0n : amount0Max, onStatus)
+  await ensurePermit2(walletClient, key.currency1, owner, nativeIs1 ? 0n : amount1Max, onStatus)
 
   const actions: number[] = [V4_ACTIONS.MINT_POSITION, V4_ACTIONS.SETTLE_PAIR]
   const params: `0x${string}`[] = [
@@ -594,8 +853,10 @@ export async function mintV4Position(opts: {
     unlockData: encodeUnlockData(actions, params),
     value,
     action: 'Mint V4',
+    onStatus,
   })
 }
+
 
 /**
  * 创建并初始化 V4 池；若提供 amount0/amount1 则同笔 multicall 注入首仓。
@@ -650,11 +911,16 @@ export async function createV4PoolAndSeed(opts: {
     hooks: opts.hooks ?? NATIVE_ETH,
   }
 
-  // 小数位：原生 ETH 按 18
+  onStatus?.('读取代币精度与池状态…')
+  // 小数位：原生币按链原生精度（Arc USDC 内部 18）
   const decOf = async (c: Address) => {
     if (isNativeCurrency(c)) return 18
     return Number(
-      await publicClient.readContract({ address: c, abi: erc20Abi, functionName: 'decimals' }),
+      await withTimeout(
+        publicClient.readContract({ address: c, abi: erc20Abi, functionName: 'decimals' }),
+        15_000,
+        '读取 decimals',
+      ),
     )
   }
   const [dec0, dec1] = await Promise.all([decOf(currency0), decOf(currency1)])
@@ -682,6 +948,7 @@ export async function createV4PoolAndSeed(opts: {
       tickUpper: opts.tickUpper,
       useNativeEth: useNative,
       slippageBps,
+      onStatus,
     })
     return { pool: await loadV4Pool(key), hash, seeded: true }
   }
@@ -721,7 +988,7 @@ export async function createV4PoolAndSeed(opts: {
     }
     if (amount0 <= 0n && amount1 <= 0n) throw new Error('注入数量必须 > 0')
 
-    if (!isNativeCurrency(currency0) && !isNativeCurrency(currency1)) {
+    if (chainHasWrappedNative() && !isNativeCurrency(currency0) && !isNativeCurrency(currency1)) {
       await ensureWethBalance({
         walletClient,
         owner,
@@ -744,13 +1011,11 @@ export async function createV4PoolAndSeed(opts: {
     })
     amount0Max = maxed.amount0Max
     amount1Max = maxed.amount1Max
-    await ensurePermit2(walletClient, currency0, owner, amount0Max)
-    await ensurePermit2(walletClient, currency1, owner, amount1Max)
+    await ensurePermit2(walletClient, currency0, owner, amount0Max, onStatus)
+    await ensurePermit2(walletClient, currency1, owner, amount1Max, onStatus)
     if (isNativeCurrency(currency0)) value = bumpAmountMax(maxed.amount0, slippageBps)
     if (isNativeCurrency(currency1)) value = bumpAmountMax(maxed.amount1, slippageBps)
   }
-
-  onStatus?.(wantSeed ? '创建 V4 池并注入流动性…' : '创建并初始化 V4 池…')
 
   const initData = encodeFunctionData({
     abi: v4PositionManagerAbi,
@@ -783,32 +1048,58 @@ export async function createV4PoolAndSeed(opts: {
     functionName: 'multicall',
     args: [calls],
   })
-  let gas: bigint
-  try {
-    gas = await publicClient.estimateGas({
-      account: owner,
-      to: CONTRACTS.v4PositionManager,
-      data,
-      value: value > 0n ? value : undefined,
-    })
-  } catch (e) {
-    const raw = e instanceof Error ? e.message : String(e)
-    throw new Error(`创建 V4 失败：${raw.slice(0, 220)}`)
-  }
 
+  onStatus?.(wantSeed ? '准备创建 V4 池并注入…' : '准备创建并初始化 V4 池…')
+  const gas = await estimateGasQuick({
+    account: owner,
+    to: CONTRACTS.v4PositionManager,
+    data,
+    value,
+    // init + mint 较重；估 gas 卡住时用此值尽快弹钱包
+    fallback: wantSeed ? 3_500_000n : 800_000n,
+    raceMs: 1500,
+  })
+
+  onStatus?.(wantSeed ? '请在钱包确认：创建 V4 池并注入流动性…' : '请在钱包确认：创建 V4 池…')
   const hash = await walletClient.writeContract({
     address: CONTRACTS.v4PositionManager,
     abi: v4PositionManagerAbi,
     functionName: 'multicall',
     args: [calls],
     value: value > 0n ? value : undefined,
-    gas: (gas * 130n) / 100n,
+    gas,
     chain: walletClient.chain,
     account: owner,
   })
-  await publicClient.waitForTransactionReceipt({ hash })
-  const pool = await loadV4Pool(key)
-  if (!(pool.sqrtPriceX96 > 0n)) throw new Error('创建成功但尚未读到池价，请稍后刷新')
+  onStatus?.(`创建交易已提交 ${hash.slice(0, 10)}…，确认上链中`)
+  const receipt = await waitTxReceiptSoft(hash, 60_000)
+  // Arc 上 receipt 常读不到：轮询池是否已初始化
+  const waitPoolMs = receipt ? 15_000 : 75_000
+  const poolStart = Date.now()
+  let poolReady = false
+  let n = 0
+  while (Date.now() - poolStart < waitPoolMs) {
+    n += 1
+    if (n === 1 || n % 4 === 0) onStatus?.('确认池已创建…')
+    try {
+      const p = await loadV4Pool(key)
+      if (p && p.sqrtPriceX96 > 0n) {
+        poolReady = true
+        return { pool: p, hash, seeded: wantSeed }
+      }
+    } catch {
+      /* RPC 抖一下 */
+    }
+    await sleep(700)
+  }
+  const pool = await loadV4Pool(key).catch(() => null)
+  if (!pool || !(pool.sqrtPriceX96 > 0n)) {
+    throw new Error(
+      poolReady
+        ? '创建成功但尚未读到池价，请稍后刷新'
+        : `创建交易已发出（${hash.slice(0, 10)}…）但尚未读到池状态。请到浏览器确认成功后刷新再加仓。`,
+    )
+  }
   return { pool, hash, seeded: wantSeed }
 }
 
@@ -825,8 +1116,9 @@ export async function increaseV4Liquidity(opts: {
    * 且 amountMax 不超过提供量，避免 SETTLE 从钱包多扣本金。
    */
   capToProvided?: boolean
+  onStatus?: (msg: string) => void
 }) {
-  const { walletClient, owner, position } = opts
+  const { walletClient, owner, position, onStatus } = opts
   const slippageBps = opts.slippageBps ?? 300
   if (position.version !== 'v4') throw new Error('需要 V4 仓位')
   const key = poolKeyFromPosition(position)
@@ -913,8 +1205,8 @@ export async function increaseV4Liquidity(opts: {
     amount1Max = maxed.amount1Max
   }
 
-  await ensurePermit2(walletClient, key.currency0, owner, nativeIs0 ? 0n : amount0Max)
-  await ensurePermit2(walletClient, key.currency1, owner, nativeIs1 ? 0n : amount1Max)
+  await ensurePermit2(walletClient, key.currency0, owner, nativeIs0 ? 0n : amount0Max, onStatus)
+  await ensurePermit2(walletClient, key.currency1, owner, nativeIs1 ? 0n : amount1Max, onStatus)
 
   const actions: number[] = [V4_ACTIONS.INCREASE_LIQUIDITY, V4_ACTIONS.SETTLE_PAIR]
   const params: `0x${string}`[] = [
@@ -935,6 +1227,7 @@ export async function increaseV4Liquidity(opts: {
     unlockData: encodeUnlockData(actions, params),
     value,
     action: '加仓 V4',
+    onStatus,
   })
 }
 

@@ -27,7 +27,10 @@ import {
   formatAmount,
   getErc20Balance,
   getNativeBalance,
+  getTokenBalanceView,
+  isArcUsdcErc20,
   getTokenUsdPrice,
+  getWethUsdPrice,
   increaseV3Liquidity,
   increaseV4Liquidity,
   isEthLikeCurrency,
@@ -47,6 +50,7 @@ import {
   mintV3Position,
   mintV4Position,
   pairHasWeth,
+  recordPositionClaim,
   removeV3Liquidity,
   removeV4Liquidity,
   rebalanceV3,
@@ -61,6 +65,8 @@ import {
   unwrapWeth,
   wrapEth,
   loadV4PoolById,
+  aggregateFeesByPool,
+  positionPoolKey,
   type DiscoveredPool,
   type PoolDepth,
   type PoolInfo,
@@ -69,6 +75,7 @@ import {
 import { RangeDepthChart } from './RangeDepthChart'
 import { PositionDetailCard, estimateRebalanceHalfPercent } from './PositionDetailCard'
 import { PositionLegs } from './PositionLegs'
+import { quotePoolSwap, swapInPool, type PoolSwapQuote } from './swap'
 import { parseAmount, formatAge, formatPrice, formatUsd, pairAmountForRange, formatAmountExact, priceToClosestTick, priceToSqrtPriceX96, tickToPrice } from './math'
 import { withTimeout } from './async'
 import {
@@ -320,8 +327,14 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [lastRefreshAt, setLastRefreshAt] = useState<number | null>(null)
+  /** 原生余额 raw（18 位 wei；Arc 上也是原生 USDC 的 18 位内部精度，用于 gas/value） */
   const [ethBal, setEthBal] = useState<bigint>(0n)
   const [wethBal, setWethBal] = useState<bigint>(0n)
+  /** 钱包条展示：Arc 用 ERC-20 USDC(6)，其它链直接展示 ethBal(18) */
+  const [gasTokenDisplay, setGasTokenDisplay] = useState<{ raw: bigint; decimals: number }>({
+    raw: 0n,
+    decimals: 18,
+  })
 
   const [tab, setTab] = useState<TabKey>('positions')
   /** 签名方式：'wallet' 插件钱包 / 'local' 本地私钥。两者互斥 */
@@ -346,11 +359,17 @@ export default function App() {
   const [themeMode, setThemeMode] = useTheme()
   const [showSettings, setShowSettings] = usePersistentState('showSettings', false)
   const [removePct, setRemovePct] = useState(100)
-  const [posOpMode, setPosOpMode] = useState<'add' | 'remove'>('add')
+  const [posOpMode, setPosOpMode] = useState<'add' | 'remove' | 'swap'>('add')
   const [add0, setAdd0] = useState('')
   const [add1, setAdd1] = useState('')
   const [addBal0, setAddBal0] = useState<bigint>(0n)
   const [addBal1, setAddBal1] = useState<bigint>(0n)
+  /** 本池 Swap：true = token0→token1 */
+  const [swapZeroForOne, setSwapZeroForOne] = useState(true)
+  const [swapAmount, setSwapAmount] = useState('')
+  const [swapQuote, setSwapQuote] = useState<PoolSwapQuote | null>(null)
+  const [swapQuoteBusy, setSwapQuoteBusy] = useState(false)
+  const [swapQuoteErr, setSwapQuoteErr] = useState<string | null>(null)
   const [autoRefresh, setAutoRefresh] = usePersistentState('autoRefresh', false)
   const [refreshSecs, setRefreshSecs] = usePersistentState<number>('refreshSecs', 60)
   const [confirmReq, setConfirmReq] = useState<ConfirmRequest | null>(null)
@@ -426,6 +445,10 @@ export default function App() {
     if (!selectedId) return
     const el = document.getElementById('position-detail-card')
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    setSwapAmount('')
+    setSwapQuote(null)
+    setSwapQuoteErr(null)
+    setSwapZeroForOne(true)
   }, [selectedId])
 
   const summary = useMemo(() => {
@@ -452,6 +475,13 @@ export default function App() {
     const feeAprPct = aprWeight > 0 ? aprSum / aprWeight : undefined
     return { totalUsd, feesUsd, unclaimedUsd, claimedUsd, pnlUsd, inRange, atRisk, feeAprPct, n: positions.length }
   }, [positions])
+
+  const poolFeeSummaries = useMemo(() => aggregateFeesByPool(positions), [positions])
+  const poolFeeByKey = useMemo(() => {
+    const m = new Map<string, (typeof poolFeeSummaries)[number]>()
+    for (const row of poolFeeSummaries) m.set(row.key, row)
+    return m
+  }, [poolFeeSummaries])
 
   const counts = useMemo(
     () => ({
@@ -534,6 +564,14 @@ export default function App() {
     try {
       const eth = await getNativeBalance(addr)
       setEthBal(eth)
+      if (chainCfg.key === 'arc') {
+        // 展示走 ERC-20 USDC(6)，与 Rabby/MetaMask 一致；ethBal 仍保留原生 18 位供 gas
+        const usdc = await getTokenBalanceView(CONTRACTS.stable, addr)
+        setGasTokenDisplay({ raw: usdc.raw, decimals: usdc.decimals })
+        setWethBal(0n)
+        return
+      }
+      setGasTokenDisplay({ raw: eth, decimals: 18 })
       if (chainHasWrappedNative()) {
         setWethBal(await getErc20Balance(CONTRACTS.weth, addr))
       } else {
@@ -542,7 +580,7 @@ export default function App() {
     } catch {
       /* ignore */
     }
-  }, [])
+  }, [chainCfg.key])
 
   const connect = async () => {
     // 互斥：本地私钥解锁时不允许再连插件钱包
@@ -708,7 +746,8 @@ export default function App() {
       setChainId(nextId)
       setTokenA(cfg.defaultTokenA)
       setTokenB(cfg.defaultTokenB)
-      setCustomToken('')
+      setTokenMetaCache({})
+      setGasTokenDisplay({ raw: 0n, decimals: cfg.key === 'arc' ? 6 : 18 })
       setPool(null)
       setScannedPools([])
       setPositions([])
@@ -1584,8 +1623,12 @@ export default function App() {
   /** <select> 用的值：解析成选项里的原始大小写，否则选中态会丢 */
   const tokenSelectValue = (addr: Address) => findToken(addr)?.addr ?? addr
 
-  const tokenDecimals = (addr: Address) =>
-    tokenMetaCache[addr?.toLowerCase()]?.decimals ?? findToken(addr)?.decimals ?? 18
+  const tokenDecimals = (addr: Address) => {
+    const known = KNOWN_TOKENS[addr?.toLowerCase()]?.decimals
+    if (known != null) return known
+    if (isArcUsdcErc20(addr)) return 6
+    return tokenMetaCache[addr?.toLowerCase()]?.decimals ?? findToken(addr)?.decimals ?? 18
+  }
 
   const pickToken = useCallback((side: 'a' | 'b', addr: Address, meta?: TokenOption) => {
     if (meta) {
@@ -1604,8 +1647,11 @@ export default function App() {
   }, [tokenA, tokenB])
 
   const tokenLabel = (addr: Address) => {
-    if (isNativeCurrency(addr) || addr.toLowerCase() === CONTRACTS.weth.toLowerCase()) return 'ETH'
-    return findToken(addr)?.symbol ?? shortAddr(addr)
+    if (isNativeCurrency(addr)) {
+      return chainCfg.key === 'arc' ? 'USDC' : 'ETH'
+    }
+    if (chainHasWrappedNative() && addr.toLowerCase() === CONTRACTS.weth.toLowerCase()) return 'ETH'
+    return findToken(addr)?.symbol ?? KNOWN_TOKENS[addr?.toLowerCase()]?.symbol ?? shortAddr(addr)
   }
 
   /** V3 链上永远是 WETH；V4 可选原生 ETH */
@@ -1946,8 +1992,8 @@ export default function App() {
     setStatusHash(null)
     setStatus(
       seedOnCreate
-        ? `创建 ${mintProtocol.toUpperCase()} 池并注入流动性…`
-        : `创建 / 初始化 ${mintProtocol.toUpperCase()} 池…`,
+        ? `准备创建 ${mintProtocol.toUpperCase()} 池…`
+        : `准备创建 / 初始化 ${mintProtocol.toUpperCase()} 池…`,
     )
     try {
       if (mintProtocol === 'v4') {
@@ -2200,6 +2246,70 @@ export default function App() {
     ? (addUseEth && isEthLikeCurrency(selected.token1.address) ? ethBal : addBal1)
     : 0n
 
+  const swapInMeta = selected
+    ? (swapZeroForOne
+      ? { token: selected.token0, label: addUseEth && isEthLikeCurrency(selected.token0.address) ? 'ETH' : selected.token0.symbol, bal: addShow0 }
+      : { token: selected.token1, label: addUseEth && isEthLikeCurrency(selected.token1.address) ? 'ETH' : selected.token1.symbol, bal: addShow1 })
+    : null
+  const swapOutMeta = selected
+    ? (swapZeroForOne
+      ? { token: selected.token1, label: addUseEth && isEthLikeCurrency(selected.token1.address) ? 'ETH' : selected.token1.symbol }
+      : { token: selected.token0, label: addUseEth && isEthLikeCurrency(selected.token0.address) ? 'ETH' : selected.token0.symbol })
+    : null
+
+  // 本池 Swap 报价（防抖）
+  useEffect(() => {
+    if (!selected || posOpMode !== 'swap') {
+      setSwapQuote(null)
+      setSwapQuoteErr(null)
+      return
+    }
+    const raw = swapAmount.trim()
+    if (!raw || Number(raw) <= 0) {
+      setSwapQuote(null)
+      setSwapQuoteErr(null)
+      setSwapQuoteBusy(false)
+      return
+    }
+    let cancelled = false
+    setSwapQuoteBusy(true)
+    setSwapQuoteErr(null)
+    const t = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const amountIn = parseAmount(raw, swapInMeta!.token.decimals)
+          if (amountIn <= 0n) {
+            if (!cancelled) {
+              setSwapQuote(null)
+              setSwapQuoteBusy(false)
+            }
+            return
+          }
+          const q = await quotePoolSwap({
+            position: selected,
+            zeroForOne: swapZeroForOne,
+            amountIn,
+            slippageBps,
+          })
+          if (!cancelled) {
+            setSwapQuote(q)
+            setSwapQuoteBusy(false)
+          }
+        } catch (e) {
+          if (!cancelled) {
+            setSwapQuote(null)
+            setSwapQuoteBusy(false)
+            setSwapQuoteErr(e instanceof Error ? e.message : String(e))
+          }
+        }
+      })()
+    }, 350)
+    return () => {
+      cancelled = true
+      window.clearTimeout(t)
+    }
+  }, [selected, posOpMode, swapAmount, swapZeroForOne, slippageBps, swapInMeta?.token.decimals])
+
   const activeNav = NAV_ITEMS.find((it) => it.key === tab)
 
   return (
@@ -2286,7 +2396,7 @@ export default function App() {
                   <span className="wallet-bals mono">
                     {chainHasWrappedNative()
                       ? `${formatAmount(ethBal, 18, 4)} ETH · ${formatAmount(wethBal, 18, 4)} WETH`
-                      : `${formatAmount(ethBal, chainCfg.chain.nativeCurrency.decimals, 4)} ${chainCfg.chain.nativeCurrency.symbol}`}
+                      : `${formatAmount(gasTokenDisplay.raw, gasTokenDisplay.decimals, 4)} ${chainCfg.chain.nativeCurrency.symbol}`}
                   </span>
                 </div>
                 <div className="btn-split">
@@ -2601,6 +2711,11 @@ export default function App() {
                 const selectedRow = selectedId === id
                 const cq = getPositionCoinPrices(p)
                 const feeUsd = p.fees0Usd + p.fees1Usd
+                const poolSum = poolFeeByKey.get(positionPoolKey(p))
+                const poolFeesUsd = poolSum?.totalFeesUsd ?? p.totalFeesUsd
+                const poolUnclaimedUsd = poolSum?.unclaimedUsd ?? feeUsd
+                const poolClaimedUsd = poolSum?.claimedUsd ?? p.claimedFeesUsd
+                const multiInPool = (poolSum?.positionCount ?? 1) > 1
                 const rangeSpan = Math.max(cq.coinPriceUpper - cq.coinPriceLower, 1e-18)
                 const rangeMarker = Math.max(
                   0,
@@ -2618,6 +2733,7 @@ export default function App() {
                     <div className="pc-top">
                       <span className="pc-meta-line mono">
                         #{p.tokenId.toString()} · {p.version.toUpperCase()} · {(p.fee / 10000).toFixed(2)}%
+                        {multiInPool ? ` · ${poolSum!.positionCount} 仓` : ''}
                       </span>
                       <span className={`pc-state ${p.inRange ? (risk === 'high' || risk === 'warn' ? risk : 'in') : 'out'}`}>
                         {p.inRange
@@ -2641,9 +2757,9 @@ export default function App() {
                         )}
                       </div>
                       <div className="pc-fee-line">
-                        费 {formatUsd(p.totalFeesUsd)}
-                        <span>未领 {formatUsd(feeUsd)}</span>
-                        <span>已领 {formatUsd(p.claimedFeesUsd)}</span>
+                        本池累计 {formatUsd(poolFeesUsd)}
+                        <span>未领 {formatUsd(poolUnclaimedUsd)}</span>
+                        <span>已领 {formatUsd(poolClaimedUsd)}</span>
                         {p.feeAprPct != null && <span>年化 {formatApr(p.feeAprPct)}</span>}
                       </div>
                     </div>
@@ -2683,16 +2799,25 @@ export default function App() {
                 selected.version === 'v4'
                   ? 'Claim V4'
                   : (addUseEth ? 'Claim→ETH' : 'Claim'),
-                () => selected.version === 'v4'
-                  ? claimV4({ walletClient: wallet!, owner: address!, position: selected })
-                  : claimV3({
-                    walletClient: wallet!,
-                    owner: address!,
-                    tokenId: selected.tokenId,
-                    unwrapEth: addUseEth,
-                    token0: selected.token0.address,
-                    token1: selected.token1.address,
-                  }),
+                async () => {
+                  const pos = selected
+                  const hash = pos.version === 'v4'
+                    ? await claimV4({ walletClient: wallet!, owner: address!, position: pos })
+                    : await claimV3({
+                      walletClient: wallet!,
+                      owner: address!,
+                      tokenId: pos.tokenId,
+                      unwrapEth: addUseEth,
+                      token0: pos.token0.address,
+                      token1: pos.token1.address,
+                    })
+                  const wethUsd = await getWethUsdPrice().catch(() => 0)
+                  const next = recordPositionClaim(pos, wethUsd)
+                  setPositions((prev) => prev.map((p) =>
+                    p.version === next.version && p.tokenId === next.tokenId ? next : p,
+                  ))
+                  return { hash }
+                },
                 `${selected.token0.symbol}/${selected.token1.symbol}`,
               )}
               onCompound={() => {
@@ -2709,12 +2834,25 @@ export default function App() {
                 }, () => {
                   void run(
                     '领取并复投',
-                    () => claimAndCompound({
-                      walletClient: wallet!,
-                      owner: address!,
-                      position: selected,
-                      slippageBps,
-                    }),
+                    async () => {
+                      const pos = selected
+                      const result = await claimAndCompound({
+                        walletClient: wallet!,
+                        owner: address!,
+                        position: pos,
+                        slippageBps,
+                        onStatus: setStatus,
+                      })
+                      // 只要领取成功（不论复投是否成功），未领都应记入已领
+                      if (result.claimHash) {
+                        const wethUsd = await getWethUsdPrice().catch(() => 0)
+                        const next = recordPositionClaim(pos, wethUsd)
+                        setPositions((prev) => prev.map((p) =>
+                          p.version === next.version && p.tokenId === next.tokenId ? next : p,
+                        ))
+                      }
+                      return result
+                    },
                     `${selected.token0.symbol}/${selected.token1.symbol}`,
                   )
                 })
@@ -2849,13 +2987,21 @@ export default function App() {
                   >
                     部分撤出
                   </button>
+                  <button
+                    type="button"
+                    className={`filter-chip ${posOpMode === 'swap' ? 'active' : ''}`}
+                    aria-pressed={posOpMode === 'swap'}
+                    onClick={() => setPosOpMode('swap')}
+                  >
+                    本池 Swap
+                  </button>
                 </div>
                 {selectedUsesWeth && (
                   <label className="op-native inline-setting check">
                     <input type="checkbox" checked={useNativeEth} onChange={(e) => setUseNativeEth(e.target.checked)} />
                     <span className="op-native-text">
                       用原生 ETH
-                      <span className="op-native-sub">加仓付 / Claim·撤出收</span>
+                      <span className="op-native-sub">加仓付 / Claim·撤出收 / Swap</span>
                     </span>
                   </label>
                 )}
@@ -2948,6 +3094,7 @@ export default function App() {
                           amount1: parseAmount(add1 || '0', selected.token1.decimals),
                           useNativeEth: addUseEth,
                           slippageBps,
+                          onStatus: setStatus,
                         })
                         : increaseV3Liquidity({
                           walletClient: wallet!,
@@ -2962,6 +3109,115 @@ export default function App() {
                     )}
                   >
                     确认加仓{selected.version === 'v4' ? ' · V4' : ''}
+                  </button>
+                </div>
+              </div>
+              ) : posOpMode === 'swap' ? (
+              <div className="op-block">
+                <div className="swap-dir-row">
+                  <button
+                    type="button"
+                    className={`filter-chip ${swapZeroForOne ? 'active' : ''}`}
+                    aria-pressed={swapZeroForOne}
+                    onClick={() => setSwapZeroForOne(true)}
+                  >
+                    {addLabel0} → {addLabel1}
+                  </button>
+                  <button
+                    type="button"
+                    className={`filter-chip ${!swapZeroForOne ? 'active' : ''}`}
+                    aria-pressed={!swapZeroForOne}
+                    onClick={() => setSwapZeroForOne(false)}
+                  >
+                    {addLabel1} → {addLabel0}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn icon mint-swap"
+                    title="切换方向"
+                    onClick={() => setSwapZeroForOne((v) => !v)}
+                  >
+                    ⇄
+                  </button>
+                </div>
+                <label className="amt">
+                  <span className="amt-head">支付 {swapInMeta?.label}</span>
+                  <span className="bal-hint">
+                    余额 {swapInMeta ? formatAmount(swapInMeta.bal, swapInMeta.token.decimals, 6) : '—'}
+                    <button
+                      type="button"
+                      className="amt-max"
+                      disabled={!address || !swapInMeta || swapInMeta.bal === 0n}
+                      onClick={() => {
+                        if (!swapInMeta) return
+                        // 原生侧留一点 gas
+                        let max = swapInMeta.bal
+                        if (addUseEth && isEthLikeCurrency(swapInMeta.token.address)) {
+                          const gasReserve = 10n ** 15n
+                          max = ethBal > gasReserve ? ethBal - gasReserve : 0n
+                        }
+                        setSwapAmount(formatAmountExact(max, swapInMeta.token.decimals))
+                      }}
+                    >
+                      Max
+                    </button>
+                  </span>
+                  <input
+                    value={swapAmount}
+                    onChange={(e) => setSwapAmount(e.target.value)}
+                    inputMode="decimal"
+                    placeholder="兑换数量"
+                  />
+                </label>
+                <div className="swap-quote-box">
+                  <div className="swap-quote-line">
+                    <span className="muted">预计得到</span>
+                    <strong>
+                      {swapQuoteBusy
+                        ? '报价中…'
+                        : swapQuote
+                          ? `${formatAmount(swapQuote.amountOut, swapQuote.tokenOutDecimals, 6)} ${swapOutMeta?.label ?? ''}`
+                          : '—'}
+                    </strong>
+                  </div>
+                  {swapQuote && (
+                    <div className="swap-quote-line muted">
+                      <span>最少（滑点 {(slippageBps / 100).toFixed(2)}%）</span>
+                      <span>
+                        {formatAmount(swapQuote.amountOutMin, swapQuote.tokenOutDecimals, 6)}{' '}
+                        {swapOutMeta?.label}
+                        {!swapQuote.quoted ? ' · 现价估算' : ''}
+                      </span>
+                    </div>
+                  )}
+                  {swapQuoteErr && <p className="err-inline">{swapQuoteErr}</p>}
+                </div>
+                <p className="muted op-hint">
+                  在当前{selected.version.toUpperCase()}池内单跳兑换，适合新池冷启动或换边配平。滑点用顶部设置。
+                </p>
+                <div className="btn-row">
+                  <button
+                    className="btn primary"
+                    disabled={busy || !address || !swapQuote || swapQuoteBusy}
+                    onClick={() => {
+                      if (!selected || !swapInMeta || !swapQuote) return
+                      void run(
+                        selected.version === 'v4' ? '本池 Swap V4' : '本池 Swap',
+                        () => swapInPool({
+                          walletClient: wallet!,
+                          owner: address!,
+                          position: selected,
+                          zeroForOne: swapZeroForOne,
+                          amountIn: swapQuote.amountIn,
+                          slippageBps,
+                          useNativeEth: addUseEth,
+                          onStatus: setStatus,
+                        }),
+                        `${swapInMeta.label}→${swapOutMeta?.label ?? ''}`,
+                      )
+                    }}
+                  >
+                    确认 Swap{selected.version === 'v4' ? ' · V4' : ''}
                   </button>
                 </div>
               </div>
@@ -3355,7 +3611,7 @@ export default function App() {
                         : createRangePreset === 'onesided-eth' && isEthLikeCurrency(tokenB)
                           ? '（不需要）'
                           : ''}
-                      <span className="bal-hint">余额 {formatAmount(createSeedBalA, createSynth?.decA ?? 18, 6)}</span>
+                      <span className="bal-hint">余额 {formatAmount(createSeedBalA, createSynth?.decA ?? tokenDecimals(tokenA), 6)}</span>
                       <input
                         value={seedAmtA}
                         onChange={(e) => onCreateSeedSide('A', e.target.value)}
@@ -3376,7 +3632,7 @@ export default function App() {
                         : createRangePreset === 'onesided-eth' && isEthLikeCurrency(tokenA)
                           ? '（不需要）'
                           : ''}
-                      <span className="bal-hint">余额 {formatAmount(createSeedBalB, createSynth?.decB ?? 18, 6)}</span>
+                      <span className="bal-hint">余额 {formatAmount(createSeedBalB, createSynth?.decB ?? tokenDecimals(tokenB), 6)}</span>
                       <input
                         value={seedAmtB}
                         onChange={(e) => onCreateSeedSide('B', e.target.value)}
@@ -4019,6 +4275,7 @@ export default function App() {
                           tickUpper: useUpper,
                           useNativeEth: mintUseEth,
                           slippageBps,
+                          onStatus: setStatus,
                         })
                       }
                       return mintV3Position({
@@ -4030,6 +4287,7 @@ export default function App() {
                         tickLower: useLower,
                         tickUpper: useUpper,
                         useNativeEth: mintUseEth,
+                        onStatus: setStatus,
                       })
                     }, `${pool.token0.symbol}/${pool.token1.symbol}`)
                   }}
