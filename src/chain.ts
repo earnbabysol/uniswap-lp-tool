@@ -1,14 +1,14 @@
 import { defineChain, type Address, type Chain } from 'viem'
 
-export type SupportedChainId = 4663 | 8453 | 5042
+export type SupportedChainId = 4663 | 8453 | 5042 | 56
 
 export type ChainContracts = {
   /**
-   * 包装原生币（WETH）。Arc 无包装原生币，此处为 Uniswap 部署时的 UnsupportedProtocol 占位，
-   * 且 `hasWrappedNative === false` 时不得当 WETH 用。
+   * 包装原生币（WETH / WBNB）。Arc 无包装原生币，此处为 Uniswap 部署时的 UnsupportedProtocol 占位，
+   * 且 `hasWrappedNative === false` 时不得当包装原生币用。
    */
   weth: Address
-  /** 稳定币：Robinhood=USDG，Base/Arc=USDC */
+  /** 稳定币：Robinhood=USDG，Base/Arc/BSC=USDC */
   stable: Address
   /** @deprecated 兼容旧代码，等同 stable */
   usdg: Address
@@ -19,7 +19,10 @@ export type ChainContracts = {
   v3Factory: Address
   v3Npm: Address
   v3SwapRouter: Address
+  /** Quoter V1 或 QuoterV2 地址（BSC 为 QuoterV2） */
   v3Quoter: Address
+  /** true = QuoterV2（struct 入参）；缺省 / false = Quoter V1 */
+  v3QuoterIsV2?: boolean
   v4PoolManager: Address
   v4PositionManager: Address
   v4StateView: Address
@@ -30,7 +33,7 @@ export type ChainContracts = {
 
 export type AppChainConfig = {
   id: SupportedChainId
-  key: 'robinhood' | 'base' | 'arc'
+  key: 'robinhood' | 'base' | 'arc' | 'bsc'
   label: string
   shortLabel: string
   chain: Chain
@@ -85,6 +88,18 @@ export const arc = defineChain({
   },
 })
 
+export const bsc = defineChain({
+  id: 56,
+  name: 'BNB Smart Chain',
+  nativeCurrency: { name: 'BNB', symbol: 'BNB', decimals: 18 },
+  rpcUrls: {
+    default: { http: ['https://bsc-dataseed.binance.org'] },
+  },
+  blockExplorers: {
+    default: { name: 'BscScan', url: 'https://bscscan.com' },
+  },
+})
+
 const ROBINHOOD_CONTRACTS: ChainContracts = {
   weth: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
   stable: '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168',
@@ -121,6 +136,32 @@ const BASE_CONTRACTS: ChainContracts = {
   universalRouter: '0x6fF5693b99212Da76ad316178A184AB56D299b43',
 }
 
+/**
+ * BSC Uniswap 官方部署：
+ * V3 https://developers.uniswap.org/docs/protocols/v3/deployments/v3-bnb-deployments
+ * V4 https://developers.uniswap.org/docs/protocols/v4/deployments
+ */
+const BSC_CONTRACTS: ChainContracts = {
+  weth: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', // WBNB
+  // Binance-Peg USDC（18 位）；流动性深，作默认稳定币
+  stable: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
+  usdg: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
+  v3Factory: '0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7',
+  v3Npm: '0x7b8A01B39D58278b5DE7e48c8449c9f4F5170613',
+  v3SwapRouter: '0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2',
+  v3Quoter: '0x78D78E420Da98ad378D7799bE8f4AF69033EB077', // QuoterV2
+  v3QuoterIsV2: true,
+  v4PoolManager: '0x28e2ea090877bf75740558f6bfb36a5ffee9e9df',
+  v4PositionManager: '0x7a4a5c919ae2541aed11041a1aeee68f1287f95b',
+  v4StateView: '0xd13dd3d6e93f276fafc9db9e6bb47c1180aee0c4',
+  v4Quoter: '0x9f75dd27d6664c475b90e105573e550ff69437b0',
+  permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
+  universalRouter: '0x1906c1d672b88cd1b9ac7593301ca990f94eae07',
+}
+
+/** Binance-Peg USDT（BSC 上常用） */
+const BSC_USDT: Address = '0x55d398326f99059fF775485246999027B3197955'
+
 /** Uniswap contracts @ https://github.com/Uniswap/contracts/blob/main/deployments/5042.md */
 const ARC_CONTRACTS: ChainContracts = {
   // UnsupportedProtocol stub（非真 WETH）；池子用原生/ERC-20 USDC
@@ -145,11 +186,11 @@ const ARC_EURC: Address = '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a'
 function tokensFromContracts(
   c: ChainContracts,
   extras: Record<string, { symbol: string; decimals: number }> = {},
-  opts?: { includeWeth?: boolean },
+  opts?: { includeWeth?: boolean; wrappedSymbol?: string },
 ) {
   const out: Record<string, { symbol: string; decimals: number }> = { ...extras }
   if (opts?.includeWeth !== false) {
-    out[c.weth.toLowerCase()] = { symbol: 'WETH', decimals: 18 }
+    out[c.weth.toLowerCase()] = { symbol: opts?.wrappedSymbol ?? 'WETH', decimals: 18 }
   }
   return out
 }
@@ -231,6 +272,34 @@ export const CHAIN_CONFIGS: Record<SupportedChainId, AppChainConfig> = {
     defaultTokenB: ARC_CONTRACTS.stable,
     hasWrappedNative: false,
   },
+  56: {
+    id: 56,
+    key: 'bsc',
+    label: 'BNB Smart Chain',
+    shortLabel: 'BSC',
+    chain: bsc,
+    defaultRpcUrls: [
+      'https://bsc-dataseed.binance.org',
+      'https://bsc-dataseed.bnbchain.org',
+      'https://bsc.publicnode.com',
+      'https://bsc.drpc.org',
+    ],
+    explorerUrl: 'https://bscscan.com',
+    explorerApi: 'https://bsc.blockscout.com',
+    contracts: BSC_CONTRACTS,
+    knownTokens: tokensFromContracts(
+      BSC_CONTRACTS,
+      {
+        [BSC_CONTRACTS.stable.toLowerCase()]: { symbol: 'USDC', decimals: 18 },
+        [BSC_USDT.toLowerCase()]: { symbol: 'USDT', decimals: 18 },
+      },
+      { wrappedSymbol: 'WBNB' },
+    ),
+    v3PoolInitCodeHash: '0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54',
+    defaultTokenA: BSC_CONTRACTS.stable,
+    defaultTokenB: BSC_CONTRACTS.weth,
+    hasWrappedNative: true,
+  },
 }
 
 export const SUPPORTED_CHAINS = Object.values(CHAIN_CONFIGS)
@@ -241,7 +310,7 @@ function readSavedChainId(): SupportedChainId {
   try {
     const raw = localStorage.getItem(CHAIN_KEY)
     const id = Number(raw)
-    if (id === 4663 || id === 8453 || id === 5042) return id
+    if (id === 4663 || id === 8453 || id === 5042 || id === 56) return id
   } catch {
     /* ignore */
   }
@@ -271,12 +340,29 @@ export function setActiveChainId(id: SupportedChainId): AppChainConfig {
 }
 
 export function isSupportedChainId(id: number): id is SupportedChainId {
-  return id === 4663 || id === 8453 || id === 5042
+  return id === 4663 || id === 8453 || id === 5042 || id === 56
 }
 
-/** 当前链是否有可 wrap 的原生币（WETH） */
+/** 当前链是否有可 wrap 的原生币（WETH / WBNB） */
 export function chainHasWrappedNative(): boolean {
   return CHAIN_CONFIGS[activeChainId].hasWrappedNative
+}
+
+/** 原生 gas 币符号：ETH / BNB / USDC(Arc) */
+export function getNativeSymbol(chainId: SupportedChainId = activeChainId): string {
+  return CHAIN_CONFIGS[chainId].chain.nativeCurrency.symbol
+}
+
+/** 包装原生币符号：WETH / WBNB */
+export function getWrappedNativeSymbol(chainId: SupportedChainId = activeChainId): string {
+  if (!CHAIN_CONFIGS[chainId].hasWrappedNative) return getNativeSymbol(chainId)
+  return CHAIN_CONFIGS[chainId].knownTokens[CHAIN_CONFIGS[chainId].contracts.weth.toLowerCase()]?.symbol
+    ?? (chainId === 56 ? 'WBNB' : 'WETH')
+}
+
+/** 当前链 V3 Quoter 是否为 QuoterV2 */
+export function chainUsesV3QuoterV2(chainId: SupportedChainId = activeChainId): boolean {
+  return Boolean(CHAIN_CONFIGS[chainId].contracts.v3QuoterIsV2)
 }
 
 /** 当前链合约（随 setActiveChainId 切换） */

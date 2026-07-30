@@ -10,6 +10,8 @@ import {
   chainHasWrappedNative,
   getActiveChainConfig,
   getActiveChainId,
+  getNativeSymbol,
+  getWrappedNativeSymbol,
   listKnownTokens,
   type SupportedChainId,
 } from './chain'
@@ -1581,9 +1583,10 @@ export default function App() {
   const tokenOptions = useMemo(() => {
     const weth = CONTRACTS.weth.toLowerCase()
     const zero = '0x0000000000000000000000000000000000000000'
+    const gasSym = getNativeSymbol()
     const base = listKnownTokens().map((t) => ({
       addr: t.address,
-      symbol: t.address.toLowerCase() === weth ? 'ETH' : t.symbol,
+      symbol: t.address.toLowerCase() === weth ? gasSym : t.symbol,
       decimals: t.decimals,
     }))
     const extra: { addr: Address; symbol: string; decimals: number }[] = []
@@ -1591,7 +1594,7 @@ export default function App() {
       if (!addr || KNOWN_TOKENS[addr.toLowerCase()]) return
       if (extra.some((e) => e.addr.toLowerCase() === addr.toLowerCase())) return
       if (addr.toLowerCase() === zero || addr.toLowerCase() === weth) {
-        extra.push({ addr, symbol: 'ETH', decimals: 18 })
+        extra.push({ addr, symbol: gasSym, decimals: 18 })
         return
       }
       const cached = tokenMetaCache[addr.toLowerCase()]
@@ -1648,9 +1651,11 @@ export default function App() {
 
   const tokenLabel = (addr: Address) => {
     if (isNativeCurrency(addr)) {
-      return chainCfg.key === 'arc' ? 'USDC' : 'ETH'
+      return getNativeSymbol()
     }
-    if (chainHasWrappedNative() && addr.toLowerCase() === CONTRACTS.weth.toLowerCase()) return 'ETH'
+    if (chainHasWrappedNative() && addr.toLowerCase() === CONTRACTS.weth.toLowerCase()) {
+      return getNativeSymbol()
+    }
     return findToken(addr)?.symbol ?? KNOWN_TOKENS[addr?.toLowerCase()]?.symbol ?? shortAddr(addr)
   }
 
@@ -2395,7 +2400,7 @@ export default function App() {
                   </a>
                   <span className="wallet-bals mono">
                     {chainHasWrappedNative()
-                      ? `${formatAmount(ethBal, 18, 4)} ETH · ${formatAmount(wethBal, 18, 4)} WETH`
+                      ? `${formatAmount(ethBal, 18, 4)} ${getNativeSymbol()} · ${formatAmount(wethBal, 18, 4)} ${getWrappedNativeSymbol()}`
                       : `${formatAmount(gasTokenDisplay.raw, gasTokenDisplay.decimals, 4)} ${chainCfg.chain.nativeCurrency.symbol}`}
                   </span>
                 </div>
@@ -4326,20 +4331,20 @@ export default function App() {
          */
         <div className="tools-grid">
           <section className="panel tool-card">
-            <h2>ETH ↔ WETH</h2>
-            <p className="muted">做 LP 前把 ETH wrap 成 WETH。</p>
+            <h2>{getNativeSymbol()} ↔ {getWrappedNativeSymbol()}</h2>
+            <p className="muted">做 LP 前把 {getNativeSymbol()} wrap 成 {getWrappedNativeSymbol()}。</p>
             {/*
-             * 余额从正文里拎出来做成两个读数。原来是「余额：0 ETH / 0 WETH」缩在说明句尾，
+             * 余额从正文里拨出来做成两个读数。原来是「余额：0 ETH / 0 WETH」缩在说明句尾，
              * 和「做 LP 前可把…」同字号同颜色 —— 这是下面填数量时唯一要看的数，
              * 不该跟说明文字混在一句里。
              */}
             <div className="tool-bal">
               <span>
-                <em>ETH</em>
+                <em>{getNativeSymbol()}</em>
                 <b className="mono">{formatAmount(ethBal, 18, 5)}</b>
               </span>
               <span>
-                <em>WETH</em>
+                <em>{getWrappedNativeSymbol()}</em>
                 <b className="mono">{formatAmount(wethBal, 18, 5)}</b>
               </span>
             </div>
@@ -4348,32 +4353,32 @@ export default function App() {
               <input value={wrapAmt} onChange={(e) => setWrapAmt(e.target.value)} placeholder="0.0" />
             </label>
             <div className="chip-row">
-            <button type="button" className="chip" onClick={() => setWrapAmt(formatAmountExact(ethBal / 2n, 18))}>一半 ETH</button>
-            <button type="button" className="chip" onClick={() => setWrapAmt(formatAmountExact(ethBal > 10n ** 15n ? ethBal - 10n ** 15n : 0n, 18))}>Max ETH（留 gas）</button>
-            <button type="button" className="chip" onClick={() => setWrapAmt(formatAmountExact(wethBal, 18))}>Max WETH</button>
+            <button type="button" className="chip" onClick={() => setWrapAmt(formatAmountExact(ethBal / 2n, 18))}>{`一半 ${getNativeSymbol()}`}</button>
+            <button type="button" className="chip" onClick={() => setWrapAmt(formatAmountExact(ethBal > 10n ** 15n ? ethBal - 10n ** 15n : 0n, 18))}>{`Max ${getNativeSymbol()}(留 gas)`}</button>
+            <button type="button" className="chip" onClick={() => setWrapAmt(formatAmountExact(wethBal, 18))}>{`Max ${getWrappedNativeSymbol()}`}</button>
           </div>
           <div className="btn-row">
             <button
               className="btn primary"
               disabled={!address || busy}
-              onClick={() => void run('Wrap ETH', () => wrapEth({
+              onClick={() => void run(`Wrap ${getNativeSymbol()}`, () => wrapEth({
                 walletClient: wallet!,
                 owner: address!,
                 amount: parseAmount(wrapAmt || '0', 18),
               }))}
             >
-              Wrap → WETH
+              Wrap → {getWrappedNativeSymbol()}
             </button>
             <button
               className="btn"
               disabled={!address || busy}
-              onClick={() => void run('Unwrap WETH', () => unwrapWeth({
+              onClick={() => void run(`Unwrap ${getWrappedNativeSymbol()}`, () => unwrapWeth({
                 walletClient: wallet!,
                 owner: address!,
                 amount: parseAmount(wrapAmt || '0', 18),
               }))}
             >
-              Unwrap → ETH
+              Unwrap → {getNativeSymbol()}
             </button>
           </div>
           </section>
@@ -4469,7 +4474,7 @@ export default function App() {
               {[
                 { name: 'V3 Position Manager', addr: CONTRACTS.v3Npm, href: explorerAddress(CONTRACTS.v3Npm) },
                 ...(chainHasWrappedNative()
-                  ? [{ name: 'WETH', addr: CONTRACTS.weth, href: explorerAddress(CONTRACTS.weth) }]
+                  ? [{ name: getWrappedNativeSymbol(), addr: CONTRACTS.weth, href: explorerAddress(CONTRACTS.weth) }]
                   : []),
                 {
                   name: KNOWN_TOKENS[CONTRACTS.stable.toLowerCase()]?.symbol

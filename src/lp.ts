@@ -22,6 +22,7 @@ import {
   chainHasWrappedNative,
   getActiveChainId,
   getExplorerApi,
+  getNativeSymbol,
   getStableAddress,
   getV3PoolInitCodeHash,
 } from './chain'
@@ -253,7 +254,7 @@ async function resolveToken(address: Address): Promise<TokenMeta> {
     if (getActiveChainId() === 5042) {
       return { address, symbol: 'USDC', decimals: 18 }
     }
-    return { address, symbol: 'ETH', decimals: 18 }
+    return { address, symbol: getNativeSymbol(), decimals: 18 }
   }
   const known = KNOWN_TOKENS[address.toLowerCase()]
   if (known) return { address, ...known }
@@ -302,7 +303,7 @@ export async function getTokenBalanceView(
       return { raw, decimals: 6, symbol: 'USDC' }
     }
     const raw = await getNativeBalance(owner)
-    return { raw, decimals: 18, symbol: 'ETH' }
+    return { raw, decimals: 18, symbol: getNativeSymbol() }
   }
   if (isArcUsdcErc20(token)) {
     const raw = await getErc20Balance(token, owner)
@@ -2339,7 +2340,7 @@ async function listV4TokenIds(
       abi: v4PositionManagerAbi,
       functionName: 'nextTokenId',
     })
-    const probe = deep ? 500n : chainId === 8453 ? 80n : 120n
+    const probe = deep ? 500n : chainId === 8453 || chainId === 56 ? 80n : 120n
     const start = nextId > probe ? nextId - probe : 1n
     opts?.onStatus?.(`校验近 ${probe.toString()} 个 V4 tokenId…`)
     const batch = 40n
@@ -2411,8 +2412,8 @@ async function scanV4TokenIdsByLogs(owner: Address, lookbackBlocks: bigint): Pro
   )
   const latest = await publicClient.getBlockNumber()
   const owned = new Set<string>()
-  // Base / 多数公共 RPC 对 eth_getLogs 窗口很严
-  const span = getActiveChainId() === 8453 ? 2_000n : 8_000n
+  // Base / BSC / 多数公共 RPC 对 eth_getLogs 窗口很严
+  const span = getActiveChainId() === 8453 || getActiveChainId() === 56 ? 2_000n : 8_000n
   const start = latest > lookbackBlocks ? latest - lookbackBlocks : 0n
   for (let from = start; from <= latest; from += span) {
     const to = from + span - 1n > latest ? latest : from + span - 1n
@@ -2488,7 +2489,7 @@ async function collectV4ModifyLogs(opts: {
   const { poolId, tokenId, fromBlock } = opts
   const salt = v4Salt(tokenId).toLowerCase()
   const latest = await publicClient.getBlockNumber()
-  const span = getActiveChainId() === 8453 ? 2_000n : 8_000n
+  const span = getActiveChainId() === 8453 || getActiveChainId() === 56 ? 2_000n : 8_000n
   const out: Array<{
     blockNumber: bigint
     transactionHash: Hash
@@ -4083,7 +4084,7 @@ export function getCoinQuote(pool: PoolInfo): {
     return {
       invert: true,
       coin: t1,
-      quote: { ...t0, symbol: 'ETH' },
+      quote: { ...t0, symbol: getNativeSymbol() },
       spot: pool.price > 0 ? 1 / pool.price : 0,
     }
   }
@@ -4091,7 +4092,7 @@ export function getCoinQuote(pool: PoolInfo): {
     return {
       invert: false,
       coin: t0,
-      quote: { ...t1, symbol: 'ETH' },
+      quote: { ...t1, symbol: getNativeSymbol() },
       spot: pool.price,
     }
   }

@@ -11,6 +11,7 @@ export function defaultRpcUrl(chainId: SupportedChainId = getActiveChainId()): s
   if (fromCfg) return fromCfg
   if (chainId === 8453) return 'https://mainnet.base.org'
   if (chainId === 5042) return 'https://5042.rpc.thirdweb.com'
+  if (chainId === 56) return 'https://bsc-dataseed.binance.org'
   return 'https://rpc.mainnet.chain.robinhood.com'
 }
 

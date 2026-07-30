@@ -15,10 +15,11 @@ import {
   permit2Abi,
   universalRouterAbi,
   v3QuoterAbi,
+  v3QuoterV2Abi,
   v3SwapRouterAbi,
   v4QuoterAbi,
 } from './abis'
-import { CONTRACTS, chainHasWrappedNative } from './chain'
+import { CONTRACTS, chainHasWrappedNative, chainUsesV3QuoterV2 } from './chain'
 import type { PositionRow } from './lp'
 import {
   isNativeCurrency,
@@ -106,6 +107,22 @@ async function quoteV3ExactIn(opts: {
   amountIn: bigint
 }): Promise<bigint | null> {
   try {
+    if (chainUsesV3QuoterV2()) {
+      const { result } = await publicClient.simulateContract({
+        address: CONTRACTS.v3Quoter,
+        abi: v3QuoterV2Abi,
+        functionName: 'quoteExactInputSingle',
+        args: [{
+          tokenIn: opts.tokenIn,
+          tokenOut: opts.tokenOut,
+          amountIn: opts.amountIn,
+          fee: opts.fee,
+          sqrtPriceLimitX96: 0n,
+        }],
+      })
+      const amountOut = Array.isArray(result) ? (result[0] as bigint) : (result as bigint)
+      return amountOut
+    }
     const { result } = await publicClient.simulateContract({
       address: CONTRACTS.v3Quoter,
       abi: v3QuoterAbi,
