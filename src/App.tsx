@@ -1543,6 +1543,17 @@ export default function App() {
     }
   }
 
+  const finishToast = (
+    toastId: number,
+    patch: { kind: 'success' | 'error' | 'info'; title: string; detail?: string; href?: string },
+  ) => {
+    const ok = updateToast(toastId, patch)
+    if (!ok) {
+      // pending 已被挤出栈时补一条，避免界面永远停在「进行中…」
+      pushToast(patch)
+    }
+  }
+
   const run = async (
     label: string,
     fn: () => Promise<unknown>,
@@ -1558,7 +1569,8 @@ export default function App() {
     setStatusHash(null)
     const toastId = pushToast({ kind: 'pending', title: `${label} 进行中…`, detail: pair })
     try {
-      const r = await fn()
+      // 总超时兜底：钱包拒签不返回 / RPC 挂死时，别让「进行中」锁死整页
+      const r = await withTimeout(fn(), 180_000, label)
       const hash = extractHash(r)
       const note = extractNote(r)
       if (hash) {
@@ -1567,19 +1579,29 @@ export default function App() {
       }
       const title = note ?? `${label} 已完成`
       setStatus(title)
-      updateToast(toastId, {
-        kind: note && /失败|加不进|不足/.test(note) ? 'info' : 'success',
+      finishToast(toastId, {
+        kind: note && /失败|加不进|不足|偏慢/.test(note) ? 'info' : 'success',
         title,
         detail: pair,
         href: hash ? explorerTx(hash) : undefined,
       })
-      await refreshPositions({ silent: true })
-      if (address) await refreshBalances(address)
+      try {
+        await withTimeout(refreshPositions({ silent: true }), 45_000, '刷新仓位')
+        if (address) await withTimeout(refreshBalances(address), 20_000, '刷新余额')
+      } catch (e) {
+        console.warn('post-tx refresh failed', e)
+      }
       opts?.afterSuccess?.()
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
+      const cancelled = /user rejected|denied|已取消/i.test(msg)
+      const timedOut = /超时/.test(msg)
       setStatus(msg)
-      updateToast(toastId, { kind: 'error', title: `${label} 失败`, detail: msg })
+      finishToast(toastId, {
+        kind: 'error',
+        title: cancelled ? `${label} 已取消` : timedOut ? `${label} 超时` : `${label} 失败`,
+        detail: msg,
+      })
     } finally {
       setBusy(false)
     }

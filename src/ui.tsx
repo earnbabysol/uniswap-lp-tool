@@ -52,21 +52,40 @@ export function useToasts() {
   const push = useCallback(
     (t: Omit<Toast, 'id'>) => {
       const id = toastSeq++
-      setToasts((prev) => [...prev.slice(-4), { ...t, id }])
+      setToasts((prev) => {
+        const next = [...prev, { ...t, id }]
+        if (next.length <= 6) return next
+        // 优先丢掉已结束的旧通知，尽量保留 pending，避免「进行中」被挤掉后无法 update
+        const dropIdx = next.findIndex((x) => x.kind !== 'pending')
+        if (dropIdx >= 0) {
+          next.splice(dropIdx, 1)
+          return next
+        }
+        return next.slice(-6)
+      })
       if (!t.sticky && t.kind !== 'pending') schedule(id, t.kind === 'error' ? 9000 : 5000)
       return id
     },
     [schedule],
   )
 
-  /** 就地更新（pending → success/error），保持位置不跳动 */
+  /**
+   * 就地更新（pending → success/error）。
+   * 若该 id 已被挤出栈，返回 false，调用方应再 push 一条，避免永久停在「进行中…」。
+   */
   const update = useCallback(
-    (id: number, patch: Partial<Omit<Toast, 'id'>>) => {
-      setToasts((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)))
+    (id: number, patch: Partial<Omit<Toast, 'id'>>): boolean => {
+      let found = false
+      setToasts((prev) => {
+        found = prev.some((t) => t.id === id)
+        if (!found) return prev
+        return prev.map((t) => (t.id === id ? { ...t, ...patch } : t))
+      })
       const kind = patch.kind
-      if (kind && kind !== 'pending' && !patch.sticky) {
+      if (found && kind && kind !== 'pending' && !patch.sticky) {
         schedule(id, kind === 'error' ? 9000 : 5000)
       }
+      return found
     },
     [schedule],
   )

@@ -851,7 +851,7 @@ export async function createV3Pool(opts: {
       chain: walletClient.chain,
       account: owner,
     })
-    await publicClient.waitForTransactionReceipt({ hash })
+    await waitTxReceipt(hash)
     return { pool: await loadV3Pool(existing), hash, created: true }
   }
 
@@ -876,7 +876,7 @@ export async function createV3Pool(opts: {
       chain: walletClient.chain,
       account: owner,
     })
-    await publicClient.waitForTransactionReceipt({ hash })
+    await waitTxReceipt(hash)
     const addr = await findV3Pool(token0Addr, token1Addr, fee)
     if (!addr) throw new Error('创建成功但未读到池地址，请稍后「按 Fee 加载」')
     return { pool: await loadV3Pool(addr), hash, created: true }
@@ -908,7 +908,7 @@ export async function createV3Pool(opts: {
       chain: walletClient.chain,
       account: owner,
     })
-    await publicClient.waitForTransactionReceipt({ hash: createHash })
+    await waitTxReceipt(createHash)
     const addr = await findV3Pool(token0Addr, token1Addr, fee)
     if (!addr) throw new Error('createPool 后未找到池地址')
 
@@ -932,7 +932,7 @@ export async function createV3Pool(opts: {
       chain: walletClient.chain,
       account: owner,
     })
-    await publicClient.waitForTransactionReceipt({ hash })
+    await waitTxReceipt(hash)
     return { pool: await loadV3Pool(addr), hash, created: true }
   }
 }
@@ -1142,7 +1142,7 @@ export async function createV3PoolAndSeed(opts: {
     chain: walletClient.chain,
     account: owner,
   })
-  await publicClient.waitForTransactionReceipt({ hash })
+  await waitTxReceipt(hash)
   void poolAddr
   const pool = await loadV3Pool(
     (await findV3Pool(token0Addr, token1Addr, fee)) ?? predictV3PoolAddress(token0Addr, token1Addr, fee),
@@ -2355,7 +2355,7 @@ export async function burnVacantV3Nfts(opts: {
         chain: walletClient.chain,
         account: owner,
       })
-      await publicClient.waitForTransactionReceipt({ hash })
+      await waitTxReceipt(hash)
       burned.push(tokenId)
     } catch {
       failed.push(tokenId)
@@ -3245,6 +3245,56 @@ async function getReceiptViaWallet(hash: `0x${string}`): Promise<'success' | 're
 }
 
 /**
+ * 等收据：钱包 RPC + 公共 RPC 双通道，带硬超时。
+ * 避免 waitForTransactionReceipt 永久挂起导致 UI 一直「进行中…」。
+ */
+export async function waitTxReceipt(
+  hash: Hash,
+  opts?: {
+    timeoutMs?: number
+    onStatus?: (msg: string) => void
+    /** 超时不抛错，返回 unknown（领取后还要继续复投时用） */
+    soft?: boolean
+    action?: string
+  },
+): Promise<'success' | 'reverted' | 'unknown'> {
+  const timeoutMs = opts?.timeoutMs ?? 45_000
+  const action = opts?.action ?? '交易'
+  const start = Date.now()
+  opts?.onStatus?.(`等待上链确认 ${hash.slice(0, 10)}…`)
+  while (Date.now() - start < timeoutMs) {
+    const via = await getReceiptViaWallet(hash)
+    if (via === 'reverted') {
+      throw new Error(`${action}失败（已回滚）${hash.slice(0, 10)}…`)
+    }
+    if (via === 'success') return 'success'
+    try {
+      const r = await withTimeout(
+        publicClient.getTransactionReceipt({ hash }),
+        4_000,
+        '读收据',
+      )
+      if (r.status === 'reverted') {
+        throw new Error(`${action}失败（已回滚）${hash.slice(0, 10)}…`)
+      }
+      if (r.status === 'success') return 'success'
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (/回滚|reverted/i.test(msg)) throw e instanceof Error ? e : new Error(msg)
+      /* pending / RPC 抖 */
+    }
+    await new Promise((r) => setTimeout(r, 500))
+  }
+  if (opts?.soft) {
+    opts?.onStatus?.('确认偏慢，继续下一步…')
+    return 'unknown'
+  }
+  throw new Error(
+    `${action}确认超时（${Math.round(timeoutMs / 1000)}s）。可在浏览器查看 ${hash.slice(0, 10)}…，确认后再操作，勿重复提交。`,
+  )
+}
+
+/**
  * V3 授权：发出 approve 后优先用钱包 receipt / allowance 确认；
  * Arc 上公共 RPC 经常卡死，超时也继续下一步（会话缓存防重复授权）。
  */
@@ -3781,7 +3831,7 @@ export async function removeV3Liquidity(opts: {
       dex: position.dex,
       v3Npm: position.v3Npm ?? npm,
     })
-    await publicClient.waitForTransactionReceipt({ hash })
+    await waitTxReceipt(hash)
     if (burnEmpty) {
       try {
         await walletClient.writeContract({
@@ -3857,7 +3907,7 @@ export async function removeV3Liquidity(opts: {
   })
 
   if (burnEmpty && pct >= 100) {
-    await publicClient.waitForTransactionReceipt({ hash })
+    await waitTxReceipt(hash)
     try {
       await walletClient.writeContract({
         address: npm,
@@ -3940,7 +3990,7 @@ export async function rebalanceV3(opts: {
     burnEmpty: false,
     slippageBps,
   })
-  await publicClient.waitForTransactionReceipt({ hash: exitHash })
+  await waitTxReceipt(exitHash, { action: '撤出' })
 
   const [bal0, bal1] = await Promise.all([
     publicClient.readContract({ address: position.token0.address, abi: erc20Abi, functionName: 'balanceOf', args: [owner] }),
@@ -4076,14 +4126,26 @@ export async function claimAndCompoundV3(opts: {
         chain: walletClient.chain,
         account: owner,
       })
-      await publicClient.waitForTransactionReceipt({ hash })
+      // 软等：超时也当已提交，避免再走 fallback 二次领取
+      const mined = await waitTxReceipt(hash, {
+        soft: true,
+        action: '领取并复投',
+        timeoutMs: 60_000,
+      })
       return {
         claimHash: hash,
         increaseHash: hash,
         compounded: true,
-        note: '已领取并复投',
+        note: mined === 'unknown'
+          ? '已提交领取并复投（确认偏慢，请稍后刷新）'
+          : '已领取并复投',
       }
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      // 用户拒签直接结束；链上预检失败再走「先领后加」
+      if (/user rejected|denied|已取消/i.test(msg)) {
+        throw e instanceof Error ? e : new Error(msg)
+      }
       console.warn('V3 atomic compound failed, fallback to claim-then-increase', e)
     }
   }
@@ -4097,7 +4159,7 @@ export async function claimAndCompoundV3(opts: {
     dex: position.dex,
     v3Npm: position.v3Npm ?? npm,
   })
-  await publicClient.waitForTransactionReceipt({ hash: claimHash })
+  await waitTxReceipt(claimHash, { soft: true, action: '领取', timeoutMs: 45_000 })
 
   if (liquidity <= 0n) {
     return {
@@ -4215,22 +4277,12 @@ export async function claimAndCompoundV4(opts: {
   onStatus?.('领取 V4 手续费…')
   const claimHash = await claimV4({ walletClient, owner, position })
   onStatus?.(`领取已提交 ${claimHash.slice(0, 10)}…，等待上链`)
-  try {
-    await withTimeout(
-      publicClient.waitForTransactionReceipt({
-        hash: claimHash,
-        confirmations: 1,
-        pollingInterval: 600,
-        timeout: 25_000,
-      }),
-      28_000,
-      '领取确认',
-    )
-  } catch {
-    // Arc 上 receipt 常读不到：稍等再复投，避免整条链路卡死
-    onStatus?.('领取确认偏慢，继续尝试复投…')
-    await new Promise((r) => setTimeout(r, 1500))
-  }
+  await waitTxReceipt(claimHash, {
+    soft: true,
+    action: '领取',
+    timeoutMs: 45_000,
+    onStatus,
+  })
 
   if (!canCompound) {
     return {
