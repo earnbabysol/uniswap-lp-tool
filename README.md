@@ -19,11 +19,13 @@ npm run build
 
 产物在 `dist/`。
 
-## 在线部署（Vercel）
+## 在线部署（GitHub Pages，免 Vercel）
 
-仓库已配置 `vercel.json`。把 GitHub 仓库接到 [Vercel](https://vercel.com) 后，每次 `git push` 会自动更新线上地址。
+仓库已带 GitHub Actions。开启 Pages 后，每次 `git push` 自动更新：
 
-1. 打开 https://vercel.com/new
-2. 用 GitHub 登录，导入 `earnbabysol/uniswap-lp-tool`
-3. Framework 选 Vite（一般会自动识别），直接 Deploy
-4. 把生成的 `*.vercel.app` 链接发给同伴即可
+1. 打开 https://github.com/earnbabysol/uniswap-lp-tool/settings/pages
+2. **Source** 选 **GitHub Actions**
+3. 等 Actions 跑完（仓库顶部 Actions 页）
+4. 访问：https://earnbabysol.github.io/uniswap-lp-tool/
+
+本地开发仍用 `npm run dev`（不受 Pages 的 base 路径影响）。
