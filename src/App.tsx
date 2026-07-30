@@ -2158,6 +2158,7 @@ export default function App() {
           tickLower,
           tickUpper,
           useNativeEth,
+          slippageBps,
           onStatus: setStatus,
         })
         setPool(info)
@@ -2651,7 +2652,7 @@ export default function App() {
       <div className="settings-row">
         <label className="inline-setting">
           滑点
-          <select value={slippageBps} onChange={(e) => setSlippageBps(Number(e.target.value))}>
+          <select value={slippageBps} onChange={(e) => setSlippageBps(Number(e.target.value))} title="开仓/加仓/撤出/Swap 均生效；被夹超限会直接失败">
             <option value={50}>0.5%</option>
             <option value={100}>1%</option>
             <option value={150}>1.5%</option>
@@ -4529,6 +4530,7 @@ export default function App() {
                         tickLower: useLower,
                         tickUpper: useUpper,
                         useNativeEth: mintUseEth,
+                        slippageBps,
                         onStatus: setStatus,
                       })
                     }, `${pool.token0.symbol}/${pool.token1.symbol}`, {

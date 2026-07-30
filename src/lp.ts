@@ -912,6 +912,23 @@ export function predictV3PoolAddress(token0: Address, token1: Address, fee: numb
 }
 
 /**
+ * Uniswap V3 mint/increase 的 amountMin：按期望数量扣滑点。
+ * 单边为 0 的一侧 min 也是 0。
+ */
+export function amountMinsForSlippage(
+  amount0: bigint,
+  amount1: bigint,
+  slippageBps = 300,
+): { amount0Min: bigint; amount1Min: bigint } {
+  const bps = BigInt(Math.max(0, Math.min(Math.floor(slippageBps) || 0, 9_900)))
+  const keep = 10_000n - bps
+  return {
+    amount0Min: amount0 > 0n ? (amount0 * keep) / 10_000n : 0n,
+    amount1Min: amount1 > 0n ? (amount1 * keep) / 10_000n : 0n,
+  }
+}
+
+/**
  * 创建并初始化 V3 池；若给了 amount 则同笔 multicall 注入首仓（createAndInitialize + mint）。
  */
 export async function createV3PoolAndSeed(opts: {
@@ -926,6 +943,7 @@ export async function createV3PoolAndSeed(opts: {
   tickLower?: number
   tickUpper?: number
   useNativeEth?: boolean
+  slippageBps?: number
   onStatus?: (msg: string) => void
 }): Promise<{ pool: PoolInfo; hash: `0x${string}` | null; created: boolean; seeded: boolean }> {
   const tokenA = isEthLikeCurrency(opts.tokenA) ? CONTRACTS.weth : opts.tokenA
@@ -993,8 +1011,7 @@ export async function createV3PoolAndSeed(opts: {
   }
 
   const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200)
-  const amount0Min = 0n
-  const amount1Min = 0n
+  const { amount0Min, amount1Min } = amountMinsForSlippage(amount0, amount1, opts.slippageBps ?? 300)
   const createData = encodeFunctionData({
     abi: v3NpmAbi,
     functionName: 'createAndInitializePoolIfNecessary',
@@ -1061,6 +1078,7 @@ export async function createV3PoolAndSeed(opts: {
       tickLower,
       tickUpper,
       useNativeEth: useNative,
+      slippageBps: opts.slippageBps ?? 300,
       onStatus,
     })
     return {
@@ -3218,7 +3236,7 @@ function friendlyTxError(e: unknown, action: string): string {
   const raw = e instanceof Error ? e.message : String(e)
   const lower = raw.toLowerCase()
   if (lower.includes('slippage') || lower.includes('price slippage') || lower.includes('stf') || lower.includes('too little')) {
-    return `${action} 失败：滑点保护触发。把顶部滑点调到 5%–10% 再试；若刚配对完数量，也可点一次刷新池价后重新输入。`
+    return `${action} 失败：滑点保护触发（价被推偏或变动过大）。把顶部滑点调高再试，或用私有交易防夹；薄 meme 池建议小额分批。`
   }
   if (lower.includes('insufficient') && (lower.includes('fund') || lower.includes('balance'))) {
     return `${action} 失败：余额不足（用 ETH 组仓时 value + gas 都要从 ETH 扣）。`
@@ -3352,7 +3370,7 @@ export async function mintV3Position(opts: {
 }) {
   const { walletClient, owner, pool, amount0, amount1, onStatus } = opts
   const npm = resolveV3Npm(pool)
-  void opts.slippageBps
+  const slippageBps = opts.slippageBps ?? 300
   if (pool.version !== 'v3' || !pool.poolAddress) throw new Error('需要 V3 池')
   let tickLower = opts.tickLower
   let tickUpper = opts.tickUpper
@@ -3421,7 +3439,7 @@ export async function mintV3Position(opts: {
   }
 
   const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200)
-  // 数量已与链上公式对齐：amountMin 用 0，杜绝假滑点；多余 desired 不会被多扣
+  const { amount0Min, amount1Min } = amountMinsForSlippage(use0, use1, slippageBps)
   const mintArgs = [{
     token0: usePool.token0.address,
     token1: usePool.token1.address,
@@ -3430,8 +3448,8 @@ export async function mintV3Position(opts: {
     tickUpper,
     amount0Desired: use0,
     amount1Desired: use1,
-    amount0Min: 0n,
-    amount1Min: 0n,
+    amount0Min,
+    amount1Min,
     recipient: owner,
     deadline,
   }] as const
@@ -3513,10 +3531,7 @@ export async function increaseV3Liquidity(opts: {
     await ensureAllowance(walletClient, position.token1.address, owner, npm, amount1)
   }
 
-  const effectiveSlip = Math.max(slippageBps, 100)
-  const amount0Min = 0n
-  const amount1Min = 0n
-  void effectiveSlip
+  const { amount0Min, amount1Min } = amountMinsForSlippage(amount0, amount1, slippageBps)
   const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200)
   const increaseArgs = [{
     tokenId: position.tokenId,
@@ -3930,8 +3945,7 @@ export async function claimAndCompoundV3(opts: {
               tokenId: position.tokenId,
               amount0Desired: fee0,
               amount1Desired: fee1,
-              amount0Min: 0n,
-              amount1Min: 0n,
+              ...amountMinsForSlippage(fee0, fee1, 500),
               deadline,
             }],
           }),
@@ -4011,8 +4025,7 @@ export async function claimAndCompoundV3(opts: {
         tokenId: position.tokenId,
         amount0Desired: amount0,
         amount1Desired: amount1,
-        amount0Min: 0n,
-        amount1Min: 0n,
+        ...amountMinsForSlippage(amount0, amount1, 500),
         deadline: BigInt(Math.floor(Date.now() / 1000) + 1200),
       }],
       chain: walletClient.chain,
