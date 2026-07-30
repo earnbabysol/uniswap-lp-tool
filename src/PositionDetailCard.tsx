@@ -29,7 +29,15 @@ export type PositionDetailCardProps = {
   onClose: () => void
   onRebalance: () => void
   onCopyId?: () => void
+  /** V3 池合约地址或 V4 poolId，供展示与一键复制 */
+  poolRef?: string | null
+  onCopyPool?: () => void
   poolHref?: string | null
+}
+
+function shortPoolRef(ref: string): string {
+  if (ref.length <= 18) return ref
+  return `${ref.slice(0, 10)}…${ref.slice(-8)}`
 }
 
 export function PositionDetailCard({
@@ -41,9 +49,13 @@ export function PositionDetailCard({
   onClose,
   onRebalance,
   onCopyId,
+  poolRef,
+  onCopyPool,
   poolHref,
 }: PositionDetailCardProps) {
   const cq = useMemo(() => getPositionCoinPrices(p), [p])
+  const unclaimedRaw = p.fees0 + p.fees1
+  const hasUnclaimed = unclaimedRaw > 0n
   const unclaimedUsd = p.fees0Usd + p.fees1Usd
   const principalUsd = p.amount0Usd + p.amount1Usd
   const deposited = p.costBasisUsd > 0 ? p.costBasisUsd : principalUsd > 0 ? principalUsd : 0
@@ -91,13 +103,25 @@ export function PositionDetailCard({
               复制编号
             </button>
           )}
+        </div>
+      </div>
+
+      {poolRef && (
+        <div className="pdc-pool">
+          <span className="pdc-pool-label">{p.version === 'v4' ? 'poolId' : '池地址'}</span>
+          <code className="pdc-pool-ref mono" title={poolRef}>{shortPoolRef(poolRef)}</code>
+          {onCopyPool && (
+            <button type="button" className="btn ghost tight" onClick={onCopyPool}>
+              复制
+            </button>
+          )}
           {poolHref && (
             <a className="btn ghost tight" href={poolHref} target="_blank" rel="noreferrer">
-              池子 ↗
+              浏览器 ↗
             </a>
           )}
         </div>
-      </div>
+      )}
 
       <div className="pdc-badges">
         <span className={`pdc-badge pnl ${pnlUp ? 'up' : 'down'}`}>
@@ -212,19 +236,19 @@ export function PositionDetailCard({
         <button
           type="button"
           className="btn"
-          disabled={busy || unclaimedUsd <= 0}
+          disabled={busy || !hasUnclaimed}
           onClick={onCollect}
-          title={unclaimedUsd <= 0 ? '暂无未领手续费' : undefined}
+          title={!hasUnclaimed ? '暂无未领手续费' : undefined}
         >
           领取手续费
         </button>
         <button
           type="button"
           className="btn primary"
-          disabled={busy || unclaimedUsd <= 0}
+          disabled={busy || !hasUnclaimed}
           onClick={onCompound}
           title={
-            unclaimedUsd <= 0
+            !hasUnclaimed
               ? '暂无未领手续费'
               : '仅用未领手续费加回本仓；配不平的一边留在钱包；复投失败时手续费仍在钱包'
           }

@@ -34,7 +34,7 @@ function makeReadTransport() {
   const cfg = getActiveChainConfig()
   const customUrl = loadCustomRpcUrl(cfg.id)
   const httpUrls = customUrl ? [customUrl] : [...cfg.defaultRpcUrls]
-  const httpTimeout = customUrl ? 30_000 : cfg.key === 'arc' ? 6_000 : 20_000
+  const httpTimeout = customUrl ? 30_000 : cfg.key === 'arc' ? 6_000 : cfg.key === 'bsc' ? 12_000 : 20_000
   const httpTransports = httpUrls.map((url) =>
     http(url, {
       timeout: httpTimeout,
@@ -67,6 +67,7 @@ const clientBox: { current: PublicClient } = {
   current: createPublicClient({
     chain: getActiveChainConfig().chain,
     transport: makeReadTransport(),
+    batch: { multicall: true },
   }),
 }
 
@@ -84,6 +85,7 @@ export function refreshPublicClient() {
   clientBox.current = createPublicClient({
     chain: cfg.chain,
     transport: makeReadTransport(),
+    batch: { multicall: true },
   })
 }
 

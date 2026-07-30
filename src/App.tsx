@@ -25,6 +25,7 @@ import {
   describeRange,
   discoverPoolsByToken,
   findV3Pool,
+  findBestV3Pool,
   findV4Pool,
   formatAmount,
   getErc20Balance,
@@ -78,7 +79,7 @@ import { RangeDepthChart } from './RangeDepthChart'
 import { PositionDetailCard, estimateRebalanceHalfPercent } from './PositionDetailCard'
 import { PositionLegs } from './PositionLegs'
 import { quotePoolSwap, swapInPool, type PoolSwapQuote } from './swap'
-import { parseAmount, formatAge, formatPrice, formatUsd, pairAmountForRange, formatAmountExact, priceToClosestTick, priceToSqrtPriceX96, tickToPrice } from './math'
+import { parseAmount, formatAge, formatPrice, formatUsd, pairAmountForRange, neededMintSide, formatAmountExact, priceToClosestTick, priceToSqrtPriceX96, tickToPrice } from './math'
 import { withTimeout } from './async'
 import {
   connectWallet,
@@ -228,6 +229,13 @@ function extractNote(r: unknown): string | null {
 function copyText(text: string) {
   void navigator.clipboard?.writeText(text)
 }
+
+function positionPoolRef(p: { poolAddress?: string | null; poolId?: string | null }): string | null {
+  if (p.poolAddress) return p.poolAddress
+  if (p.poolId) return p.poolId
+  return null
+}
+
 
 function applyDefaultCoinRange(
   info: PoolInfo,
@@ -447,11 +455,58 @@ export default function App() {
     if (!selectedId) return
     const el = document.getElementById('position-detail-card')
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    setPosOpMode('add')
+    setAdd0('')
+    setAdd1('')
+    setRemovePct(100)
     setSwapAmount('')
     setSwapQuote(null)
     setSwapQuoteErr(null)
     setSwapZeroForOne(true)
   }, [selectedId])
+
+  const fillAddBalances = (pct = 100) => {
+    if (!selected) return
+    const f = BigInt(Math.floor(pct * 100))
+    const gas = 10n ** 15n
+    const eth0 = isEthLikeCurrency(selected.token0.address)
+    const eth1 = isEthLikeCurrency(selected.token1.address)
+    let r0 = addUseEth && eth0 ? (ethBal > gas ? ethBal - gas : 0n) : addBal0
+    let r1 = addUseEth && eth1 ? (ethBal > gas ? ethBal - gas : 0n) : addBal1
+    r0 = (r0 * f) / 10000n
+    r1 = (r1 * f) / 10000n
+    const from0 = pairAmountForRange({
+      sqrtPriceX96: selected.sqrtPriceX96,
+      tickLower: selected.tickLower,
+      tickUpper: selected.tickUpper,
+      amount: r0,
+      side: 0,
+    })
+    const from1 = pairAmountForRange({
+      sqrtPriceX96: selected.sqrtPriceX96,
+      tickLower: selected.tickLower,
+      tickUpper: selected.tickUpper,
+      amount: r1,
+      side: 1,
+    })
+    if (from0.singleSided === 'token1' || from1.singleSided === 'token1') {
+      setAdd0('0')
+      setAdd1(formatAmountExact(from1.amount1, selected.token1.decimals))
+      return
+    }
+    if (from0.singleSided === 'token0' || from1.singleSided === 'token0') {
+      setAdd0(formatAmountExact(from0.amount0, selected.token0.decimals))
+      setAdd1('0')
+      return
+    }
+    if (from0.amount0 > 0n && from0.amount1 <= r1) {
+      setAdd0(formatAmountExact(from0.amount0, selected.token0.decimals))
+      setAdd1(formatAmountExact(from0.amount1, selected.token1.decimals))
+      return
+    }
+    setAdd0(formatAmountExact(from1.amount0, selected.token0.decimals))
+    setAdd1(formatAmountExact(from1.amount1, selected.token1.decimals))
+  }
 
   const summary = useMemo(() => {
     const totalUsd = positions.reduce((s, p) => s + p.totalUsd, 0)
@@ -1186,14 +1241,13 @@ export default function App() {
         setStatus(`已加载 V4 · fee ${(info.fee / 10000).toFixed(2)}% · spacing ${info.tickSpacing} · 币价 ${formatPrice(getCoinQuote(info).spot)}`)
         return
       }
-      const addr = await findV3Pool(tokenA, tokenB, fee)
-      if (!addr) {
+      const info = await findBestV3Pool(tokenA, tokenB, fee)
+      if (!info) {
         setPool(null)
         setShowCreatePool(true)
-        setStatus('该 Fee 尚无 V3 池 — 可在下方创建并初始化')
+        setStatus('该 Fee 尚无 V3 池（已查 Uniswap/Pancake）— 可在下方创建 Uniswap 池')
         return
       }
-      const info = await loadV3Pool(addr)
       if (info.sqrtPriceX96 === 0n) {
         setPool(null)
         setShowCreatePool(true)
@@ -1203,7 +1257,10 @@ export default function App() {
       setPool(info)
       setShowCreatePool(false)
       applyDefaultCoinRange(info, setPriceLo, setPriceHi)
-      setStatus(`已加载 ${shortAddr(addr)} · 币价 ${formatPrice(getCoinQuote(info).spot)} ${getCoinQuote(info).quote.symbol}/${getCoinQuote(info).coin.symbol}`)
+      {
+        const q = getCoinQuote(info)
+        setStatus(`已加载 ${info.dexLabel ?? 'V3'} · ${(info.fee / 10000).toFixed(2)}% · ${info.poolAddress ? shortAddr(info.poolAddress) : ''} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`)
+      }
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e))
     } finally {
@@ -1480,7 +1537,12 @@ export default function App() {
     }
   }
 
-  const run = async (label: string, fn: () => Promise<unknown>, pair?: string) => {
+  const run = async (
+    label: string,
+    fn: () => Promise<unknown>,
+    pair?: string,
+    opts?: { afterSuccess?: () => void },
+  ) => {
     if (!wallet || !address) {
       pushToast({ kind: 'error', title: '请先连接钱包' })
       return setStatus('请先连接钱包')
@@ -1507,6 +1569,7 @@ export default function App() {
       })
       await refreshPositions({ silent: true })
       if (address) await refreshBalances(address)
+      opts?.afterSuccess?.()
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       setStatus(msg)
@@ -1640,14 +1703,41 @@ export default function App() {
         [addr.toLowerCase()]: { symbol: meta.symbol, decimals: meta.decimals },
       }))
     }
-    if (side === 'a') setTokenA(addr)
-    else setTokenB(addr)
-  }, [])
+    // 始终保持 tokenA=币、tokenB=报价：若一侧是原生/包装币，它必须落在报价侧
+    let nextA = side === 'a' ? addr : tokenA
+    let nextB = side === 'b' ? addr : tokenB
+    const ethA = isEthLikeCurrency(nextA)
+    const ethB = isEthLikeCurrency(nextB)
+    if (ethA && !ethB) {
+      const tmp = nextA
+      nextA = nextB
+      nextB = tmp
+    }
+    setTokenA(nextA)
+    setTokenB(nextB)
+  }, [tokenA, tokenB])
 
   const swapTokens = useCallback(() => {
-    setTokenA(tokenB)
-    setTokenB(tokenA)
+    // 交换后若 ETH 落在币侧，再归一回「币 / 报价」
+    const nextA = tokenB
+    const nextB = tokenA
+    if (isEthLikeCurrency(nextA) && !isEthLikeCurrency(nextB)) {
+      setTokenA(nextB)
+      setTokenB(nextA)
+      return
+    }
+    setTokenA(nextA)
+    setTokenB(nextB)
   }, [tokenA, tokenB])
+
+  // 打开创建区时，纠正历史状态里颠倒的币/报价
+  useEffect(() => {
+    if (!showCreatePool) return
+    if (isEthLikeCurrency(tokenA) && !isEthLikeCurrency(tokenB)) {
+      setTokenA(tokenB)
+      setTokenB(tokenA)
+    }
+  }, [showCreatePool, tokenA, tokenB])
 
   const tokenLabel = (addr: Address) => {
     if (isNativeCurrency(addr)) {
@@ -1738,8 +1828,16 @@ export default function App() {
 
     const spacing =
       mintProtocol === 'v4'
-        ? v4TickSpacing
-        : useFee === 100 ? 1 : useFee === 500 ? 10 : useFee === 3000 ? 60 : 200
+        ? Math.max(1, Number(v4TickSpacing) || suggestV4TickSpacing(useFee))
+        : useFee === 100
+          ? 1
+          : useFee === 500
+            ? 10
+            : useFee === 2500
+              ? 50
+              : useFee === 3000
+                ? 60
+                : 200
 
     const sqrt = priceToSqrtPriceX96(sortedPrice, d0, d1)
     const tick = priceToClosestTick(sortedPrice, d0, d1)
@@ -1911,10 +2009,6 @@ export default function App() {
       amount: avail0,
       side: 0,
     })
-    if (from0.singleSided === 'token0' || from0.amount1 <= avail1) {
-      applyPool(from0.amount0, from0.amount1)
-      return
-    }
     const from1 = pairAmountForRange({
       sqrtPriceX96: synth.sqrtPriceX96,
       tickLower: range.tickLower,
@@ -1922,7 +2016,24 @@ export default function App() {
       amount: avail1,
       side: 1,
     })
-    applyPool(from1.amount0, from1.amount1)
+    if (from0.singleSided === 'token1' || from1.singleSided === 'token1') {
+      applyPool(0n, from1.amount1)
+      return
+    }
+    if (from0.singleSided === 'token0' || from1.singleSided === 'token0') {
+      applyPool(from0.amount0, 0n)
+      return
+    }
+    if (from0.amount0 > 0n && from0.amount1 <= avail1) {
+      applyPool(from0.amount0, from0.amount1)
+      return
+    }
+    if (from1.amount1 > 0n && from1.amount0 <= avail0) {
+      applyPool(from1.amount0, from1.amount1)
+      return
+    }
+    if (from0.amount0 > 0n) applyPool(from0.amount0, from0.amount1)
+    else applyPool(from1.amount0, from1.amount1)
   }
 
   const createPool = async () => {
@@ -1930,6 +2041,7 @@ export default function App() {
       setStatus('请先连接钱包')
       return
     }
+    // 新建池走 Uniswap Factory；Pancake 深池请直接「加载」后 Mint，勿在此重复创建
     if (tokenA.toLowerCase() === tokenB.toLowerCase()) {
       setStatus('两个 Token 不能相同')
       return
@@ -2037,8 +2149,8 @@ export default function App() {
         const { pool: info, hash, created, seeded } = await createV3PoolAndSeed({
           walletClient: wallet,
           owner: address,
-          tokenA,
-          tokenB,
+          tokenA: chainCurrency(tokenA),
+          tokenB: chainCurrency(tokenB),
           fee: useFee,
           initialPriceBPerA,
           amount0: seedOnCreate ? amount0 : undefined,
@@ -2080,12 +2192,12 @@ export default function App() {
     if (!pool || !mintTicks) return
     const f = BigInt(Math.floor(pct * 100))
     const gasReserve = 10n ** 15n
-    const weth0 = pool.token0.address.toLowerCase() === CONTRACTS.weth.toLowerCase()
-    const weth1 = pool.token1.address.toLowerCase() === CONTRACTS.weth.toLowerCase()
+    const eth0 = isEthLikeCurrency(pool.token0.address)
+    const eth1 = isEthLikeCurrency(pool.token1.address)
     let avail0 = bal0
     let avail1 = bal1
-    if (useNativeEth && weth0) avail0 = ethBal > gasReserve ? ethBal - gasReserve : 0n
-    if (useNativeEth && weth1) avail1 = ethBal > gasReserve ? ethBal - gasReserve : 0n
+    if (useNativeEth && eth0) avail0 = ethBal > gasReserve ? ethBal - gasReserve : 0n
+    if (useNativeEth && eth1) avail1 = ethBal > gasReserve ? ethBal - gasReserve : 0n
     avail0 = (avail0 * f) / 10000n
     avail1 = (avail1 * f) / 10000n
 
@@ -2101,11 +2213,6 @@ export default function App() {
       amount: avail0,
       side: 0,
     })
-    if (from0.singleSided === 'token0' || from0.amount1 <= avail1) {
-      apply(from0.amount0, from0.amount1)
-      setPairSide(0)
-      return
-    }
     const from1 = pairAmountForRange({
       sqrtPriceX96: pool.sqrtPriceX96,
       tickLower: mintTicks.tickLower,
@@ -2113,15 +2220,54 @@ export default function App() {
       amount: avail1,
       side: 1,
     })
+
+    // 区间上方只要 token1；下方只要 token0
+    if (from0.singleSided === 'token1' || from1.singleSided === 'token1') {
+      apply(0n, from1.amount1)
+      setPairSide(1)
+      return
+    }
+    if (from0.singleSided === 'token0' || from1.singleSided === 'token0') {
+      apply(from0.amount0, 0n)
+      setPairSide(0)
+      return
+    }
+    if (from0.amount0 > 0n && from0.amount1 <= avail1) {
+      apply(from0.amount0, from0.amount1)
+      setPairSide(0)
+      return
+    }
+    if (from1.amount1 > 0n && from1.amount0 <= avail0) {
+      apply(from1.amount0, from1.amount1)
+      setPairSide(1)
+      return
+    }
+    if (from0.amount0 > 0n) {
+      apply(from0.amount0, from0.amount1)
+      setPairSide(0)
+      return
+    }
     apply(from1.amount0, from1.amount1)
     setPairSide(1)
   }
 
   const onMintSide = (side: 0 | 1, raw: string) => {
+    if (!pool || !mintTicks) {
+      if (side === 0) setAmount0(raw)
+      else setAmount1(raw)
+      setPairSide(side)
+      return
+    }
+    const need = neededMintSide(pool.tick, mintTicks.tickLower, mintTicks.tickUpper)
+    // 单边区间点到不需要的一侧：清零并忽略，避免 Max 把可用侧冲掉
+    if (need !== 'both' && need !== side) {
+      if (side === 0) setAmount0('0')
+      else setAmount1('0')
+      return
+    }
     if (side === 0) setAmount0(raw)
     else setAmount1(raw)
     setPairSide(side)
-    if (!pool || !mintTicks) return
     const dec = side === 0 ? pool.token0.decimals : pool.token1.decimals
     const amount = parseAmount(raw || '0', dec)
     const paired = pairAmountForRange({
@@ -2171,6 +2317,12 @@ export default function App() {
 
   const onAddSide = (side: 0 | 1, raw: string) => {
     if (!selected) return
+    const need = neededMintSide(selected.tick, selected.tickLower, selected.tickUpper)
+    if (need !== 'both' && need !== side) {
+      if (side === 0) setAdd0('0')
+      else setAdd1('0')
+      return
+    }
     if (side === 0) setAdd0(raw)
     else setAdd1(raw)
     const dec = side === 0 ? selected.token0.decimals : selected.token1.decimals
@@ -2191,17 +2343,31 @@ export default function App() {
 
   const poolUsesWeth = pool ? pairHasWeth(pool.token0.address, pool.token1.address) : false
   const mintUseEth = useNativeEth && poolUsesWeth
+  const mintNeedSide = pool && mintTicks
+    ? neededMintSide(pool.tick, mintTicks.tickLower, mintTicks.tickUpper)
+    : 'both'
   const label0 = pool
-    ? (mintUseEth && isEthLikeCurrency(pool.token0.address) ? 'ETH' : pool.token0.symbol)
+    ? (mintUseEth && isEthLikeCurrency(pool.token0.address) ? getNativeSymbol() : pool.token0.symbol)
     : ''
   const label1 = pool
-    ? (mintUseEth && isEthLikeCurrency(pool.token1.address) ? 'ETH' : pool.token1.symbol)
+    ? (mintUseEth && isEthLikeCurrency(pool.token1.address) ? getNativeSymbol() : pool.token1.symbol)
     : ''
   const showBal0 = pool
     ? (mintUseEth && isEthLikeCurrency(pool.token0.address) ? ethBal : bal0)
     : 0n
   const showBal1 = pool
     ? (mintUseEth && isEthLikeCurrency(pool.token1.address) ? ethBal : bal1)
+    : 0n
+  const gasReserve = 10n ** 15n
+  const mintMax0 = pool
+    ? (mintUseEth && isEthLikeCurrency(pool.token0.address)
+      ? (ethBal > gasReserve ? ethBal - gasReserve : 0n)
+      : bal0)
+    : 0n
+  const mintMax1 = pool
+    ? (mintUseEth && isEthLikeCurrency(pool.token1.address)
+      ? (ethBal > gasReserve ? ethBal - gasReserve : 0n)
+      : bal1)
     : 0n
 
   /**
@@ -2238,11 +2404,14 @@ export default function App() {
 
   const selectedUsesWeth = selected ? pairHasWeth(selected.token0.address, selected.token1.address) : false
   const addUseEth = useNativeEth && selectedUsesWeth
+  const addNeedSide = selected
+    ? neededMintSide(selected.tick, selected.tickLower, selected.tickUpper)
+    : 'both'
   const addLabel0 = selected
-    ? (addUseEth && isEthLikeCurrency(selected.token0.address) ? 'ETH' : selected.token0.symbol)
+    ? (addUseEth && isEthLikeCurrency(selected.token0.address) ? getNativeSymbol() : selected.token0.symbol)
     : ''
   const addLabel1 = selected
-    ? (addUseEth && isEthLikeCurrency(selected.token1.address) ? 'ETH' : selected.token1.symbol)
+    ? (addUseEth && isEthLikeCurrency(selected.token1.address) ? getNativeSymbol() : selected.token1.symbol)
     : ''
   const addShow0 = selected
     ? (addUseEth && isEthLikeCurrency(selected.token0.address) ? ethBal : addBal0)
@@ -2250,16 +2419,26 @@ export default function App() {
   const addShow1 = selected
     ? (addUseEth && isEthLikeCurrency(selected.token1.address) ? ethBal : addBal1)
     : 0n
+  const addMax0 = selected
+    ? (addUseEth && isEthLikeCurrency(selected.token0.address)
+      ? (ethBal > gasReserve ? ethBal - gasReserve : 0n)
+      : addBal0)
+    : 0n
+  const addMax1 = selected
+    ? (addUseEth && isEthLikeCurrency(selected.token1.address)
+      ? (ethBal > gasReserve ? ethBal - gasReserve : 0n)
+      : addBal1)
+    : 0n
 
   const swapInMeta = selected
     ? (swapZeroForOne
-      ? { token: selected.token0, label: addUseEth && isEthLikeCurrency(selected.token0.address) ? 'ETH' : selected.token0.symbol, bal: addShow0 }
-      : { token: selected.token1, label: addUseEth && isEthLikeCurrency(selected.token1.address) ? 'ETH' : selected.token1.symbol, bal: addShow1 })
+      ? { token: selected.token0, label: addUseEth && isEthLikeCurrency(selected.token0.address) ? getNativeSymbol() : selected.token0.symbol, bal: addShow0 }
+      : { token: selected.token1, label: addUseEth && isEthLikeCurrency(selected.token1.address) ? getNativeSymbol() : selected.token1.symbol, bal: addShow1 })
     : null
   const swapOutMeta = selected
     ? (swapZeroForOne
-      ? { token: selected.token1, label: addUseEth && isEthLikeCurrency(selected.token1.address) ? 'ETH' : selected.token1.symbol }
-      : { token: selected.token0, label: addUseEth && isEthLikeCurrency(selected.token0.address) ? 'ETH' : selected.token0.symbol })
+      ? { token: selected.token1, label: addUseEth && isEthLikeCurrency(selected.token1.address) ? getNativeSymbol() : selected.token1.symbol }
+      : { token: selected.token0, label: addUseEth && isEthLikeCurrency(selected.token0.address) ? getNativeSymbol() : selected.token0.symbol })
     : null
 
   // 本池 Swap 报价（防抖）
@@ -2750,6 +2929,25 @@ export default function App() {
                     </div>
 
                     <div className="pc-pair">{cq.coin.symbol} / {cq.quote.symbol}</div>
+                    {(() => {
+                      const pref = positionPoolRef(p)
+                      if (!pref) return null
+                      return (
+                        <button
+                          type="button"
+                          className="pc-pool mono"
+                          title={`点击复制 ${pref}`}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            copyText(pref)
+                            pushToast({ kind: 'success', title: '已复制池地址', detail: pref })
+                          }}
+                        >
+                          <span className="pc-pool-k">{p.version === 'v4' ? 'poolId' : '池'}</span>
+                          {pref.length > 22 ? `${pref.slice(0, 10)}…${pref.slice(-8)}` : pref}
+                        </button>
+                      )
+                    })()}
 
                     <div className="pc-hero">
                       <div className="pc-value">{formatUsd(p.totalUsd)}</div>
@@ -2798,8 +2996,18 @@ export default function App() {
             <PositionDetailCard
               position={selected}
               busy={busy}
+              poolRef={positionPoolRef(selected)}
               poolHref={selected.poolAddress ? explorerAddress(selected.poolAddress) : null}
-              onCopyId={() => copyText(selected.tokenId.toString())}
+              onCopyId={() => {
+                copyText(selected.tokenId.toString())
+                pushToast({ kind: 'success', title: '已复制仓位编号', detail: selected.tokenId.toString() })
+              }}
+              onCopyPool={() => {
+                const pref = positionPoolRef(selected)
+                if (!pref) return
+                copyText(pref)
+                pushToast({ kind: 'success', title: '已复制池地址', detail: pref })
+              }}
               onCollect={() => void run(
                 selected.version === 'v4'
                   ? 'Claim V4'
@@ -2815,6 +3023,8 @@ export default function App() {
                       unwrapEth: addUseEth,
                       token0: pos.token0.address,
                       token1: pos.token1.address,
+                      dex: pos.dex,
+                      v3Npm: pos.v3Npm,
                     })
                   const wethUsd = await getWethUsdPrice().catch(() => 0)
                   const next = recordPositionClaim(pos, wethUsd)
@@ -3005,7 +3215,7 @@ export default function App() {
                   <label className="op-native inline-setting check">
                     <input type="checkbox" checked={useNativeEth} onChange={(e) => setUseNativeEth(e.target.checked)} />
                     <span className="op-native-text">
-                      用原生 ETH
+                      用原生 {getNativeSymbol()}
                       <span className="op-native-sub">加仓付 / Claim·撤出收 / Swap</span>
                     </span>
                   </label>
@@ -3022,13 +3232,19 @@ export default function App() {
                       <button
                         type="button"
                         className="amt-max"
-                        disabled={!address || addShow0 === 0n}
-                        onClick={() => onAddSide(0, formatAmountExact(addShow0, selected.token0.decimals))}
+                        disabled={!address || addMax0 === 0n || addNeedSide === 1}
+                        onClick={() => onAddSide(0, formatAmountExact(addMax0, selected.token0.decimals))}
                       >
                         Max
                       </button>
                     </span>
-                    <input value={add0} onChange={(e) => onAddSide(0, e.target.value)} inputMode="decimal" placeholder="填数量" />
+                    <input
+                      value={add0}
+                      onChange={(e) => onAddSide(0, e.target.value)}
+                      inputMode="decimal"
+                      placeholder={addNeedSide === 1 ? '此区间不需要' : '填数量'}
+                      disabled={addNeedSide === 1}
+                    />
                   </label>
                   <label className="amt">
                     <span className="amt-head">{addLabel1}</span>
@@ -3037,57 +3253,46 @@ export default function App() {
                       <button
                         type="button"
                         className="amt-max"
-                        disabled={!address || addShow1 === 0n}
-                        onClick={() => onAddSide(1, formatAmountExact(addShow1, selected.token1.decimals))}
+                        disabled={!address || addMax1 === 0n || addNeedSide === 0}
+                        onClick={() => onAddSide(1, formatAmountExact(addMax1, selected.token1.decimals))}
                       >
                         Max
                       </button>
                     </span>
-                    <input value={add1} onChange={(e) => onAddSide(1, e.target.value)} inputMode="decimal" placeholder="填数量" />
+                    <input
+                      value={add1}
+                      onChange={(e) => onAddSide(1, e.target.value)}
+                      inputMode="decimal"
+                      placeholder={addNeedSide === 0 ? '此区间不需要' : '填数量'}
+                      disabled={addNeedSide === 0}
+                    />
                   </label>
                 </div>
-                <p className="muted op-hint">填一边即可，另一边按当前区间配平。</p>
+                <p className="muted op-hint">
+                  {addNeedSide === 'both'
+                    ? '填一边即可，另一边按当前区间配平。'
+                    : `当前仓位在区间外，加仓只需 ${addNeedSide === 0 ? addLabel0 : addLabel1}。`}
+                </p>
+                <div className="mint-fill">
+                  <span className="muted small">按余额填</span>
+                  <div className="seg" role="group" aria-label="按余额比例加仓">
+                    {[25, 50, 75, 100].map((n) => (
+                      <button
+                        key={`add-fill-${n}`}
+                        type="button"
+                        className="filter-chip mono"
+                        disabled={!address}
+                        onClick={() => fillAddBalances(n)}
+                      >
+                        {n === 100 ? '全部' : `${n}%`}
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 <div className="btn-row">
                   <button
-                    className="btn"
-                    type="button"
-                    disabled={!address}
-                    onClick={() => {
-                      const gasReserve = 10n ** 15n
-                      const r0 = addUseEth && selected.token0.address.toLowerCase() === CONTRACTS.weth.toLowerCase()
-                        ? (ethBal > gasReserve ? ethBal - gasReserve : 0n)
-                        : addBal0
-                      const r1 = addUseEth && selected.token1.address.toLowerCase() === CONTRACTS.weth.toLowerCase()
-                        ? (ethBal > gasReserve ? ethBal - gasReserve : 0n)
-                        : addBal1
-                      const from0 = pairAmountForRange({
-                        sqrtPriceX96: selected.sqrtPriceX96,
-                        tickLower: selected.tickLower,
-                        tickUpper: selected.tickUpper,
-                        amount: r0,
-                        side: 0,
-                      })
-                      if (from0.singleSided === 'token0' || from0.amount1 <= r1) {
-                        setAdd0(formatAmountExact(from0.amount0, selected.token0.decimals))
-                        setAdd1(formatAmountExact(from0.amount1, selected.token1.decimals))
-                        return
-                      }
-                      const from1 = pairAmountForRange({
-                        sqrtPriceX96: selected.sqrtPriceX96,
-                        tickLower: selected.tickLower,
-                        tickUpper: selected.tickUpper,
-                        amount: r1,
-                        side: 1,
-                      })
-                      setAdd0(formatAmountExact(from1.amount0, selected.token0.decimals))
-                      setAdd1(formatAmountExact(from1.amount1, selected.token1.decimals))
-                    }}
-                  >
-                    按余额配平
-                  </button>
-                  <button
                     className="btn primary"
-                    disabled={busy}
+                    disabled={busy || (!add0 && !add1)}
                     onClick={() => void run(
                       selected.version === 'v4' ? '加仓 V4' : '加仓',
                       () => selected.version === 'v4'
@@ -3111,6 +3316,7 @@ export default function App() {
                           useNativeEth: addUseEth,
                         }),
                       `${selected.token0.symbol}/${selected.token1.symbol}`,
+                      { afterSuccess: () => { setAdd0(''); setAdd1('') } },
                     )}
                   >
                     确认加仓{selected.version === 'v4' ? ' · V4' : ''}
@@ -3119,6 +3325,11 @@ export default function App() {
               </div>
               ) : posOpMode === 'swap' ? (
               <div className="op-block">
+                {selected.version === 'v3' && selected.dex && selected.dex !== 'uniswap' && selected.dex !== 'unknown' ? (
+                  <p className="muted op-hint warn-text">
+                    {selected.dexLabel ?? selected.dex} 池暂不支持本工具内 Swap，请用站外兑换。
+                  </p>
+                ) : null}
                 <div className="swap-dir-row">
                   <button
                     type="button"
@@ -3203,7 +3414,13 @@ export default function App() {
                 <div className="btn-row">
                   <button
                     className="btn primary"
-                    disabled={busy || !address || !swapQuote || swapQuoteBusy}
+                    disabled={
+                      busy
+                      || !address
+                      || !swapQuote
+                      || swapQuoteBusy
+                      || (selected.version === 'v3' && Boolean(selected.dex && selected.dex !== 'uniswap' && selected.dex !== 'unknown'))
+                    }
                     onClick={() => {
                       if (!selected || !swapInMeta || !swapQuote) return
                       void run(
@@ -3219,6 +3436,7 @@ export default function App() {
                           onStatus: setStatus,
                         }),
                         `${swapInMeta.label}→${swapOutMeta?.label ?? ''}`,
+                        { afterSuccess: () => { setSwapAmount(''); setSwapQuote(null) } },
                       )
                     }}
                   >
@@ -3234,30 +3452,45 @@ export default function App() {
                 </label>
                 <div className="chip-row">
                   {[25, 50, 75, 100].map((n) => (
-                    <button key={n} type="button" className={`chip ${removePct === n ? 'on' : ''}`} onClick={() => setRemovePct(n)}>{n}%</button>
+                    <button
+                      key={n}
+                      type="button"
+                      className={`chip ${removePct === n ? 'on' : ''}`}
+                      onClick={() => setRemovePct(n)}
+                    >
+                      {n === 100 ? '全部关闭' : `${n}%`}
+                    </button>
                   ))}
                 </div>
                 <p className="muted">
-                  约 {formatAmount((selected.amount0 * BigInt(removePct)) / 100n, selected.token0.decimals, 4)} {selected.token0.symbol}
+                  约 {formatAmount((selected.amount0 * BigInt(removePct)) / 100n, selected.token0.decimals, 4)} {addLabel0 || selected.token0.symbol}
                   {' + '}
-                  {formatAmount((selected.amount1 * BigInt(removePct)) / 100n, selected.token1.decimals, 4)} {selected.token1.symbol}
-                  {removePct === 100 ? ' · 全撤后会 burn 空 NFT' : ''}
+                  {formatAmount((selected.amount1 * BigInt(removePct)) / 100n, selected.token1.decimals, 4)} {addLabel1 || selected.token1.symbol}
+                  {(selected.fees0 > 0n || selected.fees1 > 0n) ? ' · 未领手续费会一并领出' : ''}
+                  {removePct === 100 ? ' · 全撤后销毁空 NFT' : ''}
                 </p>
                 <button
                   className="btn danger"
                   disabled={busy}
                   onClick={() => {
                     confirmThen({
-                      title: `确认移除 ${removePct}% 流动性？`,
+                      title: removePct >= 100 ? '确认关闭仓位？' : `确认移除 ${removePct}% 流动性？`,
                       lines: [
                         `${selected.token0.symbol}/${selected.token1.symbol} #${selected.tokenId}`,
                         `约 ${formatAmount((selected.amount0 * BigInt(removePct)) / 100n, selected.token0.decimals, 4)} ${selected.token0.symbol} + ${formatAmount((selected.amount1 * BigInt(removePct)) / 100n, selected.token1.decimals, 4)} ${selected.token1.symbol}`,
+                        selected.fees0 + selected.fees1 > 0n
+                          ? `未领手续费约 ${formatUsd(selected.fees0Usd + selected.fees1Usd)} 会一并领出`
+                          : '当前无未领手续费',
                         removePct >= 100 ? '全撤后会 burn 空 NFT，不可撤销。' : '滑点按上方设置。',
                       ],
-                      confirmLabel: `撤出 ${removePct}%`,
+                      confirmLabel: removePct >= 100 ? '全撤并关闭' : `撤出 ${removePct}%`,
                       danger: true,
                     }, () => {
-                      void run(selected.version === 'v4' ? '移除 V4' : '移除 LP', async () => {
+                      void run(
+                        selected.version === 'v4'
+                          ? (removePct >= 100 ? '关闭 V4' : '移除 V4')
+                          : (removePct >= 100 ? '关闭仓位' : '移除 LP'),
+                        async () => {
                         const hash = selected.version === 'v4'
                           ? await removeV4Liquidity({
                             walletClient: wallet!,
@@ -3281,7 +3514,9 @@ export default function App() {
                     })
                   }}
                 >
-                  撤出 {removePct}%{selected.version === 'v4' ? ' · V4' : ''}
+                  {removePct >= 100
+                    ? `关闭仓位${selected.version === 'v4' ? ' · V4' : ''}`
+                    : `撤出 ${removePct}%${selected.version === 'v4' ? ' · V4' : ''}`}
                 </button>
               </div>
               )}
@@ -3390,9 +3625,6 @@ export default function App() {
               {' / '}
               {tokenLabel(tokenB)}
             </strong>
-            {isEthLikeCurrency(tokenA) && !isEthLikeCurrency(tokenB) && (
-              <span className="warn-text">　建议把 ETH 放右侧「报价」</span>
-            )}
           </p>
 
           <div className="btn-row">
@@ -3432,6 +3664,9 @@ export default function App() {
               <p className="muted mint-create-lead">
                 自选交易对并设定初始价（<strong>USD / {tokenLabel(createSides.coin)}</strong>），系统会自动换算成链上需要的
                 {' '}{tokenLabel(createSides.quote)} per {tokenLabel(createSides.coin)}。
+                {mintProtocol === 'v3' && (
+                  <> 新建会走 <strong>Uniswap</strong> Factory；已有 Pancake 深池请用上方「加载」后 Mint。</>
+                )}
               </p>
 
               <div className="mint-token-row compact">
@@ -3568,7 +3803,7 @@ export default function App() {
                           setPercentUp(hi)
                         }}
                       >
-                        单边 ETH
+                        单边 {getNativeSymbol()}
                       </button>
                       <button
                         type="button"
@@ -3595,7 +3830,7 @@ export default function App() {
                   </div>
                   <p className="muted" style={{ margin: '0 0 8px', fontSize: 12 }}>
                     {createRangePreset === 'onesided-eth'
-                      ? '单边 ETH：区间在市价下方，创建时通常只需付 ETH。'
+                      ? `单边 ${getNativeSymbol()}：区间放到币价下方，创建时通常只需付报价侧（${tokenLabel(createSides.quote)}）。`
                       : createRangePreset === 'full'
                         ? '全区间：覆盖全部价格，需同时准备两侧代币（按初始价比例）。'
                         : `双边 ±${createRangePreset}%：区间围绕初始价，通常需两侧代币。`}
@@ -3605,7 +3840,7 @@ export default function App() {
                       <> 上方初始价填好后，这里填一边就会自动配平（可点「取现价」从已有池子带过来）。</>
                     )}
                     {mintProtocol === 'v3' && (
-                      <> V3 链上用 WETH，可直接付 ETH（自动 Wrap）。</>
+                      <> V3 链上用 {getWrappedNativeSymbol()}，可直接付 {getNativeSymbol()}（自动 Wrap）。</>
                     )}
                   </p>
                   <div className="grid2">
@@ -3690,7 +3925,7 @@ export default function App() {
                     applyDefaultCoinRange(p, setPriceLo, setPriceHi)
                   }}
                 >
-                  {(p.fee / 10000).toFixed(2)}% · {formatPrice(getCoinQuote(p).spot)}
+                  {p.dexLabel ? `${p.dexLabel} · ` : ''}{(p.fee / 10000).toFixed(2)}% · {formatPrice(getCoinQuote(p).spot)}
                 </button>
               ))}
             </div>
@@ -3777,7 +4012,9 @@ export default function App() {
                       }
                     }}
                   >
-                    <span className={`tag ${d.pool.version}`}>{d.pool.version.toUpperCase()}</span>
+                    <span className={`tag ${d.pool.version}`}>
+                      {d.pool.version === 'v3' ? (d.pool.dexLabel ?? 'V3') : 'V4'}
+                    </span>
                     <span className="mono">
                       {q.coin.symbol}/{q.quote.symbol}
                       {hasHook && (
@@ -3919,24 +4156,24 @@ export default function App() {
                         </div>
                       </div>
                       <div className="mint-preset-row">
-                        <span className="mint-preset-label">只付 ETH</span>
+                        <span className="mint-preset-label">只付 {getNativeSymbol()}</span>
                         <div className="seg" role="group" aria-label="单币区间预设">
                           <button
                             type="button"
                             aria-pressed={percentLower === -75 && percentUp === -3}
                             className={`filter-chip ${percentLower === -75 && percentUp === -3 ? 'active' : ''}`}
                             onClick={() => {
-                              // 币价口径固定 -75%~-3%，ETH 在 token0/token1 都能单边付 ETH
+                              // 币价口径固定 -75%~-3%，原生币在 token0/token1 都能单边支付
                               const { percentLower: lo, percentUpper: hi } = oneSidedEthPercents()
                               setPercentLower(lo)
                               setPercentUp(hi)
                               setRangeMode('percent')
                             }}
                           >
-                            区间放到市价下方
+                            区间放到币价下方
                           </button>
                         </div>
-                        <InfoHint text="把整个区间挪到当前币价下方，这样建仓时只需要付 ETH（报价币）一侧，不用先去买币。等币价跌进区间才会开始成交、换成币。" />
+                        <InfoHint text={`把整个区间挪到当前币价下方，建仓时通常只需付 ${getNativeSymbol()}（报价侧），不用先买币。等币价跌进区间才会开始成交。`} />
                       </div>
                     </div>
                     <div className="mint-pct-grid">
@@ -4086,8 +4323,8 @@ export default function App() {
                       <button
                         type="button"
                         className="amt-max"
-                        disabled={!address || !mintTicks || showBal0 === 0n}
-                        onClick={() => onMintSide(0, formatAmountExact(showBal0, pool.token0.decimals))}
+                        disabled={!address || !mintTicks || mintMax0 === 0n || mintNeedSide === 1}
+                        onClick={() => onMintSide(0, formatAmountExact(mintMax0, pool.token0.decimals))}
                       >
                         Max
                       </button>
@@ -4116,8 +4353,8 @@ export default function App() {
                       <button
                         type="button"
                         className="amt-max"
-                        disabled={!address || !mintTicks || showBal1 === 0n}
-                        onClick={() => onMintSide(1, formatAmountExact(showBal1, pool.token1.decimals))}
+                        disabled={!address || !mintTicks || mintMax1 === 0n || mintNeedSide === 0}
+                        onClick={() => onMintSide(1, formatAmountExact(mintMax1, pool.token1.decimals))}
                       >
                         Max
                       </button>
@@ -4294,10 +4531,16 @@ export default function App() {
                         useNativeEth: mintUseEth,
                         onStatus: setStatus,
                       })
-                    }, `${pool.token0.symbol}/${pool.token1.symbol}`)
+                    }, `${pool.token0.symbol}/${pool.token1.symbol}`, {
+                      afterSuccess: () => {
+                        setAmount0('')
+                        setAmount1('')
+                        setTab('positions')
+                      },
+                    })
                   }}
                 >
-                  Mint {pool?.version === 'v4' || mintProtocol === 'v4' ? 'V4' : 'V3'} 开仓{mintUseEth ? '（ETH）' : ''}
+                  Mint {pool?.version === 'v4' || mintProtocol === 'v4' ? 'V4' : 'V3'} 开仓{mintUseEth ? `（${getNativeSymbol()}）` : ''}
                 </button>
                 {/*
                  * 灰掉的主按钮必须说明为什么。禁用条件和上面 disabled= 是同一串，

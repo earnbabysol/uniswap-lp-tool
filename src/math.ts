@@ -221,6 +221,58 @@ export function pairAmountForRange(opts: {
   return { amount0, amount1: amount, singleSided: 'none' }
 }
 
+/**
+ * 提交 Mint 前统一配平：
+ * - 单边区间：只保留需要的那一侧（上方 token1 / 下方 token0）
+ * - 双边：优先用 token1 锚点（常为用户手填的 meme/稳定币），再回退 token0
+ */
+export function resolvePairedMintAmounts(opts: {
+  sqrtPriceX96: bigint
+  tickLower: number
+  tickUpper: number
+  amount0: bigint
+  amount1: bigint
+}): { amount0: bigint; amount1: bigint; singleSided: 'none' | 'token0' | 'token1' } {
+  const { sqrtPriceX96, tickLower, tickUpper, amount0, amount1 } = opts
+  const from0 =
+    amount0 > 0n
+      ? pairAmountForRange({ sqrtPriceX96, tickLower, tickUpper, amount: amount0, side: 0 })
+      : null
+  const from1 =
+    amount1 > 0n
+      ? pairAmountForRange({ sqrtPriceX96, tickLower, tickUpper, amount: amount1, side: 1 })
+      : null
+
+  const hint = from0?.singleSided ?? from1?.singleSided ?? 'none'
+  if (hint === 'token0') {
+    return { amount0: from0?.amount0 ?? 0n, amount1: 0n, singleSided: 'token0' }
+  }
+  if (hint === 'token1') {
+    return { amount0: 0n, amount1: from1?.amount1 ?? 0n, singleSided: 'token1' }
+  }
+
+  if (from0 && from1) {
+    if (from1.amount0 <= amount0 || amount0 === 0n) {
+      return { amount0: from1.amount0, amount1: from1.amount1, singleSided: 'none' }
+    }
+    return { amount0: from0.amount0, amount1: from0.amount1, singleSided: 'none' }
+  }
+  if (from1) return { amount0: from1.amount0, amount1: from1.amount1, singleSided: 'none' }
+  if (from0) return { amount0: from0.amount0, amount1: from0.amount1, singleSided: 'none' }
+  return { amount0: 0n, amount1: 0n, singleSided: 'none' }
+}
+
+/** 现价相对区间：需要哪一侧代币（both = 双边） */
+export function neededMintSide(
+  tick: number,
+  tickLower: number,
+  tickUpper: number,
+): 0 | 1 | 'both' {
+  if (tick >= tickUpper) return 1
+  if (tick < tickLower) return 0
+  return 'both'
+}
+
 /** Token amounts currently held by a V3/V4 position */
 export function getAmountsForPosition(
   sqrtPriceX96: bigint,

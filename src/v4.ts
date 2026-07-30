@@ -18,7 +18,7 @@ import {
   getAmountsForPosition,
   getLiquidityForAmounts,
   nearestUsableTick,
-  pairAmountForRange,
+  resolvePairedMintAmounts,
   priceToClosestTick,
   priceToSqrtPriceX96,
   rangeFromPercent,
@@ -92,6 +92,26 @@ export function isEthLikeCurrency(addr: Address) {
 
 export function sortCurrencies(a: Address, b: Address): [Address, Address] {
   return a.toLowerCase() < b.toLowerCase() ? [a, b] : [b, a]
+}
+
+/** 把 WETH / 原生 ETH 视为同一侧，按目标池 token0/1 重排数量 */
+export function remapAmountsAcrossPools(
+  from0: Address,
+  from1: Address,
+  to0: Address,
+  to1: Address,
+  amount0: bigint,
+  amount1: bigint,
+): { amount0: bigint; amount1: bigint } {
+  const keyOf = (addr: Address) =>
+    isEthLikeCurrency(addr) || isNativeCurrency(addr) ? '__eth__' : addr.toLowerCase()
+  const k0 = keyOf(from0)
+  const k1 = keyOf(from1)
+  const t0 = keyOf(to0)
+  const t1 = keyOf(to1)
+  const out0 = t0 === k0 ? amount0 : t0 === k1 ? amount1 : 0n
+  const out1 = t1 === k0 ? amount0 : t1 === k1 ? amount1 : 0n
+  return { amount0: out0, amount1: out1 }
 }
 
 export function poolKeyFromPool(pool: PoolInfo): V4PoolKey {
@@ -599,25 +619,27 @@ function currencyVariants(token: Address, preferNative = true): Address[] {
 /**
  * 勾选付 ETH 时：若当前是 WETH 池，尝试切到同 fee/spacing/hooks 的原生 ETH 池，
  * 以便 Mint/加仓一笔直接带 value（与 V3 NPM 体验一致）。
+ * 注意：0x0 永远最小，切池后 token0/1 顺序可能翻转，调用方必须 remapAmountsAcrossPools。
  */
 async function resolvePoolForEthPayment(pool: PoolInfo, useNativeEth: boolean): Promise<PoolInfo> {
   if (!useNativeEth) return pool
   const c0 = pool.token0.address
   const c1 = pool.token1.address
+  if (isNativeCurrency(c0) || isNativeCurrency(c1)) return pool
   const weth0 = c0.toLowerCase() === CONTRACTS.weth.toLowerCase()
   const weth1 = c1.toLowerCase() === CONTRACTS.weth.toLowerCase()
-  if (!weth0 && !weth1) return pool // 已是原生或非 ETH 对
-  if (isNativeCurrency(c0) || isNativeCurrency(c1)) return pool
+  if (!weth0 && !weth1) return pool
 
-  const nativeKey = {
-    currency0: weth0 ? NATIVE_ETH : c0,
-    currency1: weth1 ? NATIVE_ETH : c1,
-    fee: pool.fee,
-    tickSpacing: pool.tickSpacing,
-    hooks: pool.hooks ?? NATIVE_ETH,
-  }
+  const other = weth0 ? c1 : c0
+  const [currency0, currency1] = sortCurrencies(NATIVE_ETH, other)
   try {
-    const nativePool = await loadV4Pool(nativeKey)
+    const nativePool = await loadV4Pool({
+      currency0,
+      currency1,
+      fee: pool.fee,
+      tickSpacing: pool.tickSpacing,
+      hooks: pool.hooks ?? NATIVE_ETH,
+    })
     if (nativePool.sqrtPriceX96 > 0n) return nativePool
   } catch {
     /* 无原生池 */
@@ -751,7 +773,8 @@ export async function mintV4Position(opts: {
   if (opts.pool.version !== 'v4' || !opts.pool.poolId) throw new Error('需要 V4 池')
 
   // 优先原生 ETH 池：一笔 msg.value 入金，无需先 Wrap → WETH
-  const pool = await resolvePoolForEthPayment(opts.pool, useNativeEth)
+  const srcPool = opts.pool
+  const pool = await resolvePoolForEthPayment(srcPool, useNativeEth)
   const live = await loadV4Pool({
     currency0: pool.token0.address,
     currency1: pool.token1.address,
@@ -770,33 +793,24 @@ export async function mintV4Position(opts: {
   tickUpper = nearestUsableTick(tickUpper, live.tickSpacing)
   if (tickLower >= tickUpper) throw new Error('区间无效')
 
-  const from0 = opts.amount0 > 0n
-    ? pairAmountForRange({
-      sqrtPriceX96: live.sqrtPriceX96,
-      tickLower,
-      tickUpper,
-      amount: opts.amount0,
-      side: 0,
-    })
-    : null
-  const from1 = opts.amount1 > 0n
-    ? pairAmountForRange({
-      sqrtPriceX96: live.sqrtPriceX96,
-      tickLower,
-      tickUpper,
-      amount: opts.amount1,
-      side: 1,
-    })
-    : null
-  let amount0 = opts.amount0
-  let amount1 = opts.amount1
-  if (from0 && from0.amount0 > 0n) {
-    amount0 = from0.amount0
-    amount1 = from0.amount1
-  } else if (from1 && from1.amount1 > 0n) {
-    amount0 = from1.amount0
-    amount1 = from1.amount1
-  }
+  // WETH→原生池时 token 顺序可能翻转，先按币种对齐再配平
+  const aligned = remapAmountsAcrossPools(
+    srcPool.token0.address,
+    srcPool.token1.address,
+    live.token0.address,
+    live.token1.address,
+    opts.amount0,
+    opts.amount1,
+  )
+  const paired = resolvePairedMintAmounts({
+    sqrtPriceX96: live.sqrtPriceX96,
+    tickLower,
+    tickUpper,
+    amount0: aligned.amount0,
+    amount1: aligned.amount1,
+  })
+  let amount0 = paired.amount0
+  let amount1 = paired.amount1
   if (amount0 <= 0n && amount1 <= 0n) throw new Error('数量必须 > 0')
 
   const key = poolKeyFromPool(live)
@@ -973,19 +987,15 @@ export async function createV4PoolAndSeed(opts: {
     tickUpper = nearestUsableTick(tickUpper, tickSpacing)
     if (tickLower >= tickUpper) throw new Error('区间无效')
 
-    const from0 = amount0 > 0n
-      ? pairAmountForRange({ sqrtPriceX96, tickLower, tickUpper, amount: amount0, side: 0 })
-      : null
-    const from1 = amount1 > 0n
-      ? pairAmountForRange({ sqrtPriceX96, tickLower, tickUpper, amount: amount1, side: 1 })
-      : null
-    if (from0 && from0.amount0 > 0n) {
-      amount0 = from0.amount0
-      amount1 = from0.amount1
-    } else if (from1 && from1.amount1 > 0n) {
-      amount0 = from1.amount0
-      amount1 = from1.amount1
-    }
+    const paired = resolvePairedMintAmounts({
+      sqrtPriceX96,
+      tickLower,
+      tickUpper,
+      amount0,
+      amount1,
+    })
+    amount0 = paired.amount0
+    amount1 = paired.amount1
     if (amount0 <= 0n && amount1 <= 0n) throw new Error('注入数量必须 > 0')
 
     if (chainHasWrappedNative() && !isNativeCurrency(currency0) && !isNativeCurrency(currency1)) {
@@ -1127,31 +1137,15 @@ export async function increaseV4Liquidity(opts: {
   let amount0 = opts.amount0
   let amount1 = opts.amount1
   if (!opts.capToProvided) {
-    const from0 = opts.amount0 > 0n
-      ? pairAmountForRange({
-        sqrtPriceX96: live.sqrtPriceX96,
-        tickLower: position.tickLower,
-        tickUpper: position.tickUpper,
-        amount: opts.amount0,
-        side: 0,
-      })
-      : null
-    const from1 = opts.amount1 > 0n
-      ? pairAmountForRange({
-        sqrtPriceX96: live.sqrtPriceX96,
-        tickLower: position.tickLower,
-        tickUpper: position.tickUpper,
-        amount: opts.amount1,
-        side: 1,
-      })
-      : null
-    if (from0 && from0.amount0 > 0n) {
-      amount0 = from0.amount0
-      amount1 = from0.amount1
-    } else if (from1 && from1.amount1 > 0n) {
-      amount0 = from1.amount0
-      amount1 = from1.amount1
-    }
+    const paired = resolvePairedMintAmounts({
+      sqrtPriceX96: live.sqrtPriceX96,
+      tickLower: position.tickLower,
+      tickUpper: position.tickUpper,
+      amount0: opts.amount0,
+      amount1: opts.amount1,
+    })
+    amount0 = paired.amount0
+    amount1 = paired.amount1
   }
   if (amount0 <= 0n && amount1 <= 0n) throw new Error('数量必须 > 0')
 

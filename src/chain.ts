@@ -2,6 +2,15 @@ import { defineChain, type Address, type Chain } from 'viem'
 
 export type SupportedChainId = 4663 | 8453 | 5042 | 56
 
+/** 同链上额外的 Uniswap-V3 兼容 DEX（如 BSC Pancake） */
+export type V3DexFactory = {
+  key: string
+  label: string
+  factory: Address
+  /** 仓位 NFT 管理器；缺省则仅用于搜池，不扫仓位 */
+  npm?: Address
+}
+
 export type ChainContracts = {
   /**
    * 包装原生币（WETH / WBNB）。Arc 无包装原生币，此处为 Uniswap 部署时的 UnsupportedProtocol 占位，
@@ -49,6 +58,10 @@ export type AppChainConfig = {
   defaultTokenB: Address
   /** 是否有可 wrap 的原生币（Arc 为 false：gas=USDC，无 WETH） */
   hasWrappedNative: boolean
+  /** 额外按 $1 计价的稳定币（如 BSC 的 USDT）；默认含 contracts.stable */
+  usdStables?: Address[]
+  /** BSC 等：额外扫 Pancake 等 V3 工厂 */
+  altV3Factories?: V3DexFactory[]
 }
 
 export const robinhood = defineChain({
@@ -127,7 +140,8 @@ const BASE_CONTRACTS: ChainContracts = {
   v3Factory: '0x33128a8fC17869897dcE68Ed026d694621f6FDfD',
   v3Npm: '0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1',
   v3SwapRouter: '0x2626664c2603336E57B271c5C0b26F421741e481',
-  v3Quoter: '0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6',
+  v3Quoter: '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a',
+  v3QuoterIsV2: true,
   v4PoolManager: '0x498581fF718922c3f8e6A244956aF099B2652b2b',
   v4PositionManager: '0x7C5f5A4bBd8fD63184577525326123B519429bDc',
   v4StateView: '0xA3c0c9b65baD0b08107Aa264b0f3dB444b867A71',
@@ -161,6 +175,9 @@ const BSC_CONTRACTS: ChainContracts = {
 
 /** Binance-Peg USDT（BSC 上常用） */
 const BSC_USDT: Address = '0x55d398326f99059fF775485246999027B3197955'
+/** PancakeSwap V3（BSC 主流 LP 所在） */
+const PANCAKE_V3_FACTORY: Address = '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865'
+const PANCAKE_V3_NPM: Address = '0x46A15B0b27311cedF172AB29E4f4766fbE7F4364'
 
 /** Uniswap contracts @ https://github.com/Uniswap/contracts/blob/main/deployments/5042.md */
 const ARC_CONTRACTS: ChainContracts = {
@@ -279,10 +296,10 @@ export const CHAIN_CONFIGS: Record<SupportedChainId, AppChainConfig> = {
     shortLabel: 'BSC',
     chain: bsc,
     defaultRpcUrls: [
-      'https://bsc-dataseed.binance.org',
-      'https://bsc-dataseed.bnbchain.org',
       'https://bsc.publicnode.com',
       'https://bsc.drpc.org',
+      'https://bsc-dataseed.binance.org',
+      'https://bsc-dataseed.bnbchain.org',
     ],
     explorerUrl: 'https://bscscan.com',
     explorerApi: 'https://bsc.blockscout.com',
@@ -299,6 +316,15 @@ export const CHAIN_CONFIGS: Record<SupportedChainId, AppChainConfig> = {
     defaultTokenA: BSC_CONTRACTS.stable,
     defaultTokenB: BSC_CONTRACTS.weth,
     hasWrappedNative: true,
+    usdStables: [BSC_USDT],
+    altV3Factories: [
+      {
+        key: 'pancake',
+        label: 'PancakeSwap',
+        factory: PANCAKE_V3_FACTORY,
+        npm: PANCAKE_V3_NPM,
+      },
+    ],
   },
 }
 
@@ -406,8 +432,50 @@ export function getExplorerApi(): string {
   return CHAIN_CONFIGS[activeChainId].explorerApi
 }
 
+/** 当前链要扫的全部 V3 工厂：主 Uniswap + 备用 DEX */
+export function getV3DexFactories(): Array<V3DexFactory & { isPrimary: boolean }> {
+  const cfg = CHAIN_CONFIGS[activeChainId]
+  const primary: V3DexFactory & { isPrimary: boolean } = {
+    key: 'uniswap',
+    label: 'Uniswap',
+    factory: cfg.contracts.v3Factory,
+    npm: cfg.contracts.v3Npm,
+    isPrimary: true,
+  }
+  const alts = (cfg.altV3Factories ?? []).map((d) => ({ ...d, isPrimary: false }))
+  return [primary, ...alts]
+}
+
+export function labelV3Factory(factory: Address): string {
+  const f = factory.toLowerCase()
+  for (const d of getV3DexFactories()) {
+    if (d.factory.toLowerCase() === f) return d.label
+  }
+  return 'V3'
+}
+
 export function getStableAddress(): Address {
   return CHAIN_CONFIGS[activeChainId].contracts.stable
+}
+
+/** 当前链按 1 USD 计价的稳定币列表（含主稳定币） */
+export function getUsdStableAddresses(): Address[] {
+  const cfg = CHAIN_CONFIGS[activeChainId]
+  const list = [cfg.contracts.stable, ...(cfg.usdStables ?? [])]
+  const seen = new Set<string>()
+  const out: Address[] = []
+  for (const a of list) {
+    const k = a.toLowerCase()
+    if (seen.has(k)) continue
+    seen.add(k)
+    out.push(a)
+  }
+  return out
+}
+
+export function isUsdStable(token: Address): boolean {
+  const addr = token.toLowerCase()
+  return getUsdStableAddresses().some((s) => s.toLowerCase() === addr)
 }
 
 export function listKnownTokens(): Array<{ address: Address; symbol: string; decimals: number }> {

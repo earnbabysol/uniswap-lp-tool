@@ -26,6 +26,10 @@ import {
   getExplorerApi,
   getNativeSymbol,
   getStableAddress,
+  getUsdStableAddresses,
+  isUsdStable,
+  getV3DexFactories,
+  labelV3Factory,
   getV3PoolInitCodeHash,
 } from './chain'
 import { erc20Abi, v3FactoryAbi, v3NpmAbi, v3PoolAbi, v4PositionManagerAbi, v4StateViewAbi } from './abis'
@@ -42,6 +46,7 @@ import {
   fullRangeTicks,
   nearestUsableTick,
   pairAmountForRange,
+  resolvePairedMintAmounts,
   priceToClosestTick,
   priceToSqrtPriceX96,
   rangeFromPercent,
@@ -85,6 +90,9 @@ export type PoolInfo = {
   version: 'v3' | 'v4'
   poolAddress?: Address
   poolId?: `0x${string}`
+  /** uniswap / pancake 等；V4 固定 uniswap */
+  dex?: string
+  dexLabel?: string
   token0: TokenMeta
   token1: TokenMeta
   fee: number
@@ -99,6 +107,11 @@ export type PoolInfo = {
 export type PositionRow = {
   version: 'v3' | 'v4'
   tokenId: bigint
+  /** uniswap / pancake；与 mint 用的 NPM 对应 */
+  dex?: string
+  dexLabel?: string
+  /** V3 仓位所属 Position Manager（Pancake 与 Uniswap 不同） */
+  v3Npm?: Address
   token0: TokenMeta
   token1: TokenMeta
   fee: number
@@ -322,20 +335,36 @@ const v3PoolMetaCache = new Map<string, {
   token1: TokenMeta
   fee: number
   tickSpacing: number
+  factory?: Address | null
+  dex?: string
+  dexLabel?: string
 }>()
 
 export async function loadV3Pool(poolAddress: Address): Promise<PoolInfo> {
   const key = poolAddress.toLowerCase()
   let meta = v3PoolMetaCache.get(key)
   if (!meta) {
-    const [token0Addr, token1Addr, fee, tickSpacing] = await Promise.all([
+    const [token0Addr, token1Addr, fee, tickSpacing, factoryAddr] = await Promise.all([
       publicClient.readContract({ address: poolAddress, abi: v3PoolAbi, functionName: 'token0' }),
       publicClient.readContract({ address: poolAddress, abi: v3PoolAbi, functionName: 'token1' }),
       publicClient.readContract({ address: poolAddress, abi: v3PoolAbi, functionName: 'fee' }),
       publicClient.readContract({ address: poolAddress, abi: v3PoolAbi, functionName: 'tickSpacing' }),
+      publicClient.readContract({ address: poolAddress, abi: v3PoolAbi, functionName: 'factory' }).catch(() => null),
     ])
     const [token0, token1] = await Promise.all([resolveToken(token0Addr), resolveToken(token1Addr)])
-    meta = { token0, token1, fee, tickSpacing }
+    const dexes = getV3DexFactories()
+    const matched = factoryAddr
+      ? dexes.find((d) => d.factory.toLowerCase() === String(factoryAddr).toLowerCase())
+      : undefined
+    meta = {
+      token0,
+      token1,
+      fee,
+      tickSpacing,
+      factory: factoryAddr as Address | null,
+      dex: matched?.key ?? (factoryAddr ? 'unknown' : 'uniswap'),
+      dexLabel: matched?.label ?? (factoryAddr ? labelV3Factory(factoryAddr as Address) : 'Uniswap'),
+    }
     v3PoolMetaCache.set(key, meta)
   }
   const [slot0, liquidity] = await Promise.all([
@@ -347,6 +376,8 @@ export async function loadV3Pool(poolAddress: Address): Promise<PoolInfo> {
   return {
     version: 'v3',
     poolAddress,
+    dex: meta.dex,
+    dexLabel: meta.dexLabel,
     token0: meta.token0,
     token1: meta.token1,
     fee: meta.fee,
@@ -569,56 +600,90 @@ export function remapMintAmountsForRange(opts: {
   amount1: bigint
   liveTick: number
 }): { amount0: bigint; amount1: bigint } {
-  const { sqrtPriceX96, tickLower, tickUpper, liveTick } = opts
-  let { amount0, amount1 } = opts
+  const { sqrtPriceX96, tickLower, tickUpper, liveTick, amount0, amount1 } = opts
 
-  // 单边：现价在区间上方 → 只要 token0；下方 → 只要 token1
+  // Uniswap 约定：现价在区间上方（tick >= upper）→ 只要 token1；下方 → 只要 token0
   if (liveTick >= tickUpper) {
-    if (amount0 <= 0n && amount1 > 0n) {
-      // 原先付的是 token1，翻到只收 token0——无法无兑换自动换边，清零 token1 避免错付
-      amount1 = 0n
-    } else {
-      amount1 = 0n
-    }
-    return { amount0, amount1 }
+    if (amount1 > 0n) return { amount0: 0n, amount1 }
+    return { amount0: 0n, amount1: 0n }
   }
   if (liveTick < tickLower) {
-    if (amount1 <= 0n && amount0 > 0n) {
-      amount0 = 0n
-    } else {
-      amount0 = 0n
-    }
-    return { amount0, amount1 }
+    if (amount0 > 0n) return { amount0, amount1: 0n }
+    return { amount0: 0n, amount1: 0n }
   }
 
-  // 现价落在区间内：用非零的那一侧（或较大侧）配平
-  const prefer0 = amount0 >= amount1
-  if (prefer0 && amount0 > 0n) {
-    const paired = pairAmountForRange({
-      sqrtPriceX96,
-      tickLower,
-      tickUpper,
-      amount: amount0,
-      side: 0,
-    })
-    return { amount0: paired.amount0, amount1: paired.amount1 }
-  }
-  if (amount1 > 0n) {
-    const paired = pairAmountForRange({
-      sqrtPriceX96,
-      tickLower,
-      tickUpper,
-      amount: amount1,
-      side: 1,
-    })
-    return { amount0: paired.amount0, amount1: paired.amount1 }
-  }
-  return { amount0, amount1 }
+  const paired = resolvePairedMintAmounts({
+    sqrtPriceX96,
+    tickLower,
+    tickUpper,
+    amount0,
+    amount1,
+  })
+  return { amount0: paired.amount0, amount1: paired.amount1 }
 }
 
-export async function findV3Pool(tokenA: Address, tokenB: Address, fee: number): Promise<Address | null> {
+
+/** 按池子选 V3 Position Manager；Pancake 仓必须走 Pancake NPM */
+export function resolveV3Npm(poolOrPos: {
+  dex?: string
+  dexLabel?: string
+  v3Npm?: Address
+  version?: string
+}): Address {
+  if (poolOrPos.v3Npm) return poolOrPos.v3Npm
+  const dexes = getV3DexFactories()
+  const key = poolOrPos.dex ?? 'uniswap'
+  const matched = dexes.find((d) => d.key === key)
+  if (matched?.npm) return matched.npm
+  if (matched && !matched.npm) {
+    throw new Error(`${matched.label} 池暂不支持在本工具建仓/加仓（未配置 Position Manager）`)
+  }
+  return CONTRACTS.v3Npm
+}
+
+export function resolveV3Factory(pool: { dex?: string }): Address {
+  const dexes = getV3DexFactories()
+  const matched = dexes.find((d) => d.key === (pool.dex ?? 'uniswap'))
+  return matched?.factory ?? CONTRACTS.v3Factory
+}
+
+/** 按 token + fee 在所有 V3 DEX 里找已初始化池，优先深度大的 */
+export async function findBestV3Pool(
+  tokenA: Address,
+  tokenB: Address,
+  fee: number,
+): Promise<PoolInfo | null> {
+  const candidates: PoolInfo[] = []
+  for (const dex of getV3DexFactories()) {
+    const addr = await findV3Pool(tokenA, tokenB, fee, dex.factory).catch(() => null)
+    if (!addr) continue
+    try {
+      const p = await loadV3Pool(addr)
+      if (p.sqrtPriceX96 > 0n) candidates.push(p)
+    } catch {
+      /* skip */
+    }
+  }
+  if (!candidates.length) return null
+  candidates.sort((a, b) => (a.liquidity === b.liquidity ? 0 : a.liquidity > b.liquidity ? -1 : 1))
+  return candidates[0]
+}
+
+/** BSC Pancake 另有 0.25%（2500）；一并扫，避免漏掉 1% 等池 */
+function v3ScanFeeTiers(): number[] {
+  const base = [...FEE_TIERS]
+  if (!base.includes(2500)) base.splice(2, 0, 2500)
+  return base
+}
+
+export async function findV3Pool(
+  tokenA: Address,
+  tokenB: Address,
+  fee: number,
+  factory: Address = CONTRACTS.v3Factory,
+): Promise<Address | null> {
   const pool = await publicClient.readContract({
-    address: CONTRACTS.v3Factory,
+    address: factory,
     abi: v3FactoryAbi,
     functionName: 'getPool',
     args: [tokenA, tokenB, fee],
@@ -628,21 +693,39 @@ export async function findV3Pool(tokenA: Address, tokenB: Address, fee: number):
 }
 
 export async function scanV3Pools(tokenA: Address, tokenB: Address): Promise<PoolInfo[]> {
-  const found = await Promise.all(
-    FEE_TIERS.map(async (f) => {
-      const addr = await findV3Pool(tokenA, tokenB, f)
-      if (!addr) return null
-      try {
-        const p = await loadV3Pool(addr)
-        // 未 initialize 的池不当作可用池
-        if (p.sqrtPriceX96 === 0n) return null
-        return p
-      } catch {
-        return null
-      }
-    }),
-  )
-  return found.filter((p): p is PoolInfo => p !== null)
+  const dexes = getV3DexFactories()
+  const fees = v3ScanFeeTiers()
+  const jobs: Promise<PoolInfo | null>[] = []
+  for (const dex of dexes) {
+    for (const f of fees) {
+      jobs.push(
+        (async () => {
+          const addr = await findV3Pool(tokenA, tokenB, f, dex.factory).catch(() => null)
+          if (!addr) return null
+          try {
+            const p = await loadV3Pool(addr)
+            if (p.sqrtPriceX96 === 0n) return null
+            return p
+          } catch {
+            return null
+          }
+        })(),
+      )
+    }
+  }
+  const found = await Promise.all(jobs)
+  const seen = new Set<string>()
+  const out: PoolInfo[] = []
+  for (const p of found) {
+    if (!p?.poolAddress) continue
+    const k = p.poolAddress.toLowerCase()
+    if (seen.has(k)) continue
+    seen.add(k)
+    out.push(p)
+  }
+  // 深度大的靠前，避免默认点到浅的 0.3% Uniswap 池
+  out.sort((a, b) => (a.liquidity === b.liquidity ? 0 : a.liquidity > b.liquidity ? -1 : 1))
+  return out
 }
 
 function sortTokenAddresses(a: Address, b: Address): [Address, Address] {
@@ -675,7 +758,10 @@ export async function createV3Pool(opts: {
   /** 人类价：Token B per Token A（与界面选择一致） */
   initialPriceBPerA: number
 }): Promise<{ pool: PoolInfo; hash: `0x${string}` | null; created: boolean }> {
-  const { walletClient, owner, tokenA, tokenB, fee, initialPriceBPerA } = opts
+  // V3 没有原生币池：0x0 / ETH 一律当 WETH
+  const tokenA = isEthLikeCurrency(opts.tokenA) ? CONTRACTS.weth : opts.tokenA
+  const tokenB = isEthLikeCurrency(opts.tokenB) ? CONTRACTS.weth : opts.tokenB
+  const { walletClient, owner, fee, initialPriceBPerA } = opts
   if (tokenA.toLowerCase() === tokenB.toLowerCase()) throw new Error('两个 Token 不能相同')
 
   const spacing = await publicClient.readContract({
@@ -842,7 +928,9 @@ export async function createV3PoolAndSeed(opts: {
   useNativeEth?: boolean
   onStatus?: (msg: string) => void
 }): Promise<{ pool: PoolInfo; hash: `0x${string}` | null; created: boolean; seeded: boolean }> {
-  const { walletClient, owner, tokenA, tokenB, fee, initialPriceBPerA, onStatus } = opts
+  const tokenA = isEthLikeCurrency(opts.tokenA) ? CONTRACTS.weth : opts.tokenA
+  const tokenB = isEthLikeCurrency(opts.tokenB) ? CONTRACTS.weth : opts.tokenB
+  const { walletClient, owner, fee, initialPriceBPerA, onStatus } = opts
   const wantSeed = (opts.amount0 ?? 0n) > 0n || (opts.amount1 ?? 0n) > 0n
 
   if (!wantSeed) {
@@ -882,21 +970,15 @@ export async function createV3PoolAndSeed(opts: {
   tickUpper = nearestUsableTick(tickUpper, spacing)
   if (tickLower >= tickUpper) throw new Error('区间无效')
 
-  let amount0 = opts.amount0 ?? 0n
-  let amount1 = opts.amount1 ?? 0n
-  const from0 = amount0 > 0n
-    ? pairAmountForRange({ sqrtPriceX96, tickLower, tickUpper, amount: amount0, side: 0 })
-    : null
-  const from1 = amount1 > 0n
-    ? pairAmountForRange({ sqrtPriceX96, tickLower, tickUpper, amount: amount1, side: 1 })
-    : null
-  if (from0 && from0.amount0 > 0n) {
-    amount0 = from0.amount0
-    amount1 = from0.amount1
-  } else if (from1 && from1.amount1 > 0n) {
-    amount0 = from1.amount0
-    amount1 = from1.amount1
-  }
+  const paired = resolvePairedMintAmounts({
+    sqrtPriceX96,
+    tickLower,
+    tickUpper,
+    amount0: opts.amount0 ?? 0n,
+    amount1: opts.amount1 ?? 0n,
+  })
+  let amount0 = paired.amount0
+  let amount1 = paired.amount1
   if (amount0 <= 0n && amount1 <= 0n) throw new Error('注入数量必须 > 0')
 
   const useNative = Boolean(opts.useNativeEth) && pairHasWeth(token0Addr, token1Addr)
@@ -941,10 +1023,15 @@ export async function createV3PoolAndSeed(opts: {
   if (useNative && isWeth(token1Addr)) value = amount1
 
   onStatus?.('创建 V3 池并注入流动性…')
+  const refundData = encodeFunctionData({
+    abi: v3NpmAbi,
+    functionName: 'refundETH',
+  })
+  const calls = value > 0n ? [createData, mintData, refundData] : [createData, mintData]
   const data = encodeFunctionData({
     abi: v3NpmAbi,
     functionName: 'multicall',
-    args: [[createData, mintData]],
+    args: [calls],
   })
   let gas: bigint
   try {
@@ -988,7 +1075,7 @@ export async function createV3PoolAndSeed(opts: {
     address: CONTRACTS.v3Npm,
     abi: v3NpmAbi,
     functionName: 'multicall',
-    args: [[createData, mintData]],
+    args: [calls],
     value: value > 0n ? value : undefined,
     gas: (gas * 130n) / 100n,
     chain: walletClient.chain,
@@ -1237,19 +1324,53 @@ export async function loadV4Pool(key: {
   }
 }
 
+let wethUsdCache: { chainId: number; at: number; value: number } | null = null
+
 export async function getWethUsdPrice(): Promise<number> {
   // Arc 等：原生 gas 即稳定币，无 WETH 池
   if (!chainHasWrappedNative()) return 1
+  const chainId = getActiveChainId()
+  const cached = wethUsdCache
+  if (cached && cached.chainId === chainId && Date.now() - cached.at < 60_000) {
+    return cached.value
+  }
+
+  const stables = getUsdStableAddresses()
+  // 优先常见费率；BSC Pancake 另有 0.25%
+  const fees = [500, 2500, 3000, 100, 10000]
+  let dexes = getV3DexFactories()
+  // BSC 上 WBNB 深度多在 Pancake，优先查
+  if (chainId === 56) {
+    dexes = [...dexes].sort((a, b) => Number(b.key === 'pancake') - Number(a.key === 'pancake'))
+  }
+
   try {
-    // Prefer 0.05% WETH/USDG pool
-    const poolAddr = await findV3Pool(CONTRACTS.weth, getStableAddress(), 500)
-      ?? await findV3Pool(CONTRACTS.weth, getStableAddress(), 3000)
-    if (!poolAddr) return 0
-    const pool = await loadV3Pool(poolAddr)
-    // price = token1 per token0. If token0=USDG token1=WETH → price is WETH per USDG (invert)
-    // If token0=WETH token1=USDG → price is USDG per WETH
-    if (pool.token0.address.toLowerCase() === CONTRACTS.weth.toLowerCase()) return pool.price
-    if (pool.token1.address.toLowerCase() === CONTRACTS.weth.toLowerCase()) return pool.price > 0 ? 1 / pool.price : 0
+    for (const fee of fees) {
+      // 同费率下并行试各 DEX × 稳定币，避免串行空转
+      const hits = await Promise.all(
+        dexes.flatMap((dex) =>
+          stables.map(async (stable) => {
+            const poolAddr = await findV3Pool(CONTRACTS.weth, stable, fee, dex.factory).catch(() => null)
+            if (!poolAddr) return 0
+            const pool = await loadV3Pool(poolAddr).catch(() => null)
+            if (!pool || !(pool.price > 0)) return 0
+            let usd = 0
+            if (pool.token0.address.toLowerCase() === CONTRACTS.weth.toLowerCase()) usd = pool.price
+            else if (pool.token1.address.toLowerCase() === CONTRACTS.weth.toLowerCase()) {
+              usd = pool.price > 0 ? 1 / pool.price : 0
+            }
+            usd = clampUsd(usd)
+            return usd >= 1 && usd <= 100_000 ? usd : 0
+          }),
+        ),
+      )
+      const found = hits.find((v) => v > 0)
+      if (found) {
+        wethUsdCache = { chainId, at: Date.now(), value: found }
+        return found
+      }
+    }
+    wethUsdCache = { chainId, at: Date.now(), value: 0 }
     return 0
   } catch {
     return 0
@@ -1267,26 +1388,29 @@ export async function getWethUsdPrice(): Promise<number> {
  */
 export async function getTokenUsdPrice(token: Address): Promise<number> {
   try {
-    const stable = getStableAddress()
     const addr = token.toLowerCase()
-    if (addr === stable.toLowerCase()) return 1
+    if (isUsdStable(token)) return 1
     if (isEthLikeCurrency(token)) return clampUsd(await getWethUsdPrice())
 
     const findAny = async (other: Address): Promise<number> => {
-      for (const f of FEE_TIERS) {
-        const pa = await findV3Pool(token, other, f).catch(() => null)
-        if (!pa) continue
-        const p = await loadV3Pool(pa).catch(() => null)
-        if (!p || !(p.price > 0)) continue
-        // price = token1 per token0，要的是 other per token
-        if (p.token0.address.toLowerCase() === addr) return p.price
-        if (p.token1.address.toLowerCase() === addr) return 1 / p.price
+      const fees = v3ScanFeeTiers()
+      for (const dex of getV3DexFactories()) {
+        for (const f of fees) {
+          const pa = await findV3Pool(token, other, f, dex.factory).catch(() => null)
+          if (!pa) continue
+          const p = await loadV3Pool(pa).catch(() => null)
+          if (!p || !(p.price > 0)) continue
+          if (p.token0.address.toLowerCase() === addr) return p.price
+          if (p.token1.address.toLowerCase() === addr) return 1 / p.price
+        }
       }
       return 0
     }
 
-    const perStable = await findAny(stable)
-    if (perStable > 0) return clampUsd(perStable)
+    for (const stable of getUsdStableAddresses()) {
+      const perStable = await findAny(stable)
+      if (perStable > 0) return clampUsd(perStable)
+    }
 
     const perEth = await findAny(CONTRACTS.weth)
     if (perEth > 0) {
@@ -1328,11 +1452,10 @@ function tokenUsd(
   const t1 = token1.toLowerCase()
   const eth0 = isEthLikeCurrency(token0)
   const eth1 = isEthLikeCurrency(token1)
-  const stable = getStableAddress().toLowerCase()
-  const usdg0 = t0 === stable
-  const usdg1 = t1 === stable
+  const usdg0 = isUsdStable(token0)
+  const usdg1 = isUsdStable(token1)
   const isEth = isEthLikeCurrency(address)
-  const isUsdg = addr === stable
+  const isUsdg = isUsdStable(address)
 
   if (!(poolPriceToken1PerToken0 > 0) || !Number.isFinite(poolPriceToken1PerToken0)) {
     if (isUsdg) return clampUsd(qty)
@@ -1428,9 +1551,19 @@ async function computeV3Fees(opts: {
   const { pool, tick, tickLower, tickUpper, liquidity, feeGrowthInside0LastX128, feeGrowthInside1LastX128, tokensOwed0, tokensOwed1 } = opts
   if (liquidity === 0n) return { fees0: tokensOwed0, fees1: tokensOwed1 }
 
-  const [fg0, fg1, lower, upper] = await Promise.all([
-    publicClient.readContract({ address: pool, abi: v3PoolAbi, functionName: 'feeGrowthGlobal0X128' }),
-    publicClient.readContract({ address: pool, abi: v3PoolAbi, functionName: 'feeGrowthGlobal1X128' }),
+  // 同池同刷新批次复用 global feeGrowth，少两次 RPC
+  const gKey = pool.toLowerCase()
+  let globals = v3FeeGrowthCache.get(gKey)
+  if (!globals || Date.now() - globals.at > 15_000) {
+    const [fg0, fg1] = await Promise.all([
+      publicClient.readContract({ address: pool, abi: v3PoolAbi, functionName: 'feeGrowthGlobal0X128' }),
+      publicClient.readContract({ address: pool, abi: v3PoolAbi, functionName: 'feeGrowthGlobal1X128' }),
+    ])
+    globals = { fg0, fg1, at: Date.now() }
+    v3FeeGrowthCache.set(gKey, globals)
+  }
+  const { fg0, fg1 } = globals
+  const [lower, upper] = await Promise.all([
     publicClient.readContract({ address: pool, abi: v3PoolAbi, functionName: 'ticks', args: [tickLower] }),
     publicClient.readContract({ address: pool, abi: v3PoolAbi, functionName: 'ticks', args: [tickUpper] }),
   ])
@@ -1464,13 +1597,14 @@ async function computeV3Fees(opts: {
 
   let fees0 = mulDiv(liquidity, delta0, Q128) + tokensOwed0
   let fees1 = mulDiv(liquidity, delta1, Q128) + tokensOwed1
-  // feeGrowth 在未初始化 tick / 异常池上会算出天文数字；回退到 tokensOwed
   const sane = (v: bigint) => v <= MAX_UINT128 && v >= 0n
   if (!sane(fees0) || !sane(fees1)) {
     return { fees0: tokensOwed0, fees1: tokensOwed1 }
   }
   return { fees0, fees1 }
 }
+
+const v3FeeGrowthCache = new Map<string, { fg0: bigint; fg1: bigint; at: number }>()
 
 function enrichUsd(
   amount0: bigint,
@@ -2044,9 +2178,9 @@ export function isVacantV3Position(
   return liquidity === 0n && tokensOwed0 === 0n && tokensOwed1 === 0n
 }
 
-async function listV3TokenIds(owner: Address): Promise<bigint[]> {
+async function listV3TokenIds(owner: Address, npm: Address = CONTRACTS.v3Npm): Promise<bigint[]> {
   const bal = await publicClient.readContract({
-    address: CONTRACTS.v3Npm,
+    address: npm,
     abi: v3NpmAbi,
     functionName: 'balanceOf',
     args: [owner],
@@ -2056,7 +2190,7 @@ async function listV3TokenIds(owner: Address): Promise<bigint[]> {
   return Promise.all(
     Array.from({ length: n }, (_, i) =>
       publicClient.readContract({
-        address: CONTRACTS.v3Npm,
+        address: npm,
         abi: v3NpmAbi,
         functionName: 'tokenOfOwnerByIndex',
         args: [owner, BigInt(i)],
@@ -2116,8 +2250,7 @@ export async function burnVacantV3Nfts(opts: {
 
 export async function loadV3Positions(owner: Address): Promise<PositionRow[]> {
   const wethUsd = await getWethUsdPrice()
-  const tokenIds = await listV3TokenIds(owner)
-  if (!tokenIds.length) return []
+  const dexes = getV3DexFactories().filter((d) => d.npm)
 
   // 同池只加载一次
   const poolMemo = new Map<string, Promise<PoolInfo>>()
@@ -2131,99 +2264,114 @@ export async function loadV3Positions(owner: Address): Promise<PositionRow[]> {
     return p
   }
 
-  const factoryMemo = new Map<string, Promise<Address | null>>()
-  const getPoolAddr = (t0: Address, t1: Address, fee: number) => {
-    const k = `${t0.toLowerCase()}-${t1.toLowerCase()}-${fee}`
-    let p = factoryMemo.get(k)
-    if (!p) {
-      p = findV3Pool(t0, t1, fee)
-      factoryMemo.set(k, p)
-    }
-    return p
-  }
+  // Uniswap + Pancake 并行扫，避免串行等两次 balanceOf/token 列表
+  const perDex = await Promise.all(
+    dexes.map(async (dex) => {
+      const npm = dex.npm!
+      const tokenIds = await listV3TokenIds(owner, npm).catch((e) => {
+        console.warn('listV3TokenIds failed', dex.key, e)
+        return [] as bigint[]
+      })
+      if (!tokenIds.length) return [] as PositionRow[]
 
-  const settled = await Promise.all(
-    tokenIds.map(async (tokenId) => {
-      try {
-        const pos = await publicClient.readContract({
-          address: CONTRACTS.v3Npm,
-          abi: v3NpmAbi,
-          functionName: 'positions',
-          args: [tokenId],
-        })
-        const [, , token0Addr, token1Addr, fee, tickLower, tickUpper, liquidity, feeGrowthInside0LastX128, feeGrowthInside1LastX128, tokensOwed0, tokensOwed1] = pos
-        if (isVacantV3Position(liquidity, tokensOwed0, tokensOwed1)) return null
-        let poolAddr = await getPoolAddr(token0Addr, token1Addr, fee)
-        if (!poolAddr) {
-          // Factory 偶发读失败时用 CREATE2 预测地址，避免整仓漏掉
-          poolAddr = predictV3PoolAddress(token0Addr, token1Addr, fee)
+      const factoryMemo = new Map<string, Promise<Address | null>>()
+      const getPoolAddr = (t0: Address, t1: Address, fee: number) => {
+        const k = `${dex.key}-${t0.toLowerCase()}-${t1.toLowerCase()}-${fee}`
+        let p = factoryMemo.get(k)
+        if (!p) {
+          p = findV3Pool(t0, t1, fee, dex.factory)
+          factoryMemo.set(k, p)
         }
-        const pool = await getPool(poolAddr)
-        const { amount0, amount1 } = getAmountsForPosition(pool.sqrtPriceX96, tickLower, tickUpper, liquidity)
-        // Fast path only: feeGrowth. simulate/getLogs were hanging refresh.
-        const { fees0, fees1 } = await computeV3Fees({
-          pool: poolAddr,
-          tick: pool.tick,
-          tickLower,
-          tickUpper,
-          liquidity,
-          feeGrowthInside0LastX128,
-          feeGrowthInside1LastX128,
-          tokensOwed0,
-          tokensOwed1,
-        })
-        const usd = enrichUsd(amount0, amount1, fees0, fees1, pool, wethUsd)
-        if (
-          liquidity === 0n &&
-          amount0 === 0n &&
-          amount1 === 0n &&
-          fees0 === 0n &&
-          fees1 === 0n
-        ) {
-          return null
-        }
-        const unclaimedFeesUsd = usd.fees0Usd + usd.fees1Usd
-        // 现金流放后台 enrichPositionsLifetimeFees，这里先套本地 high-water 缓存
-        const pnlFields = {
-          claimed0: 0n,
-          claimed1: 0n,
-          claimedFeesUsd: 0,
-          totalFeesUsd: unclaimedFeesUsd,
-          costBasisUsd: 0,
-          pnlUsd: 0,
-        }
-        const row: PositionRow = mergeCachedLifetimeFees({
-          version: 'v3',
-          tokenId,
-          token0: pool.token0,
-          token1: pool.token1,
-          fee,
-          tickLower,
-          tickUpper,
-          liquidity,
-          tick: pool.tick,
-          inRange: pool.tick >= tickLower && pool.tick < tickUpper,
-          priceLower: tickToPrice(tickLower, pool.token0.decimals, pool.token1.decimals),
-          priceUpper: tickToPrice(tickUpper, pool.token0.decimals, pool.token1.decimals),
-          price: pool.price,
-          amount0,
-          amount1,
-          fees0,
-          fees1,
-          ...usd,
-          ...pnlFields,
-          poolAddress: poolAddr,
-          tickSpacing: pool.tickSpacing,
-          sqrtPriceX96: pool.sqrtPriceX96,
-        }, unclaimedFeesUsd, wethUsd)
-        return row
-      } catch (e) {
-        console.warn('skip V3 position', tokenId.toString(), e)
-        return null
+        return p
       }
+
+      const settled = await Promise.all(
+        tokenIds.map(async (tokenId) => {
+          try {
+            const pos = await publicClient.readContract({
+              address: npm,
+              abi: v3NpmAbi,
+              functionName: 'positions',
+              args: [tokenId],
+            })
+            const [, , token0Addr, token1Addr, fee, tickLower, tickUpper, liquidity, feeGrowthInside0LastX128, feeGrowthInside1LastX128, tokensOwed0, tokensOwed1] = pos
+            if (isVacantV3Position(liquidity, tokensOwed0, tokensOwed1)) return null
+            let poolAddr = await getPoolAddr(token0Addr, token1Addr, fee)
+            if (!poolAddr) {
+              if (dex.isPrimary) poolAddr = predictV3PoolAddress(token0Addr, token1Addr, fee)
+              else return null
+            }
+            const pool = await getPool(poolAddr)
+            const { amount0, amount1 } = getAmountsForPosition(pool.sqrtPriceX96, tickLower, tickUpper, liquidity)
+            const { fees0, fees1 } = await computeV3Fees({
+              pool: poolAddr,
+              tick: pool.tick,
+              tickLower,
+              tickUpper,
+              liquidity,
+              feeGrowthInside0LastX128,
+              feeGrowthInside1LastX128,
+              tokensOwed0,
+              tokensOwed1,
+            })
+            const usd = enrichUsd(amount0, amount1, fees0, fees1, pool, wethUsd)
+            if (
+              liquidity === 0n &&
+              amount0 === 0n &&
+              amount1 === 0n &&
+              fees0 === 0n &&
+              fees1 === 0n
+            ) {
+              return null
+            }
+            const unclaimedFeesUsd = usd.fees0Usd + usd.fees1Usd
+            const pnlFields = {
+              claimed0: 0n,
+              claimed1: 0n,
+              claimedFeesUsd: 0,
+              totalFeesUsd: unclaimedFeesUsd,
+              costBasisUsd: 0,
+              pnlUsd: 0,
+            }
+            const row: PositionRow = mergeCachedLifetimeFees({
+              version: 'v3',
+              tokenId,
+              dex: dex.key,
+              dexLabel: dex.label,
+              v3Npm: npm,
+              token0: pool.token0,
+              token1: pool.token1,
+              fee,
+              tickLower,
+              tickUpper,
+              liquidity,
+              tick: pool.tick,
+              inRange: pool.tick >= tickLower && pool.tick < tickUpper,
+              priceLower: tickToPrice(tickLower, pool.token0.decimals, pool.token1.decimals),
+              priceUpper: tickToPrice(tickUpper, pool.token0.decimals, pool.token1.decimals),
+              price: pool.price,
+              amount0,
+              amount1,
+              fees0,
+              fees1,
+              ...usd,
+              ...pnlFields,
+              poolAddress: poolAddr,
+              tickSpacing: pool.tickSpacing,
+              sqrtPriceX96: pool.sqrtPriceX96,
+            }, unclaimedFeesUsd, wethUsd)
+            return row
+          } catch (e) {
+            console.warn('skip V3 position', tokenId.toString(), e)
+            return null
+          }
+        }),
+      )
+      return settled.filter((r): r is PositionRow => r != null)
     }),
   )
-  return settled.filter((r): r is PositionRow => r !== null)
+
+  return perDex.flat()
 }
 
 /** V4 PositionManager 非 ERC721Enumerable：多源合并列 NFT（Blockscout + 日志 + 近端 ownerOf） */
@@ -2261,6 +2409,18 @@ async function listV4TokenIds(
   } catch (e) {
     console.warn('V4 balanceOf failed', e)
   }
+
+  // 链上余额为 0：普通刷新直接返回，别去扫 Blockscout / 近端 ownerOf（BSC 上极慢）
+  if (!deep && balance === 0n) {
+    try {
+      localStorage.setItem(cacheKey, '[]')
+    } catch {
+      /* ignore */
+    }
+    opts?.onStatus?.('无 V4 仓位')
+    return []
+  }
+
   opts?.onStatus?.(
     balance > 0n
       ? `链上 V4 NFT 余额 ${balance.toString()}，正在扫描…`
@@ -2288,7 +2448,7 @@ async function listV4TokenIds(
     )
   }
 
-  const complete = () => balance > 0n && BigInt(ids.size) >= balance
+  const complete = () => balance === 0n || BigInt(ids.size) >= balance
 
   // 1) Blockscout / explorer 实例列表（通常最快最全）
   if (!complete() || deep) {
@@ -3078,13 +3238,14 @@ function friendlyTxError(e: unknown, action: string): string {
 async function writeMintOrIncrease(opts: {
   walletClient: WalletClient
   owner: Address
+  npm: Address
   functionName: 'mint' | 'increaseLiquidity'
   args: readonly unknown[]
   value: bigint
   action: string
   onStatus?: (msg: string) => void
 }) {
-  const { walletClient, owner, functionName, args, value, action, onStatus } = opts
+  const { walletClient, owner, npm, functionName, args, value, action, onStatus } = opts
   const data = encodeFunctionData({
     abi: v3NpmAbi,
     functionName,
@@ -3100,7 +3261,7 @@ async function writeMintOrIncrease(opts: {
     const estimated = await Promise.race([
       publicClient.estimateGas({
         account: owner,
-        to: CONTRACTS.v3Npm,
+        to: npm,
         data,
         value: value > 0n ? value : undefined,
       }).then((g) => (g * 130n) / 100n),
@@ -3122,7 +3283,7 @@ async function writeMintOrIncrease(opts: {
   // 直接调 mint/increaseLiquidity（带 value），避免 multicall 被 Rabby 标成「未知交易类型」
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const hash = await walletClient.writeContract({
-    address: CONTRACTS.v3Npm,
+    address: npm,
     abi: v3NpmAbi,
     functionName,
     args: args as any,
@@ -3134,7 +3295,7 @@ async function writeMintOrIncrease(opts: {
 
   // 退回多余 ETH（若有）；Arc 上不等死 receipt，软等后尝试 refund
   if (value > 0n) {
-    onStatus?.('Mint 已提交，尝试退回多余 ETH…')
+    onStatus?.(`Mint 已提交，尝试退回多余 ${getNativeSymbol()}…`)
     const start = Date.now()
     let mined = false
     while (Date.now() - start < 12_000) {
@@ -3159,7 +3320,7 @@ async function writeMintOrIncrease(opts: {
     if (mined) {
       try {
         await walletClient.writeContract({
-          address: CONTRACTS.v3Npm,
+          address: npm,
           abi: v3NpmAbi,
           functionName: 'refundETH',
           gas: 80_000n,
@@ -3190,6 +3351,7 @@ export async function mintV3Position(opts: {
   onStatus?: (msg: string) => void
 }) {
   const { walletClient, owner, pool, amount0, amount1, onStatus } = opts
+  const npm = resolveV3Npm(pool)
   void opts.slippageBps
   if (pool.version !== 'v3' || !pool.poolAddress) throw new Error('需要 V3 池')
   let tickLower = opts.tickLower
@@ -3231,48 +3393,17 @@ export async function mintV3Position(opts: {
         : 0,
   }
 
-  // 提交前用现价按单边锚点重算两边，避免 UI 截断导致 desired 比例失真 → Price slippage check
-  const from0 = amount0 > 0n
-    ? pairAmountForRange({
-      sqrtPriceX96: usePool.sqrtPriceX96,
-      tickLower,
-      tickUpper,
-      amount: amount0,
-      side: 0,
-    })
-    : null
-  const from1 = amount1 > 0n
-    ? pairAmountForRange({
-      sqrtPriceX96: usePool.sqrtPriceX96,
-      tickLower,
-      tickUpper,
-      amount: amount1,
-      side: 1,
-    })
-    : null
-
-  let use0 = 0n
-  let use1 = 0n
-  if (from0 && from1 && from0.singleSided === 'none') {
-    // 优先保留用户手填的 token1（meme），若 ETH 输入被截断则 from1.amount0 可能略大于输入框
-    if (from1.amount0 <= amount0 || amount0 === 0n) {
-      use0 = from1.amount0
-      use1 = from1.amount1
-    } else {
-      use0 = from0.amount0
-      use1 = from0.amount1
-    }
-  } else if (from1) {
-    use0 = from1.amount0
-    use1 = from1.amount1
-  } else if (from0) {
-    use0 = from0.amount0
-    use1 = from0.amount1
-  } else {
-    throw new Error('数量不能都为 0')
-  }
-
-  if (use0 === 0n && use1 === 0n) throw new Error('当前区间下组仓数量为 0，请调整区间')
+  // 提交前用现价按单边锚点重算两边，避免 UI 截断 / 单边 from1 零结果盖住 from0
+  const paired = resolvePairedMintAmounts({
+    sqrtPriceX96: usePool.sqrtPriceX96,
+    tickLower,
+    tickUpper,
+    amount0,
+    amount1,
+  })
+  const use0 = paired.amount0
+  const use1 = paired.amount1
+  if (use0 === 0n && use1 === 0n) throw new Error('当前区间下组仓数量为 0，请调整区间或重新填数量')
 
   const nativeValueFinal = useNative ? (wethIs0 ? use0 : wethIs1 ? use1 : 0n) : 0n
   if (useNative && nativeValueFinal > 0n) {
@@ -3283,10 +3414,10 @@ export async function mintV3Position(opts: {
 
   // 串行授权：先 token0 再 token1，避免双弹窗抢焦点；Arc 上软确认不卡死
   if (!(useNative && wethIs0) && use0 > 0n) {
-    await ensureAllowance(walletClient, usePool.token0.address, owner, CONTRACTS.v3Npm, use0, onStatus)
+    await ensureAllowance(walletClient, usePool.token0.address, owner, npm, use0, onStatus)
   }
   if (!(useNative && wethIs1) && use1 > 0n) {
-    await ensureAllowance(walletClient, usePool.token1.address, owner, CONTRACTS.v3Npm, use1, onStatus)
+    await ensureAllowance(walletClient, usePool.token1.address, owner, npm, use1, onStatus)
   }
 
   const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200)
@@ -3309,6 +3440,7 @@ export async function mintV3Position(opts: {
     const hash = await writeMintOrIncrease({
       walletClient,
       owner,
+      npm,
       functionName: 'mint',
       args: mintArgs,
       value: nativeValueFinal,
@@ -3331,27 +3463,54 @@ export async function increaseV3Liquidity(opts: {
   slippageBps?: number
   useNativeEth?: boolean
 }) {
-  const { walletClient, owner, position, amount0, amount1, slippageBps = 300 } = opts
+  const { walletClient, owner, position, slippageBps = 300 } = opts
+  const npm = resolveV3Npm(position)
   if (position.version !== 'v3') throw new Error('需要 V3 仓位')
-  if (amount0 === 0n && amount1 === 0n) throw new Error('数量不能都为 0')
+  if (opts.amount0 === 0n && opts.amount1 === 0n) throw new Error('数量不能都为 0')
 
   const useNative = Boolean(opts.useNativeEth) && pairHasWeth(position.token0.address, position.token1.address)
   const wethIs0 = isWeth(position.token0.address)
   const wethIs1 = isWeth(position.token1.address)
+
+  // 提交前按仓位区间 + 现价重配，避免 UI 截断 / 价变导致一侧几乎加不进去
+  let amount0 = opts.amount0
+  let amount1 = opts.amount1
+  if (position.poolAddress) {
+    try {
+      const slot0 = await publicClient.readContract({
+        address: position.poolAddress,
+        abi: v3PoolAbi,
+        functionName: 'slot0',
+      })
+      const paired = resolvePairedMintAmounts({
+        sqrtPriceX96: slot0[0],
+        tickLower: position.tickLower,
+        tickUpper: position.tickUpper,
+        amount0,
+        amount1,
+      })
+      amount0 = paired.amount0
+      amount1 = paired.amount1
+    } catch {
+      /* 读价失败仍用 UI 数量 */
+    }
+  }
+  if (amount0 === 0n && amount1 === 0n) throw new Error('当前区间下加仓数量为 0，请重新填数量')
+
   const nativeValue = useNative ? (wethIs0 ? amount0 : wethIs1 ? amount1 : 0n) : 0n
 
   if (useNative && nativeValue > 0n) {
     const ethBal = await publicClient.getBalance({ address: owner })
     if (ethBal < nativeValue + 10n ** 15n) {
-      throw new Error('ETH 余额不足以支付加仓金额 + gas')
+      throw new Error(`${getNativeSymbol()} 余额不足以支付加仓金额 + gas`)
     }
   }
 
   if (!(useNative && wethIs0) && amount0 > 0n) {
-    await ensureAllowance(walletClient, position.token0.address, owner, CONTRACTS.v3Npm, amount0)
+    await ensureAllowance(walletClient, position.token0.address, owner, npm, amount0)
   }
   if (!(useNative && wethIs1) && amount1 > 0n) {
-    await ensureAllowance(walletClient, position.token1.address, owner, CONTRACTS.v3Npm, amount1)
+    await ensureAllowance(walletClient, position.token1.address, owner, npm, amount1)
   }
 
   const effectiveSlip = Math.max(slippageBps, 100)
@@ -3372,6 +3531,7 @@ export async function increaseV3Liquidity(opts: {
     return await writeMintOrIncrease({
       walletClient,
       owner,
+      npm,
       functionName: 'increaseLiquidity',
       args: increaseArgs,
       value: nativeValue,
@@ -3391,13 +3551,17 @@ export async function claimV3(opts: {
   unwrapEth?: boolean
   token0?: Address
   token1?: Address
+  dex?: string
+  v3Npm?: Address
 }) {
+  const npm = resolveV3Npm(opts)
+
   const { walletClient, owner, tokenId, unwrapEth, token0, token1 } = opts
   const wantEth = Boolean(unwrapEth) && token0 && token1 && pairHasWeth(token0, token1)
 
   if (!wantEth) {
     const hash = await walletClient.writeContract({
-      address: CONTRACTS.v3Npm,
+      address: npm,
       abi: v3NpmAbi,
       functionName: 'collect',
       args: [{
@@ -3419,7 +3583,7 @@ export async function claimV3(opts: {
       functionName: 'collect',
       args: [{
         tokenId,
-        recipient: CONTRACTS.v3Npm,
+        recipient: npm,
         amount0Max: MAX_UINT128,
         amount1Max: MAX_UINT128,
       }],
@@ -3436,7 +3600,7 @@ export async function claimV3(opts: {
     }),
   ]
   const hash = await walletClient.writeContract({
-    address: CONTRACTS.v3Npm,
+    address: npm,
     abi: v3NpmAbi,
     functionName: 'multicall',
     args: [calls],
@@ -3459,6 +3623,7 @@ export async function removeV3Liquidity(opts: {
   unwrapEth?: boolean
 }) {
   const { walletClient, owner, position, percent = 100, burnEmpty = true, slippageBps = 50, unwrapEth } = opts
+  const npm = resolveV3Npm(position)
   if (position.version !== 'v3') throw new Error('需要 V3 仓位')
   const pct = Math.min(100, Math.max(1, percent))
   const liq =
@@ -3475,11 +3640,14 @@ export async function removeV3Liquidity(opts: {
       unwrapEth: wantEth,
       token0: position.token0.address,
       token1: position.token1.address,
+      dex: position.dex,
+      v3Npm: position.v3Npm ?? npm,
     })
+    await publicClient.waitForTransactionReceipt({ hash })
     if (burnEmpty) {
       try {
         await walletClient.writeContract({
-          address: CONTRACTS.v3Npm,
+          address: npm,
           abi: v3NpmAbi,
           functionName: 'burn',
           args: [position.tokenId],
@@ -3501,7 +3669,7 @@ export async function removeV3Liquidity(opts: {
   const amount1Min = est1 - (est1 * BigInt(slippageBps)) / 10000n
 
   const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200)
-  const collectRecipient = wantEth ? CONTRACTS.v3Npm : owner
+  const collectRecipient = wantEth ? npm : owner
   const calls: `0x${string}`[] = [
     encodeFunctionData({
       abi: v3NpmAbi,
@@ -3542,7 +3710,7 @@ export async function removeV3Liquidity(opts: {
   }
 
   const hash = await walletClient.writeContract({
-    address: CONTRACTS.v3Npm,
+    address: npm,
     abi: v3NpmAbi,
     functionName: 'multicall',
     args: [calls],
@@ -3554,7 +3722,7 @@ export async function removeV3Liquidity(opts: {
     await publicClient.waitForTransactionReceipt({ hash })
     try {
       await walletClient.writeContract({
-        address: CONTRACTS.v3Npm,
+        address: npm,
         abi: v3NpmAbi,
         functionName: 'burn',
         args: [position.tokenId],
@@ -3620,6 +3788,12 @@ export async function rebalanceV3(opts: {
   const pool = await loadV3Pool(position.poolAddress)
   const { tickLower, tickUpper } = rangeFromPercent(pool.tick, percent, pool.tickSpacing)
 
+  // 撤仓前记下余额，只把「撤出来的」打回新仓，避免吞掉钱包闲置资金
+  const [pre0, pre1] = await Promise.all([
+    publicClient.readContract({ address: position.token0.address, abi: erc20Abi, functionName: 'balanceOf', args: [owner] }),
+    publicClient.readContract({ address: position.token1.address, abi: erc20Abi, functionName: 'balanceOf', args: [owner] }),
+  ])
+
   const exitHash = await removeV3Liquidity({
     walletClient,
     owner,
@@ -3634,16 +3808,22 @@ export async function rebalanceV3(opts: {
     publicClient.readContract({ address: position.token0.address, abi: erc20Abi, functionName: 'balanceOf', args: [owner] }),
     publicClient.readContract({ address: position.token1.address, abi: erc20Abi, functionName: 'balanceOf', args: [owner] }),
   ])
-  if (bal0 === 0n && bal1 === 0n) throw new Error('撤仓后余额为 0，无法复投')
+  const got0 = bal0 > pre0 ? bal0 - pre0 : 0n
+  const got1 = bal1 > pre1 ? bal1 - pre1 : 0n
+  // 兜底：若差额为 0（RPC 延迟），用仓位估算 + 手续费
+  const amount0 = got0 > 0n ? got0 : position.amount0 + position.fees0
+  const amount1 = got1 > 0n ? got1 : position.amount1 + position.fees1
+  if (amount0 === 0n && amount1 === 0n) throw new Error('撤仓后余额为 0，无法复投')
 
-  await ensureAllowance(walletClient, position.token0.address, owner, CONTRACTS.v3Npm, bal0)
-  await ensureAllowance(walletClient, position.token1.address, owner, CONTRACTS.v3Npm, bal1)
+  const npm = resolveV3Npm(position)
+  if (amount0 > 0n) await ensureAllowance(walletClient, position.token0.address, owner, npm, amount0)
+  if (amount1 > 0n) await ensureAllowance(walletClient, position.token1.address, owner, npm, amount1)
 
-  const amount0Min = bal0 - (bal0 * BigInt(slippageBps)) / 10000n
-  const amount1Min = bal1 - (bal1 * BigInt(slippageBps)) / 10000n
+  const amount0Min = amount0 - (amount0 * BigInt(slippageBps)) / 10000n
+  const amount1Min = amount1 - (amount1 * BigInt(slippageBps)) / 10000n
 
   const mintHash = await walletClient.writeContract({
-    address: CONTRACTS.v3Npm,
+    address: npm,
     abi: v3NpmAbi,
     functionName: 'mint',
     args: [{
@@ -3652,8 +3832,8 @@ export async function rebalanceV3(opts: {
       fee: position.fee,
       tickLower,
       tickUpper,
-      amount0Desired: bal0,
-      amount1Desired: bal1,
+      amount0Desired: amount0,
+      amount1Desired: amount1,
       amount0Min: amount0Min > 0n ? amount0Min / 2n : 0n,
       amount1Min: amount1Min > 0n ? amount1Min / 2n : 0n,
       recipient: owner,
@@ -3689,6 +3869,7 @@ export async function claimAndCompoundV3(opts: {
   position: PositionRow
 }): Promise<CompoundResult> {
   const { walletClient, owner, position } = opts
+  const npm = resolveV3Npm(position)
   if (position.version !== 'v3') throw new Error('需要 V3 仓位')
 
   const fee0 = position.fees0
@@ -3720,15 +3901,15 @@ export async function claimAndCompoundV3(opts: {
 
   if (liquidity > 0n) {
     if (fee0 > 0n) {
-      await ensureAllowance(walletClient, position.token0.address, owner, CONTRACTS.v3Npm, fee0)
+      await ensureAllowance(walletClient, position.token0.address, owner, npm, fee0)
     }
     if (fee1 > 0n) {
-      await ensureAllowance(walletClient, position.token1.address, owner, CONTRACTS.v3Npm, fee1)
+      await ensureAllowance(walletClient, position.token1.address, owner, npm, fee1)
     }
 
     try {
       const hash = await walletClient.writeContract({
-        address: CONTRACTS.v3Npm,
+        address: npm,
         abi: v3NpmAbi,
         functionName: 'multicall',
         args: [[
@@ -3770,7 +3951,15 @@ export async function claimAndCompoundV3(opts: {
     }
   }
 
-  const claimHash = await claimV3({ walletClient, owner, tokenId: position.tokenId })
+  const claimHash = await claimV3({
+    walletClient,
+    owner,
+    tokenId: position.tokenId,
+    token0: position.token0.address,
+    token1: position.token1.address,
+    dex: position.dex,
+    v3Npm: position.v3Npm ?? npm,
+  })
   await publicClient.waitForTransactionReceipt({ hash: claimHash })
 
   if (liquidity <= 0n) {
@@ -3809,13 +3998,13 @@ export async function claimAndCompoundV3(opts: {
 
   try {
     if (amount0 > 0n) {
-      await ensureAllowance(walletClient, position.token0.address, owner, CONTRACTS.v3Npm, amount0)
+      await ensureAllowance(walletClient, position.token0.address, owner, npm, amount0)
     }
     if (amount1 > 0n) {
-      await ensureAllowance(walletClient, position.token1.address, owner, CONTRACTS.v3Npm, amount1)
+      await ensureAllowance(walletClient, position.token1.address, owner, npm, amount1)
     }
     const increaseHash = await walletClient.writeContract({
-      address: CONTRACTS.v3Npm,
+      address: npm,
       abi: v3NpmAbi,
       functionName: 'increaseLiquidity',
       args: [{
@@ -3982,6 +4171,7 @@ export async function claimAndCompound(opts: {
   slippageBps?: number
   onStatus?: (msg: string) => void
 }): Promise<CompoundResult> {
+
   if (opts.position.version === 'v4') {
     return claimAndCompoundV4(opts)
   }
@@ -4272,7 +4462,7 @@ function quoteCandidates(target: Address): Address[] {
     if (a.toLowerCase() !== t && !out.some((x) => x.toLowerCase() === a.toLowerCase())) out.push(a)
   }
   if (chainHasWrappedNative()) push(CONTRACTS.weth)
-  push(getStableAddress())
+  for (const s of getUsdStableAddresses()) push(s)
   // V4 原生币池（Arc 上即原生 USDC）
   push(zeroAddress)
   return out

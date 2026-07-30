@@ -170,6 +170,11 @@ export async function quotePoolSwap(opts: {
   const amountIn = opts.amountIn
   const slippageBps = opts.slippageBps ?? 300
   if (amountIn <= 0n) throw new Error('请输入兑换数量')
+  if (position.version === 'v3' && position.dex && position.dex !== 'uniswap' && position.dex !== 'unknown') {
+    throw new Error(
+      `${position.dexLabel ?? position.dex} 池暂不支持本工具内 Swap（Router 未接入），请用站外兑换或 Uniswap 池`,
+    )
+  }
 
   const sides = resolveSwapSides(position, zeroForOne)
   let amountOut: bigint | null = null
