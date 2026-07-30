@@ -2963,8 +2963,6 @@ export default function App() {
                 const feeUsd = p.fees0Usd + p.fees1Usd
                 const poolSum = poolFeeByKey.get(positionPoolKey(p))
                 const poolFeesUsd = poolSum?.totalFeesUsd ?? p.totalFeesUsd
-                const poolUnclaimedUsd = poolSum?.unclaimedUsd ?? feeUsd
-                const poolClaimedUsd = poolSum?.claimedUsd ?? p.claimedFeesUsd
                 const multiInPool = (poolSum?.positionCount ?? 1) > 1
                 const rangeSpan = Math.max(cq.coinPriceUpper - cq.coinPriceLower, 1e-18)
                 const rangeMarker = Math.max(
@@ -3026,9 +3024,11 @@ export default function App() {
                         )}
                       </div>
                       <div className="pc-fee-line">
-                        本池累计 {formatUsd(poolFeesUsd)}
-                        <span>未领 {formatUsd(poolUnclaimedUsd)}</span>
-                        <span>已领 {formatUsd(poolClaimedUsd)}</span>
+                        {multiInPool ? (
+                          <>本池累计 {formatUsd(poolFeesUsd)} · </>
+                        ) : null}
+                        <span>未领 {formatUsd(feeUsd)}</span>
+                        <span>已领 {formatUsd(p.claimedFeesUsd)}</span>
                         {p.feeAprPct != null && <span>年化 {formatApr(p.feeAprPct)}</span>}
                       </div>
                     </div>

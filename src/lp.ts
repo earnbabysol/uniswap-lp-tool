@@ -135,7 +135,7 @@ export type PositionRow = {
   totalUsd: number
   pct0: number
   pct1: number
-  /** 历史已领手续费（含复投后重新加仓的部分；high-water 本地缓存） */
+  /** 历史已领手续费（含复投）：链上 Collect/现金流 + 应用内领取记账 */
   claimed0: bigint
   claimed1: bigint
   claimedFeesUsd: number
@@ -1744,6 +1744,13 @@ type Cashflow = {
   claimed1: bigint
   /** 首次建仓所在区块，用于算持仓时长 / 手续费年化 */
   openedAtBlock?: bigint
+  /**
+   * 日志扫完整且事件口径可信时为 true。
+   * 可信时允许把「已领」校正到事件结果（可下调，清掉误记）。
+   */
+  trusted?: boolean
+  /** Collect 事件条数（V3）；0 且 trusted → 已领必为 0 */
+  collectEvents?: number
 }
 
 /** 区块号 → 出块时间戳（秒）。按链缓存到 localStorage，避免每次刷新重复请求 */
@@ -1815,24 +1822,38 @@ export function computeFeeApr(opts: {
 }
 
 /**
- * v4：已领以「未领下降」为主（链上事件在 Arc/V4 原生币经常扫不到）。
- * lastFees* 记录上次见到的未领；下降部分累加进 claimed。
+ * 已领手续费缓存。
+ * v5：废弃「未领 raw 下降即记已领」——feeGrowth/RPC 抖动会把几百 U 假已领锁进 high-water。
+ * 已领只来自：链上 Collect/现金流事件，或应用内 recordPositionClaim。
  */
-const FEE_CACHE_KEY = 'uniswap-lp-lifetime-fees-v4'
+const FEE_CACHE_KEY = 'uniswap-lp-lifetime-fees-v5'
 
 type FeeCacheEntry = {
   claimed0: string
   claimed1: string
   claimedUsd: number
-  /** 上次见到的未领手续费（raw） */
+  /** 上次见到的未领手续费（raw，仅观测用，不再据此累加已领） */
   lastFees0: string
   lastFees1: string
   /**
    * 应用内刚记账领取：等链上未领归零前，
-   * 不把仍残留的未领导入 lastFees，避免归零时再 delta 一次造成双计。
+   * 高水位仍保留本地已领，避免刷新瞬间被事件空结果盖掉。
    */
   awaitFeeClear?: boolean
   updatedAt: number
+}
+
+type MergeLifetimeOpts = {
+  /**
+   * 未领导数是否可信。false（如 V4 池未就绪把 fees 写成 0）时不覆盖 lastFees，
+   * 避免下次误判。
+   */
+  feesReliable?: boolean
+  /**
+   * 链上现金流可信：用 row.claimed* 作为真相（允许下调，清掉历史误记）。
+   * 仍尊重 awaitFeeClear 窗口内的本地记账。
+   */
+  allowClaimedDown?: boolean
 }
 
 function feeCacheKey(row: Pick<PositionRow, 'version' | 'tokenId'>): string {
@@ -1864,14 +1885,19 @@ function readFeeCache(): Record<string, FeeCacheEntry> {
   }
 }
 
-function writeFeeCacheEntry(key: string, entry: FeeCacheEntry) {
+function writeFeeCacheEntry(
+  key: string,
+  entry: FeeCacheEntry,
+  opts?: { allowDown?: boolean },
+) {
   try {
     const all = readFeeCache()
     const prev = all[key]
     let claimed0 = entry.claimed0
     let claimed1 = entry.claimed1
     let claimedUsd = entry.claimedUsd
-    if (prev && prev.claimedUsd > claimedUsd + 1e-9) {
+    // 默认 high-water：刷新失败时别把已领打回 0；可信事件校正时可下调
+    if (!opts?.allowDown && prev && prev.claimedUsd > claimedUsd + 1e-9) {
       claimed0 = prev.claimed0
       claimed1 = prev.claimed1
       claimedUsd = prev.claimedUsd
@@ -1905,33 +1931,35 @@ function computeClaimedFeesUsd(
 
 /**
  * 合并已领：
- * 1) 链上扫到的 row.claimed*
- * 2) 本地缓存 high-water
- * 3) 未领 raw 下降 → 视为刚领走（主路径，不依赖事件）
+ * 1) 链上扫到的 row.claimed*（事件口径）
+ * 2) 本地缓存：默认 high-water；可信事件时可校正下调
+ * 不再把「未领下降」记成已领（那是假已领的主因）
  */
-function mergeCachedLifetimeFees(row: PositionRow, unclaimedFeesUsd: number, wethUsd: number): PositionRow {
+function mergeCachedLifetimeFees(
+  row: PositionRow,
+  unclaimedFeesUsd: number,
+  wethUsd: number,
+  opts?: MergeLifetimeOpts,
+): PositionRow {
   const key = feeCacheKey(row)
   const cached = readFeeCache()[key]
+  const awaiting = Boolean(cached?.awaitFeeClear)
+  const chainCleared = row.fees0 === 0n && row.fees1 === 0n
+  const feesReliable = opts?.feesReliable !== false
+  const allowDown = Boolean(opts?.allowClaimedDown) && !awaiting
 
   let claimed0 = row.claimed0
   let claimed1 = row.claimed1
   if (cached) {
     const c0 = BigInt(cached.claimed0)
     const c1 = BigInt(cached.claimed1)
-    if (c0 > claimed0) claimed0 = c0
-    if (c1 > claimed1) claimed1 = c1
-  }
-
-  const awaiting = Boolean(cached?.awaitFeeClear)
-  const chainCleared = row.fees0 === 0n && row.fees1 === 0n
-
-  if (!awaiting) {
-    const hasLast = Boolean(cached && cached.lastFees0 !== '' && cached.lastFees1 !== '')
-    if (hasLast && cached) {
-      const last0 = BigInt(cached.lastFees0)
-      const last1 = BigInt(cached.lastFees1)
-      if (last0 > row.fees0) claimed0 += last0 - row.fees0
-      if (last1 > row.fees1) claimed1 += last1 - row.fees1
+    if (allowDown) {
+      // 事件真相；应用内刚领完的窗口走 awaiting，不会进这里
+      claimed0 = row.claimed0
+      claimed1 = row.claimed1
+    } else {
+      if (c0 > claimed0) claimed0 = c0
+      if (c1 > claimed1) claimed1 = c1
     }
   }
 
@@ -1944,21 +1972,31 @@ function mergeCachedLifetimeFees(row: PositionRow, unclaimedFeesUsd: number, wet
     totalFeesUsd: clampUsd(unclaimedFeesUsd + claimedFeesUsd),
   }
 
+  const prevLast0 = cached?.lastFees0 ?? ''
+  const prevLast1 = cached?.lastFees1 ?? ''
   writeFeeCacheEntry(key, {
     claimed0: next.claimed0.toString(),
     claimed1: next.claimed1.toString(),
     claimedUsd: next.claimedFeesUsd,
-    // 等待链上归零期间锁死 lastFees=0，避免 stale 未领导致二次 delta
-    lastFees0: awaiting && !chainCleared ? '0' : row.fees0.toString(),
-    lastFees1: awaiting && !chainCleared ? '0' : row.fees1.toString(),
+    // 未领导数不可信时保留旧 lastFees，勿写成 0
+    lastFees0: !feesReliable && prevLast0 !== ''
+      ? prevLast0
+      : awaiting && !chainCleared
+        ? '0'
+        : row.fees0.toString(),
+    lastFees1: !feesReliable && prevLast1 !== ''
+      ? prevLast1
+      : awaiting && !chainCleared
+        ? '0'
+        : row.fees1.toString(),
     awaitFeeClear: awaiting && !chainCleared,
     updatedAt: Date.now(),
-  })
+  }, { allowDown })
 
   return next
 }
 
-function persistLifetimeFees(row: PositionRow) {
+function persistLifetimeFees(row: PositionRow, opts?: { allowDown?: boolean }) {
   const prev = readFeeCache()[feeCacheKey(row)]
   writeFeeCacheEntry(feeCacheKey(row), {
     claimed0: row.claimed0.toString(),
@@ -1968,7 +2006,7 @@ function persistLifetimeFees(row: PositionRow) {
     lastFees1: row.fees1.toString(),
     awaitFeeClear: prev?.awaitFeeClear && !(row.fees0 === 0n && row.fees1 === 0n),
     updatedAt: Date.now(),
-  })
+  }, opts)
 }
 
 /**
@@ -2013,9 +2051,10 @@ async function getLogsChunked<T>(opts: {
   fromBlock: bigint
   toBlock: bigint
   span?: bigint
-}): Promise<T[]> {
+}): Promise<{ logs: T[]; incomplete: boolean }> {
   const span = opts.span ?? 9_000n
   const out: T[] = []
+  let incomplete = false
   for (let from = opts.fromBlock; from <= opts.toBlock; from += span) {
     const to = from + span - 1n > opts.toBlock ? opts.toBlock : from + span - 1n
     const req = {
@@ -2036,10 +2075,11 @@ async function getLogsChunked<T>(opts: {
         out.push(...(logs as T[]))
       } catch (e2) {
         console.warn('getLogsChunked retry fail', from.toString(), e2)
+        incomplete = true
       }
     }
   }
-  return out
+  return { logs: out, incomplete }
 }
 
 const V3_NFT_MINT = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)')
@@ -2124,23 +2164,33 @@ async function loadV3NpmLogs(
   tokenId: bigint,
   fromBlock: bigint,
   toBlock: bigint,
-): Promise<NpmAmountLog[]> {
+  npm: Address = CONTRACTS.v3Npm,
+): Promise<{ logs: NpmAmountLog[]; incomplete: boolean }> {
   const rpc = await getLogsChunked<NpmAmountLog>({
-    address: CONTRACTS.v3Npm,
+    address: npm,
     event,
     args: { tokenId },
     fromBlock,
     toBlock,
   })
-  if (rpc.length > 0) return rpc
-  return fetchNpmLogsBlockscout(event, eventName, tokenId, fromBlock)
+  // RPC 完整扫完（含 0 条）直接用，避免 Blockscout 缺页把「无 Collect」误成有领取
+  if (!rpc.incomplete) return rpc
+  const bs = await fetchNpmLogsBlockscout(event, eventName, tokenId, fromBlock)
+  if (bs.length === 0) return { logs: rpc.logs, incomplete: true }
+  // 合并去重前先拼上；仍标 incomplete——缺 chunk 时 Collect−Decrease 不可信
+  return { logs: [...rpc.logs, ...bs], incomplete: true }
 }
 
-export async function loadPositionCashflow(tokenId: bigint): Promise<Cashflow> {
+export async function loadPositionCashflow(
+  tokenId: bigint,
+  npm: Address = CONTRACTS.v3Npm,
+): Promise<Cashflow> {
   const empty: Cashflow = {
     deposited0: 0n, deposited1: 0n,
     withdrawn0: 0n, withdrawn1: 0n,
     claimed0: 0n, claimed1: 0n,
+    trusted: false,
+    collectEvents: 0,
   }
   try {
     const latest = await publicClient.getBlockNumber()
@@ -2150,14 +2200,15 @@ export async function loadPositionCashflow(tokenId: bigint): Promise<Cashflow> {
     const decEvent = parseAbiItem('event DecreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)')
     const colEvent = parseAbiItem('event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)')
 
-    const [incRpc, decRpc, colRpc] = await Promise.all([
-      loadV3NpmLogs(incEvent, 'IncreaseLiquidity', tokenId, fromBlock, latest),
-      loadV3NpmLogs(decEvent, 'DecreaseLiquidity', tokenId, fromBlock, latest),
-      loadV3NpmLogs(colEvent, 'Collect', tokenId, fromBlock, latest),
+    const [incRes, decRes, colRes] = await Promise.all([
+      loadV3NpmLogs(incEvent, 'IncreaseLiquidity', tokenId, fromBlock, latest, npm),
+      loadV3NpmLogs(decEvent, 'DecreaseLiquidity', tokenId, fromBlock, latest, npm),
+      loadV3NpmLogs(colEvent, 'Collect', tokenId, fromBlock, latest, npm),
     ])
-    const inc = dedupeNpmLogs(incRpc)
-    const dec = dedupeNpmLogs(decRpc)
-    const col = dedupeNpmLogs(colRpc)
+    const incomplete = incRes.incomplete || decRes.incomplete || colRes.incomplete
+    const inc = dedupeNpmLogs(incRes.logs)
+    const dec = dedupeNpmLogs(decRes.logs)
+    const col = dedupeNpmLogs(colRes.logs)
 
     let deposited0 = 0n
     let deposited1 = 0n
@@ -2177,8 +2228,8 @@ export async function loadPositionCashflow(tokenId: bigint): Promise<Cashflow> {
      * 历史已领（含复投）= ΣCollect − ΣDecrease
      * - 纯 Claim：无 Decrease，Collect 全算已领
      * - 同笔/分笔撤出再 Collect：超出已撤本金的部分才是手续费
-     *   （旧逻辑按同 tx 配对，分两笔时会把本金算进已领）
      * - 复投：Collect 后 Increase，Collect 仍计入已领
+     * - 无任何 Collect → 已领必为 0（用户从未领取）
      */
     let collected0 = 0n
     let collected1 = 0n
@@ -2186,12 +2237,16 @@ export async function loadPositionCashflow(tokenId: bigint): Promise<Cashflow> {
       collected0 += l.args.amount0 ?? 0n
       collected1 += l.args.amount1 ?? 0n
     }
-    const claimed0 = collected0 > withdrawn0 ? collected0 - withdrawn0 : 0n
-    const claimed1 = collected1 > withdrawn1 ? collected1 - withdrawn1 : 0n
+    // 日志不完整时：有 Collect 无 Decrease 会把本金算进已领 → 不可信，claimed 置 0 交给缓存
+    const canTrustClaimed = !incomplete
+    const claimed0 = canTrustClaimed && collected0 > withdrawn0 ? collected0 - withdrawn0 : 0n
+    const claimed1 = canTrustClaimed && collected1 > withdrawn1 ? collected1 - withdrawn1 : 0n
 
     return {
       deposited0, deposited1, withdrawn0, withdrawn1, claimed0, claimed1,
       openedAtBlock: mintBlock ?? undefined,
+      trusted: canTrustClaimed,
+      collectEvents: col.length,
     }
   } catch (e) {
     console.warn('cashflow load failed', tokenId.toString(), e)
@@ -2858,6 +2913,8 @@ export async function loadV4PositionCashflow(opts: {
     deposited0: 0n, deposited1: 0n,
     withdrawn0: 0n, withdrawn1: 0n,
     claimed0: 0n, claimed1: 0n,
+    trusted: false,
+    collectEvents: 0,
   }
   const { owner, tokenId, poolId, tickLower, tickUpper, token0, token1 } = opts
   try {
@@ -2867,7 +2924,10 @@ export async function loadV4PositionCashflow(opts: {
       fromBlock = latest > 1_500_000n ? latest - 1_500_000n : 0n
     }
     const mods = await collectV4ModifyLogs({ poolId, tokenId, fromBlock })
-    if (!mods.length) return empty
+    if (!mods.length) {
+      // 扫到区间但无 Modify：可能 lookback 不够，不能据此把已领校正为 0
+      return { ...empty, trusted: false }
+    }
 
     let deposited0 = 0n
     let deposited1 = 0n
@@ -2875,6 +2935,7 @@ export async function loadV4PositionCashflow(opts: {
     let withdrawn1 = 0n
     let claimed0 = 0n
     let claimed1 = 0n
+    let collectEvents = 0
     const claimedTx = new Set<string>()
 
     for (const m of mods) {
@@ -2885,6 +2946,7 @@ export async function loadV4PositionCashflow(opts: {
         const a1 = got.toOwner1 > 0n ? got.toOwner1 : got.toPm1
         claimed0 += a0
         claimed1 += a1
+        if (a0 > 0n || a1 > 0n) collectEvents += 1
         claimedTx.add(m.transactionHash)
         continue
       }
@@ -2927,6 +2989,9 @@ export async function loadV4PositionCashflow(opts: {
     return {
       deposited0, deposited1, withdrawn0, withdrawn1, claimed0, claimed1,
       openedAtBlock: mods.length ? mods[0].blockNumber : undefined,
+      // 有完整 Modify 轨迹即可校正；无 delta=0 领取时 claimed 为 0
+      trusted: true,
+      collectEvents,
     }
   } catch (e) {
     console.warn('loadV4PositionCashflow failed', tokenId.toString(), e)
@@ -2968,12 +3033,14 @@ export async function enrichPositionsLifetimeFees(
   await Promise.all(
     rows.map(async (row, idx) => {
       const unclaimedFeesUsd = row.fees0Usd + row.fees1Usd
+      // 首屏先显示缓存 high-water，不在这里用未领抖动灌已领
       let next = mergeCachedLifetimeFees(row, unclaimedFeesUsd, wethUsd)
+      let allowDown = false
       try {
         const principalUsd = row.amount0Usd + row.amount1Usd
         if (row.version === 'v3') {
           const cf = await withTimeout(
-            loadPositionCashflow(row.tokenId),
+            loadPositionCashflow(row.tokenId, row.v3Npm ?? CONTRACTS.v3Npm),
             45_000,
             `V3 fees #${row.tokenId}`,
           )
@@ -2990,7 +3057,13 @@ export async function enrichPositionsLifetimeFees(
             liquidity: row.liquidity,
           }
           const pnl = enrichPnl(pool, wethUsd, principalUsd, unclaimedFeesUsd, cf)
-          const merged = mergeCachedLifetimeFees({ ...row, ...pnl }, unclaimedFeesUsd, wethUsd)
+          allowDown = Boolean(cf.trusted)
+          const merged = mergeCachedLifetimeFees(
+            { ...row, ...pnl },
+            unclaimedFeesUsd,
+            wethUsd,
+            { allowClaimedDown: allowDown },
+          )
           next = await withPositionAge(merged, cf, principalUsd)
         } else if (row.version === 'v4' && row.poolId) {
           const cf = await withTimeout(
@@ -3020,14 +3093,21 @@ export async function enrichPositionsLifetimeFees(
             hooks: row.hooks,
           }
           const pnl = enrichPnl(pool, wethUsd, principalUsd, unclaimedFeesUsd, cf)
-          const merged = mergeCachedLifetimeFees({ ...row, ...pnl }, unclaimedFeesUsd, wethUsd)
+          allowDown = Boolean(cf.trusted)
+          const merged = mergeCachedLifetimeFees(
+            { ...row, ...pnl },
+            unclaimedFeesUsd,
+            wethUsd,
+            { allowClaimedDown: allowDown },
+          )
           next = await withPositionAge(merged, cf, principalUsd)
         }
       } catch (e) {
         console.warn('enrich lifetime fees fail', row.tokenId.toString(), e)
         next = mergeCachedLifetimeFees(row, unclaimedFeesUsd, wethUsd)
+        allowDown = false
       }
-      persistLifetimeFees(next)
+      persistLifetimeFees(next, { allowDown })
       out[idx] = next
       opts?.onRow?.(next)
     }),
@@ -3128,7 +3208,7 @@ export async function loadV4Positions(
           tickSpacing: Number(poolKey.tickSpacing),
           hooks: poolKey.hooks,
           sqrtPriceX96: pool.sqrtPriceX96,
-        }, unclaimedFeesUsd, wethUsd)
+        }, unclaimedFeesUsd, wethUsd, { feesReliable: poolReady })
         return row
       } catch (e) {
         console.warn('skip V4 position', tokenId.toString(), e)
