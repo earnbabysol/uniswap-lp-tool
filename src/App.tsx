@@ -7,6 +7,7 @@ import {
   V4_FEE_PRESETS,
   KNOWN_TOKENS,
   SUPPORTED_CHAINS,
+  chainHasWrappedNative,
   getActiveChainConfig,
   getActiveChainId,
   listKnownTokens,
@@ -77,6 +78,7 @@ import {
   explorerTx,
   makeLocalWalletClient,
   makeWalletClient,
+  publicClient,
   refreshPublicClient,
   shortAddr,
   switchAppChain,
@@ -530,12 +532,13 @@ export default function App() {
 
   const refreshBalances = useCallback(async (addr: Address) => {
     try {
-      const [eth, weth] = await Promise.all([
-        getNativeBalance(addr),
-        getErc20Balance(CONTRACTS.weth, addr),
-      ])
+      const eth = await getNativeBalance(addr)
       setEthBal(eth)
-      setWethBal(weth)
+      if (chainHasWrappedNative()) {
+        setWethBal(await getErc20Balance(CONTRACTS.weth, addr))
+      } else {
+        setWethBal(0n)
+      }
     } catch {
       /* ignore */
     }
@@ -652,11 +655,26 @@ export default function App() {
       setRpcBusy(true)
       setRpcLatency(null)
       setRpcBlock(null)
-      const { latencyMs, blockNumber } = await testRpcLatency(rpcInput.trim() || defaultRpcUrl())
+      const typed = rpcInput.trim()
+      // Arc 默认公共节点常挂：未填自定义时测实际只读路径（含钱包 RPC）
+      if (!typed && chainCfg.key === 'arc') {
+        refreshPublicClient()
+        const start = performance.now()
+        const blockNumber = await withTimeout(publicClient.getBlockNumber(), 15_000, 'Arc RPC')
+        setRpcLatency(Math.round(performance.now() - start))
+        setRpcBlock(blockNumber)
+        setStatus('Arc 只读路径正常（优先钱包节点）')
+        return
+      }
+      const { latencyMs, blockNumber } = await testRpcLatency(typed || defaultRpcUrl())
       setRpcLatency(latencyMs)
       setRpcBlock(blockNumber)
     } catch (e) {
-      setStatus(e instanceof Error ? e.message : String(e))
+      let msg = e instanceof Error ? e.message : String(e)
+      if (chainCfg.key === 'arc') {
+        msg = `${msg} · Arc 请连接钱包或填私有 RPC（公共节点基本不可用）`
+      }
+      setStatus(msg)
       setStatusHash(null)
     } finally {
       setRpcBusy(false)
@@ -1258,10 +1276,16 @@ export default function App() {
     setDiscoverNote('')
     setStatus('识别为代币合约，扫描相关池子…')
     try {
-      const rows = await discoverPoolsByToken(token, {
-        includeV4: true,
-        onStatus: (s) => setStatus(s),
-      })
+      // 先探活：Arc 公共 RPC 常挂，尽早失败并提示走钱包/自定义节点
+      await withTimeout(publicClient.getBlockNumber(), 12_000, '连接 RPC')
+      const rows = await withTimeout(
+        discoverPoolsByToken(token, {
+          includeV4: true,
+          onStatus: (s) => setStatus(s),
+        }),
+        60_000,
+        '扫描池子',
+      )
       if (!rows.length) {
         setDiscoverNote('没找到已初始化的池子。可以在下方「创建新池」自己开一个。')
         setStatus('未找到该代币的任何池子')
@@ -1272,7 +1296,11 @@ export default function App() {
       setDiscovered(rows)
       setStatus(`找到 ${rows.length} 个池子，选一个继续`)
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
+      let msg = e instanceof Error ? e.message : String(e)
+      if (chainCfg.key === 'arc' && /超时|RPC|fetch|network|refused|403|429/i.test(msg)) {
+        msg =
+          'Arc 主网公共 RPC 不可用。请先连接钱包（读取会走钱包节点），或在设置里填 Alchemy/QuickNode 等私有 RPC 后保存再试。'
+      }
       setDiscoverNote(msg)
       setStatus(msg)
     } finally {
@@ -2256,7 +2284,9 @@ export default function App() {
                     {shortAddr(address)}
                   </a>
                   <span className="wallet-bals mono">
-                    {formatAmount(ethBal, 18, 4)} ETH · {formatAmount(wethBal, 18, 4)} WETH
+                    {chainHasWrappedNative()
+                      ? `${formatAmount(ethBal, 18, 4)} ETH · ${formatAmount(wethBal, 18, 4)} WETH`
+                      : `${formatAmount(ethBal, chainCfg.chain.nativeCurrency.decimals, 4)} ${chainCfg.chain.nativeCurrency.symbol}`}
                   </span>
                 </div>
                 <div className="btn-split">
@@ -2389,7 +2419,9 @@ export default function App() {
           </button>
         </div>
         <p className="rpc-panel-note muted">
-          留空并保存即恢复当前链默认 RPC。测延迟会请求输入框地址；未填写则测默认节点。
+          {chainCfg.key === 'arc'
+            ? 'Arc 主网几乎没有可用公共 RPC。请连接已配置 Arc 的钱包（读取走钱包节点），或在此填 Alchemy / QuickNode 私有 RPC 后保存。'
+            : '留空并保存即恢复当前链默认 RPC。测延迟会请求输入框地址；未填写则测默认节点。'}
           {rpcLatency != null && (
             <span className="rpc-latency ok-text">
               {' '}
@@ -4178,8 +4210,15 @@ export default function App() {
               )}
               {[
                 { name: 'V3 Position Manager', addr: CONTRACTS.v3Npm, href: explorerAddress(CONTRACTS.v3Npm) },
-                { name: 'WETH', addr: CONTRACTS.weth, href: explorerAddress(CONTRACTS.weth) },
-                { name: chainId === 8453 ? 'USDC' : 'USDG', addr: CONTRACTS.stable, href: explorerAddress(CONTRACTS.stable) },
+                ...(chainHasWrappedNative()
+                  ? [{ name: 'WETH', addr: CONTRACTS.weth, href: explorerAddress(CONTRACTS.weth) }]
+                  : []),
+                {
+                  name: KNOWN_TOKENS[CONTRACTS.stable.toLowerCase()]?.symbol
+                    ?? (chainId === 4663 ? 'USDG' : 'USDC'),
+                  addr: CONTRACTS.stable,
+                  href: explorerAddress(CONTRACTS.stable),
+                },
               ].map((l) => (
                 <a key={l.name} className="tool-link" href={l.href} target="_blank" rel="noreferrer">
                   <span className="tool-link-name">{l.name}</span>

@@ -1,10 +1,14 @@
 import { defineChain, type Address, type Chain } from 'viem'
 
-export type SupportedChainId = 4663 | 8453
+export type SupportedChainId = 4663 | 8453 | 5042
 
 export type ChainContracts = {
+  /**
+   * 包装原生币（WETH）。Arc 无包装原生币，此处为 Uniswap 部署时的 UnsupportedProtocol 占位，
+   * 且 `hasWrappedNative === false` 时不得当 WETH 用。
+   */
   weth: Address
-  /** 稳定币：Robinhood=USDG，Base=USDC */
+  /** 稳定币：Robinhood=USDG，Base/Arc=USDC */
   stable: Address
   /** @deprecated 兼容旧代码，等同 stable */
   usdg: Address
@@ -26,7 +30,7 @@ export type ChainContracts = {
 
 export type AppChainConfig = {
   id: SupportedChainId
-  key: 'robinhood' | 'base'
+  key: 'robinhood' | 'base' | 'arc'
   label: string
   shortLabel: string
   chain: Chain
@@ -40,6 +44,8 @@ export type AppChainConfig = {
   /** 开仓页默认交易对 */
   defaultTokenA: Address
   defaultTokenB: Address
+  /** 是否有可 wrap 的原生币（Arc 为 false：gas=USDC，无 WETH） */
+  hasWrappedNative: boolean
 }
 
 export const robinhood = defineChain({
@@ -63,6 +69,19 @@ export const base = defineChain({
   },
   blockExplorers: {
     default: { name: 'Basescan', url: 'https://basescan.org' },
+  },
+})
+
+/** Circle Arc 主网：原生 gas 为 USDC（18 位内部精度），无 WETH */
+export const arc = defineChain({
+  id: 5042,
+  name: 'Arc',
+  nativeCurrency: { name: 'USD Coin', symbol: 'USDC', decimals: 18 },
+  rpcUrls: {
+    default: { http: ['https://5042.rpc.thirdweb.com'] },
+  },
+  blockExplorers: {
+    default: { name: 'Arc Explorer', url: 'https://explorer.arc.io' },
   },
 })
 
@@ -102,10 +121,35 @@ const BASE_CONTRACTS: ChainContracts = {
   universalRouter: '0x6fF5693b99212Da76ad316178A184AB56D299b43',
 }
 
-function tokensFromContracts(c: ChainContracts, extras: Record<string, { symbol: string; decimals: number }> = {}) {
-  const out: Record<string, { symbol: string; decimals: number }> = {
-    [c.weth.toLowerCase()]: { symbol: 'WETH', decimals: 18 },
-    ...extras,
+/** Uniswap contracts @ https://github.com/Uniswap/contracts/blob/main/deployments/5042.md */
+const ARC_CONTRACTS: ChainContracts = {
+  // UnsupportedProtocol stub（非真 WETH）；池子用原生/ERC-20 USDC
+  weth: '0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f',
+  stable: '0x3600000000000000000000000000000000000000',
+  usdg: '0x3600000000000000000000000000000000000000',
+  v3Factory: '0xf0db7b58379503491d857db50ac9ece64c653918',
+  v3Npm: '0x39654a85a4c05127f5fd6ed22caec077a0fb1377',
+  v3SwapRouter: '0x53bf6b0684ec7ef91e1387da3d1a1769bc5a6f77',
+  v3Quoter: '0x7dfd4f31be6814d2906bde155c3e1b146eac1468',
+  v4PoolManager: '0x8366a39cc670b4001a1121b8f6a443a643e40951',
+  v4PositionManager: '0x6049c9a0e26405c0985f9e3685c87d0ae917f82b',
+  v4StateView: '0xf3334192d15450cdd385c8b70e03f9a6bd9e673b',
+  v4Quoter: '0x8dc178efb8111bb0973dd9d722ebeff267c98f94',
+  permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
+  universalRouter: '0x4fca4a51ab4f23a7447b3284fbd7d73289a89fb1',
+}
+
+/** Circle EURC（与 testnet 同址常见；若主网不同可在 TokenPicker 自定义） */
+const ARC_EURC: Address = '0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a'
+
+function tokensFromContracts(
+  c: ChainContracts,
+  extras: Record<string, { symbol: string; decimals: number }> = {},
+  opts?: { includeWeth?: boolean },
+) {
+  const out: Record<string, { symbol: string; decimals: number }> = { ...extras }
+  if (opts?.includeWeth !== false) {
+    out[c.weth.toLowerCase()] = { symbol: 'WETH', decimals: 18 }
   }
   return out
 }
@@ -134,6 +178,7 @@ export const CHAIN_CONFIGS: Record<SupportedChainId, AppChainConfig> = {
     v3PoolInitCodeHash: '0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54',
     defaultTokenA: ROBINHOOD_CONTRACTS.stable,
     defaultTokenB: ROBINHOOD_CONTRACTS.weth,
+    hasWrappedNative: true,
   },
   8453: {
     id: 8453,
@@ -155,6 +200,36 @@ export const CHAIN_CONFIGS: Record<SupportedChainId, AppChainConfig> = {
     v3PoolInitCodeHash: '0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54',
     defaultTokenA: BASE_CONTRACTS.stable,
     defaultTokenB: BASE_CONTRACTS.weth,
+    hasWrappedNative: true,
+  },
+  5042: {
+    id: 5042,
+    key: 'arc',
+    label: 'Arc',
+    shortLabel: 'Arc',
+    chain: arc,
+    // 主网公共 RPC 基本不可用；读取优先走钱包节点（见 wallet.makeReadTransport）。
+    // 这里只作 wallet_addEthereumChain 的占位，建议在设置里填 Alchemy/QuickNode 等私有 RPC。
+    defaultRpcUrls: [
+      'https://rpc.mainnet.arc.io',
+      'https://5042.rpc.thirdweb.com',
+    ],
+    explorerUrl: 'https://explorer.arc.io',
+    explorerApi: 'https://explorer.arc.io',
+    contracts: ARC_CONTRACTS,
+    knownTokens: tokensFromContracts(
+      ARC_CONTRACTS,
+      {
+        // ERC-20 接口 USDC（6 位）；原生 gas 也是 USDC
+        [ARC_CONTRACTS.stable.toLowerCase()]: { symbol: 'USDC', decimals: 6 },
+        [ARC_EURC.toLowerCase()]: { symbol: 'EURC', decimals: 6 },
+      },
+      { includeWeth: false },
+    ),
+    v3PoolInitCodeHash: '0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54',
+    defaultTokenA: ARC_EURC,
+    defaultTokenB: ARC_CONTRACTS.stable,
+    hasWrappedNative: false,
   },
 }
 
@@ -166,7 +241,7 @@ function readSavedChainId(): SupportedChainId {
   try {
     const raw = localStorage.getItem(CHAIN_KEY)
     const id = Number(raw)
-    if (id === 4663 || id === 8453) return id
+    if (id === 4663 || id === 8453 || id === 5042) return id
   } catch {
     /* ignore */
   }
@@ -196,7 +271,12 @@ export function setActiveChainId(id: SupportedChainId): AppChainConfig {
 }
 
 export function isSupportedChainId(id: number): id is SupportedChainId {
-  return id === 4663 || id === 8453
+  return id === 4663 || id === 8453 || id === 5042
+}
+
+/** 当前链是否有可 wrap 的原生币（WETH） */
+export function chainHasWrappedNative(): boolean {
+  return CHAIN_CONFIGS[activeChainId].hasWrappedNative
 }
 
 /** 当前链合约（随 setActiveChainId 切换） */

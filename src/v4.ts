@@ -9,7 +9,7 @@ import {
   type Address,
   type WalletClient,
 } from 'viem'
-import { CONTRACTS } from './chain'
+import { CONTRACTS, chainHasWrappedNative } from './chain'
 import { erc20Abi, permit2Abi, v4PositionManagerAbi } from './abis'
 import {
   getAmount0ForLiquidity,
@@ -84,7 +84,9 @@ export function isNativeCurrency(addr: Address) {
 }
 
 export function isEthLikeCurrency(addr: Address) {
-  return isNativeCurrency(addr) || addr.toLowerCase() === CONTRACTS.weth.toLowerCase()
+  if (isNativeCurrency(addr)) return true
+  if (!chainHasWrappedNative()) return false
+  return addr.toLowerCase() === CONTRACTS.weth.toLowerCase()
 }
 
 export function sortCurrencies(a: Address, b: Address): [Address, Address] {

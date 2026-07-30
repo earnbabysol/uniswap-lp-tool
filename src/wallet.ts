@@ -25,16 +25,42 @@ function getReadRpcUrls(): string[] {
   return [...cfg.defaultRpcUrls]
 }
 
+/**
+ * 只读 transport。
+ * Arc 主网几乎没有可用公共 RPC（thirdweb 只能 eth_chainId），所以有钱包时优先走
+ * window.ethereum（用钱包里已配好的节点），公共 URL 短超时垫底。
+ */
 function makeReadTransport() {
-  return fallback(
-    getReadRpcUrls().map((url) =>
-      http(url, {
-        timeout: 30_000,
-        retryCount: 2,
-      }),
-    ),
-    { rank: false },
+  const cfg = getActiveChainConfig()
+  const customUrl = loadCustomRpcUrl(cfg.id)
+  const httpUrls = customUrl ? [customUrl] : [...cfg.defaultRpcUrls]
+  const httpTimeout = customUrl ? 30_000 : cfg.key === 'arc' ? 6_000 : 20_000
+  const httpTransports = httpUrls.map((url) =>
+    http(url, {
+      timeout: httpTimeout,
+      retryCount: customUrl ? 2 : 1,
+    }),
   )
+
+  const walletTransport =
+    typeof window !== 'undefined' && window.ethereum
+      ? custom(window.ethereum)
+      : null
+
+  // Arc：钱包 RPC 优先；其它链：HTTP 优先，钱包垫底
+  const transports =
+    cfg.key === 'arc' && walletTransport
+      ? customUrl
+        ? [...httpTransports, walletTransport]
+        : [walletTransport, ...httpTransports]
+      : walletTransport
+        ? [...httpTransports, walletTransport]
+        : httpTransports
+
+  if (transports.length === 0) {
+    return http('http://127.0.0.1:8545', { timeout: 5_000 })
+  }
+  return fallback(transports, { rank: false })
 }
 
 const clientBox: { current: PublicClient } = {
@@ -109,7 +135,11 @@ export async function ensureActiveChain(): Promise<void> {
         params: [{
           chainId: chainIdHex,
           chainName: cfg.label,
-          nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+          nativeCurrency: {
+            name: cfg.chain.nativeCurrency.name,
+            symbol: cfg.chain.nativeCurrency.symbol,
+            decimals: cfg.chain.nativeCurrency.decimals,
+          },
           rpcUrls,
           blockExplorerUrls: [cfg.explorerUrl],
         }],

@@ -15,7 +15,16 @@ import {
   type WalletClient,
   type Hash,
 } from 'viem'
-import { CONTRACTS, FEE_TIERS, KNOWN_TOKENS, getActiveChainId, getExplorerApi, getStableAddress, getV3PoolInitCodeHash } from './chain'
+import {
+  CONTRACTS,
+  FEE_TIERS,
+  KNOWN_TOKENS,
+  chainHasWrappedNative,
+  getActiveChainId,
+  getExplorerApi,
+  getStableAddress,
+  getV3PoolInitCodeHash,
+} from './chain'
 import { erc20Abi, v3FactoryAbi, v3NpmAbi, v3PoolAbi, v4PositionManagerAbi, v4StateViewAbi } from './abis'
 import {
   decodeV4PositionInfo,
@@ -1053,6 +1062,8 @@ export async function loadV4Pool(key: {
 }
 
 export async function getWethUsdPrice(): Promise<number> {
+  // Arc 等：原生 gas 即稳定币，无 WETH 池
+  if (!chainHasWrappedNative()) return 1
   try {
     // Prefer 0.05% WETH/USDG pool
     const poolAddr = await findV3Pool(CONTRACTS.weth, getStableAddress(), 500)
@@ -2688,6 +2699,7 @@ async function ensureAllowance(
 }
 
 function isWeth(addr: Address) {
+  if (!chainHasWrappedNative()) return false
   return addr.toLowerCase() === CONTRACTS.weth.toLowerCase()
 }
 
@@ -3203,6 +3215,7 @@ export async function wrapEth(opts: {
   amount: bigint
 }) {
   const { walletClient, owner, amount } = opts
+  if (!chainHasWrappedNative()) throw new Error('当前链没有 WETH（如 Arc 原生 gas 为 USDC）')
   if (amount <= 0n) throw new Error('数量必须 > 0')
   const hash = await walletClient.writeContract({
     address: CONTRACTS.weth,
@@ -3222,6 +3235,7 @@ export async function unwrapWeth(opts: {
   amount: bigint
 }) {
   const { walletClient, owner, amount } = opts
+  if (!chainHasWrappedNative()) throw new Error('当前链没有 WETH（如 Arc 原生 gas 为 USDC）')
   if (amount <= 0n) throw new Error('数量必须 > 0')
   const hash = await walletClient.writeContract({
     address: CONTRACTS.weth,
@@ -3871,15 +3885,17 @@ export type DiscoveredPool = {
   liquidity: bigint
 }
 
-/** 目标币和哪些币配对值得扫：WETH、稳定币、原生 ETH（V4） */
+/** 目标币和哪些币配对值得扫：WETH、稳定币、原生币（V4 address(0)） */
 function quoteCandidates(target: Address): Address[] {
   const t = target.toLowerCase()
   const out: Address[] = []
   const push = (a: Address) => {
     if (a.toLowerCase() !== t && !out.some((x) => x.toLowerCase() === a.toLowerCase())) out.push(a)
   }
-  push(CONTRACTS.weth)
+  if (chainHasWrappedNative()) push(CONTRACTS.weth)
   push(getStableAddress())
+  // V4 原生币池（Arc 上即原生 USDC）
+  push(zeroAddress)
   return out
 }
 
