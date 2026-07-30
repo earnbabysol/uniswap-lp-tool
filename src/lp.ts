@@ -158,6 +158,49 @@ export type PositionRow = {
   sqrtPriceX96: bigint
 }
 
+/** 把已加载的池拼成 Swap 用的最小 PositionRow（无真实 NFT） */
+export function poolAsSwapPosition(pool: PoolInfo): PositionRow {
+  return {
+    version: pool.version,
+    tokenId: 0n,
+    dex: pool.dex,
+    dexLabel: pool.dexLabel,
+    token0: pool.token0,
+    token1: pool.token1,
+    fee: pool.fee,
+    tickLower: 0,
+    tickUpper: 0,
+    liquidity: pool.liquidity,
+    tick: pool.tick,
+    inRange: true,
+    priceLower: 0,
+    priceUpper: 0,
+    price: pool.price,
+    amount0: 0n,
+    amount1: 0n,
+    fees0: 0n,
+    fees1: 0n,
+    amount0Usd: 0,
+    amount1Usd: 0,
+    fees0Usd: 0,
+    fees1Usd: 0,
+    totalUsd: 0,
+    pct0: 0,
+    pct1: 0,
+    claimed0: 0n,
+    claimed1: 0n,
+    claimedFeesUsd: 0,
+    totalFeesUsd: 0,
+    costBasisUsd: 0,
+    pnlUsd: 0,
+    poolAddress: pool.poolAddress,
+    poolId: pool.poolId,
+    tickSpacing: pool.tickSpacing,
+    hooks: pool.hooks,
+    sqrtPriceX96: pool.sqrtPriceX96,
+  }
+}
+
 /** 同一物理池的稳定键：V3=池地址，V4=poolId；缺失时回退 token/fee/spacing */
 export function positionPoolKey(p: PositionRow): string {
   if (p.version === 'v3' && p.poolAddress) {

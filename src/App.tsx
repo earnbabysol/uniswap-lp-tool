@@ -70,6 +70,7 @@ import {
   loadV4PoolById,
   aggregateFeesByPool,
   positionPoolKey,
+  poolAsSwapPosition,
   type DiscoveredPool,
   type PoolDepth,
   type PoolInfo,
@@ -380,6 +381,8 @@ export default function App() {
   const [swapQuote, setSwapQuote] = useState<PoolSwapQuote | null>(null)
   const [swapQuoteBusy, setSwapQuoteBusy] = useState(false)
   const [swapQuoteErr, setSwapQuoteErr] = useState<string | null>(null)
+  /** 新建仓：已加载池旁展开本池 Swap */
+  const [mintSwapOpen, setMintSwapOpen] = useState(false)
   const [autoRefresh, setAutoRefresh] = usePersistentState('autoRefresh', false)
   const [refreshSecs, setRefreshSecs] = usePersistentState<number>('refreshSecs', 60)
   const [confirmReq, setConfirmReq] = useState<ConfirmRequest | null>(null)
@@ -813,6 +816,9 @@ export default function App() {
       setAmount0('')
       setAmount1('')
       setInitPrice('')
+      setMintSwapOpen(false)
+      setSwapAmount('')
+      setSwapQuote(null)
       setRpcInput(loadCustomRpcUrl(nextId) ?? '')
       setActiveRpcLabel(describeActiveRpc(nextId))
       setRpcLatency(null)
@@ -2431,20 +2437,71 @@ export default function App() {
       : addBal1)
     : 0n
 
-  const swapInMeta = selected
-    ? (swapZeroForOne
-      ? { token: selected.token0, label: addUseEth && isEthLikeCurrency(selected.token0.address) ? getNativeSymbol() : selected.token0.symbol, bal: addShow0 }
-      : { token: selected.token1, label: addUseEth && isEthLikeCurrency(selected.token1.address) ? getNativeSymbol() : selected.token1.symbol, bal: addShow1 })
-    : null
-  const swapOutMeta = selected
-    ? (swapZeroForOne
-      ? { token: selected.token1, label: addUseEth && isEthLikeCurrency(selected.token1.address) ? getNativeSymbol() : selected.token1.symbol }
-      : { token: selected.token0, label: addUseEth && isEthLikeCurrency(selected.token0.address) ? getNativeSymbol() : selected.token0.symbol })
-    : null
+  const mintSwapActive = tab === 'mint' && mintSwapOpen && !!pool
+  const posSwapActive = tab === 'positions' && !!selected && posOpMode === 'swap'
+  const swapTarget = useMemo(() => {
+    if (mintSwapActive && pool) {
+      return {
+        position: poolAsSwapPosition(pool),
+        useEth: mintUseEth,
+        label0,
+        label1,
+        bal0: showBal0,
+        bal1: showBal1,
+      }
+    }
+    if (posSwapActive && selected) {
+      return {
+        position: selected,
+        useEth: addUseEth,
+        label0: addLabel0,
+        label1: addLabel1,
+        bal0: addShow0,
+        bal1: addShow1,
+      }
+    }
+    return null
+  }, [
+    mintSwapActive,
+    posSwapActive,
+    pool,
+    selected,
+    mintUseEth,
+    addUseEth,
+    label0,
+    label1,
+    addLabel0,
+    addLabel1,
+    showBal0,
+    showBal1,
+    addShow0,
+    addShow1,
+  ])
 
-  // 本池 Swap 报价（防抖）
+  const swapInMeta = (() => {
+    if (!swapTarget) return null
+    return swapZeroForOne
+      ? {
+        token: swapTarget.position.token0,
+        label: swapTarget.label0,
+        bal: swapTarget.bal0,
+      }
+      : {
+        token: swapTarget.position.token1,
+        label: swapTarget.label1,
+        bal: swapTarget.bal1,
+      }
+  })()
+  const swapOutMeta = (() => {
+    if (!swapTarget) return null
+    return swapZeroForOne
+      ? { token: swapTarget.position.token1, label: swapTarget.label1 }
+      : { token: swapTarget.position.token0, label: swapTarget.label0 }
+  })()
+
+  // 本池 Swap 报价（防抖）：仓位页 Swap 模式 / 新建仓展开面板共用
   useEffect(() => {
-    if (!selected || posOpMode !== 'swap') {
+    if (!swapTarget) {
       setSwapQuote(null)
       setSwapQuoteErr(null)
       return
@@ -2459,10 +2516,13 @@ export default function App() {
     let cancelled = false
     setSwapQuoteBusy(true)
     setSwapQuoteErr(null)
+    const decimals = swapZeroForOne
+      ? swapTarget.position.token0.decimals
+      : swapTarget.position.token1.decimals
     const t = window.setTimeout(() => {
       void (async () => {
         try {
-          const amountIn = parseAmount(raw, swapInMeta!.token.decimals)
+          const amountIn = parseAmount(raw, decimals)
           if (amountIn <= 0n) {
             if (!cancelled) {
               setSwapQuote(null)
@@ -2471,7 +2531,7 @@ export default function App() {
             return
           }
           const q = await quotePoolSwap({
-            position: selected,
+            position: swapTarget.position,
             zeroForOne: swapZeroForOne,
             amountIn,
             slippageBps,
@@ -2493,7 +2553,12 @@ export default function App() {
       cancelled = true
       window.clearTimeout(t)
     }
-  }, [selected, posOpMode, swapAmount, swapZeroForOne, slippageBps, swapInMeta?.token.decimals])
+  }, [
+    swapTarget,
+    swapAmount,
+    swapZeroForOne,
+    slippageBps,
+  ])
 
   const activeNav = NAV_ITEMS.find((it) => it.key === tab)
 
@@ -3369,7 +3434,7 @@ export default function App() {
                         if (!swapInMeta) return
                         // 原生侧留一点 gas
                         let max = swapInMeta.bal
-                        if (addUseEth && isEthLikeCurrency(swapInMeta.token.address)) {
+                        if (swapTarget?.useEth && isEthLikeCurrency(swapInMeta.token.address)) {
                           const gasReserve = 10n ** 15n
                           max = ethBal > gasReserve ? ethBal - gasReserve : 0n
                         }
@@ -3429,11 +3494,11 @@ export default function App() {
                         () => swapInPool({
                           walletClient: wallet!,
                           owner: address!,
-                          position: selected,
+                          position: swapTarget?.position ?? selected,
                           zeroForOne: swapZeroForOne,
                           amountIn: swapQuote.amountIn,
                           slippageBps,
-                          useNativeEth: addUseEth,
+                          useNativeEth: swapTarget?.useEth ?? addUseEth,
                           onStatus: setStatus,
                         }),
                         `${swapInMeta.label}→${swapOutMeta?.label ?? ''}`,
@@ -4049,11 +4114,24 @@ export default function App() {
                 <div className="mint-pool-top">
                   <div>
                     <div className="mint-pair">{getCoinQuote(pool).coin.symbol} / {getCoinQuote(pool).quote.symbol}</div>
-                    <div className="mint-meta">Fee {(pool.fee / 10000).toFixed(2)}% · {pool.version.toUpperCase()}</div>
+                    <div className="mint-meta">
+                      Fee {(pool.fee / 10000).toFixed(2)}% · {pool.version.toUpperCase()}
+                      {pool.dexLabel ? ` · ${pool.dexLabel}` : ''}
+                    </div>
                   </div>
-                  <button className="btn" type="button" disabled={busy} onClick={() => void refreshPoolPrice()}>
-                    刷新币价
-                  </button>
+                  <div className="mint-pool-actions">
+                    <button
+                      className={`btn ${mintSwapOpen ? 'primary' : ''}`}
+                      type="button"
+                      aria-pressed={mintSwapOpen}
+                      onClick={() => setMintSwapOpen((v) => !v)}
+                    >
+                      本池 Swap
+                    </button>
+                    <button className="btn" type="button" disabled={busy} onClick={() => void refreshPoolPrice()}>
+                      刷新币价
+                    </button>
+                  </div>
                 </div>
                 <div className="mint-spot">
                   <span className="mint-spot-label">当前币价</span>
@@ -4070,6 +4148,132 @@ export default function App() {
                   <p className="hook-warn">
                     含自定义 Hook（{shortAddr(pool.hooks)}），可能拒绝外部流动性或改变费用逻辑，开仓前请确认。
                   </p>
+                )}
+                {mintSwapOpen && (
+                  <div className="mint-pool-swap op-block">
+                    {pool.version === 'v3' && pool.dex && pool.dex !== 'uniswap' && pool.dex !== 'unknown' ? (
+                      <p className="muted op-hint warn-text">
+                        {pool.dexLabel ?? pool.dex} 池暂不支持本工具内 Swap，请用站外兑换。
+                      </p>
+                    ) : null}
+                    <div className="swap-dir-row">
+                      <button
+                        type="button"
+                        className={`filter-chip ${swapZeroForOne ? 'active' : ''}`}
+                        aria-pressed={swapZeroForOne}
+                        onClick={() => setSwapZeroForOne(true)}
+                      >
+                        {label0} → {label1}
+                      </button>
+                      <button
+                        type="button"
+                        className={`filter-chip ${!swapZeroForOne ? 'active' : ''}`}
+                        aria-pressed={!swapZeroForOne}
+                        onClick={() => setSwapZeroForOne(false)}
+                      >
+                        {label1} → {label0}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn icon mint-swap"
+                        title="切换方向"
+                        onClick={() => setSwapZeroForOne((v) => !v)}
+                      >
+                        ⇄
+                      </button>
+                    </div>
+                    <label className="amt">
+                      <span className="amt-head">支付 {swapInMeta?.label ?? (swapZeroForOne ? label0 : label1)}</span>
+                      <span className="bal-hint">
+                        余额 {swapInMeta ? formatAmount(swapInMeta.bal, swapInMeta.token.decimals, 6) : '—'}
+                        <button
+                          type="button"
+                          className="amt-max"
+                          disabled={!address || !swapInMeta || swapInMeta.bal === 0n}
+                          onClick={() => {
+                            if (!swapInMeta) return
+                            let max = swapInMeta.bal
+                            if (mintUseEth && isEthLikeCurrency(swapInMeta.token.address)) {
+                              max = ethBal > gasReserve ? ethBal - gasReserve : 0n
+                            }
+                            setSwapAmount(formatAmountExact(max, swapInMeta.token.decimals))
+                          }}
+                        >
+                          Max
+                        </button>
+                      </span>
+                      <input
+                        value={swapAmount}
+                        onChange={(e) => setSwapAmount(e.target.value)}
+                        inputMode="decimal"
+                        placeholder="兑换数量"
+                      />
+                    </label>
+                    <div className="swap-quote-box">
+                      <div className="swap-quote-line">
+                        <span className="muted">预计得到</span>
+                        <strong>
+                          {swapQuoteBusy
+                            ? '报价中…'
+                            : swapQuote
+                              ? `${formatAmount(swapQuote.amountOut, swapQuote.tokenOutDecimals, 6)} ${swapOutMeta?.label ?? ''}`
+                              : '—'}
+                        </strong>
+                      </div>
+                      {swapQuote && (
+                        <div className="swap-quote-line muted">
+                          <span>最少（滑点 {(slippageBps / 100).toFixed(2)}%）</span>
+                          <span>
+                            {formatAmount(swapQuote.amountOutMin, swapQuote.tokenOutDecimals, 6)}{' '}
+                            {swapOutMeta?.label}
+                            {!swapQuote.quoted ? ' · 现价估算' : ''}
+                          </span>
+                        </div>
+                      )}
+                      {swapQuoteErr && <p className="err-inline">{swapQuoteErr}</p>}
+                    </div>
+                    <p className="muted op-hint">
+                      在当前{pool.version.toUpperCase()}池内单跳兑换，适合冷启动或建仓前换边配平。滑点用顶部设置。
+                    </p>
+                    <div className="btn-row">
+                      <button
+                        className="btn primary"
+                        disabled={
+                          busy
+                          || !address
+                          || !swapQuote
+                          || swapQuoteBusy
+                          || (pool.version === 'v3' && Boolean(pool.dex && pool.dex !== 'uniswap' && pool.dex !== 'unknown'))
+                        }
+                        onClick={() => {
+                          if (!pool || !swapInMeta || !swapQuote) return
+                          void run(
+                            pool.version === 'v4' ? '本池 Swap V4' : '本池 Swap',
+                            () => swapInPool({
+                              walletClient: wallet!,
+                              owner: address!,
+                              position: poolAsSwapPosition(pool),
+                              zeroForOne: swapZeroForOne,
+                              amountIn: swapQuote.amountIn,
+                              slippageBps,
+                              useNativeEth: mintUseEth,
+                              onStatus: setStatus,
+                            }),
+                            `${swapInMeta.label}→${swapOutMeta?.label ?? ''}`,
+                            {
+                              afterSuccess: () => {
+                                setSwapAmount('')
+                                setSwapQuote(null)
+                                void refreshPoolPrice()
+                              },
+                            },
+                          )
+                        }}
+                      >
+                        确认 Swap{pool.version === 'v4' ? ' · V4' : ''}
+                      </button>
+                    </div>
+                  </div>
                 )}
               </div>
 

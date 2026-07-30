@@ -2717,6 +2717,17 @@ input:focus-visible, select:focus-visible, select:focus {
   gap: 12px;
   margin-bottom: 14px;
 }
+.mint-pool-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.mint-pool-swap {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid color-mix(in srgb, var(--accent) 18%, var(--line));
+}
 .mint-pair {
   font-family: var(--sans);
   font-size: 21.5px;
