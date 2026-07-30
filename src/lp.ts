@@ -10,6 +10,7 @@ import {
   encodeEventTopics,
   decodeAbiParameters,
   isAddress,
+  slice,
   zeroAddress,
   type Address,
   type WalletClient,
@@ -20,6 +21,7 @@ import {
   FEE_TIERS,
   KNOWN_TOKENS,
   chainHasWrappedNative,
+  getActiveChainConfig,
   getActiveChainId,
   getExplorerApi,
   getNativeSymbol,
@@ -1068,6 +1070,35 @@ async function resolveV4PoolKeyFromId(poolId: `0x${string}`): Promise<{
   hooks: Address
 }> {
   const id = poolId.toLowerCase() as `0x${string}`
+  const chainLabel = getActiveChainConfig().label
+
+  // 主路径：PositionManager.poolKeys(bytes25) —— 不依赖 eth_getLogs，BSC/Base 公共 RPC 也能用
+  try {
+    const id25 = slice(id, 0, 25)
+    const key = await publicClient.readContract({
+      address: CONTRACTS.v4PositionManager,
+      abi: v4PositionManagerAbi,
+      functionName: 'poolKeys',
+      args: [id25],
+    })
+    const currency0 = key[0] as Address
+    const currency1 = key[1] as Address
+    const fee = Number(key[2])
+    const tickSpacing = Number(key[3])
+    const hooks = key[4] as Address
+    // 未登记过的 id 会返回全零；与真实零地址 hooks / 空池区分开
+    if (
+      currency0 !== zeroAddress
+      || currency1 !== zeroAddress
+      || fee !== 0
+      || tickSpacing !== 0
+      || hooks !== zeroAddress
+    ) {
+      return { currency0, currency1, fee, tickSpacing, hooks }
+    }
+  } catch (e) {
+    console.warn('V4 poolKeys() lookup failed', e)
+  }
 
   try {
     const logs = await publicClient.getLogs({
@@ -1091,7 +1122,7 @@ async function resolveV4PoolKeyFromId(poolId: `0x${string}`): Promise<{
     console.warn('RPC V4 Initialize lookup failed', e)
   }
 
-  // Blockscout module=logs 备用
+  // Blockscout / Etherscan-style module=logs 备用
   try {
     const topics = encodeEventTopics({
       abi: [V4_INITIALIZE],
@@ -1133,10 +1164,12 @@ async function resolveV4PoolKeyFromId(poolId: `0x${string}`): Promise<{
       }
     }
   } catch (e) {
-    console.warn('Blockscout V4 Initialize lookup failed', e)
+    console.warn('Explorer V4 Initialize lookup failed', e)
   }
 
-  throw new Error('未找到该 V4 poolId（检查链接/Id 是否来自 Robinhood Chain）')
+  throw new Error(
+    `未找到该 V4 poolId（请确认已切换到池子所在网络：当前为 ${chainLabel}）`,
+  )
 }
 
 export async function loadV4PoolById(poolId: `0x${string}`): Promise<PoolInfo> {

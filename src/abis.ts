@@ -331,6 +331,17 @@ export const v4PositionManagerAbi = [
   { type: 'function', name: 'tokenOfOwnerByIndex', stateMutability: 'view', inputs: [{ name: 'owner', type: 'address' }, { name: 'index', type: 'uint256' }], outputs: [{ type: 'uint256' }] },
   { type: 'function', name: 'nextTokenId', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
   {
+    type: 'function', name: 'poolKeys', stateMutability: 'view',
+    inputs: [{ name: 'poolId', type: 'bytes25' }],
+    outputs: [
+      { name: 'currency0', type: 'address' },
+      { name: 'currency1', type: 'address' },
+      { name: 'fee', type: 'uint24' },
+      { name: 'tickSpacing', type: 'int24' },
+      { name: 'hooks', type: 'address' },
+    ],
+  },
+  {
     type: 'function', name: 'getPoolAndPositionInfo', stateMutability: 'view',
     inputs: [{ name: 'tokenId', type: 'uint256' }],
     outputs: [
