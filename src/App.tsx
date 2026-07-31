@@ -2108,6 +2108,8 @@ export default function App() {
       }
     }
 
+    // V3：按 WETH 地址排序 amount0/1。V4：把 A/B 原样交给 createV4PoolAndSeed，
+    // 内部按原生 0x0 / 代币排序——切勿在外面用 WBNB 排序，否则会和 0x0 对调两侧数量。
     const rawA = chainCurrency(tokenA)
     const rawB = chainCurrency(tokenB)
     const sortedAFirst = rawA.toLowerCase() < rawB.toLowerCase()
@@ -2151,8 +2153,8 @@ export default function App() {
           fee: useFee,
           tickSpacing: v4TickSpacing,
           initialPriceBPerA,
-          amount0: seedOnCreate ? amount0 : undefined,
-          amount1: seedOnCreate ? amount1 : undefined,
+          amountA: seedOnCreate ? amountA : undefined,
+          amountB: seedOnCreate ? amountB : undefined,
           tickLower,
           tickUpper,
           useNativeEth,

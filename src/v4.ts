@@ -13,8 +13,6 @@ import { CONTRACTS, chainHasWrappedNative } from './chain'
 import { withTimeout } from './async'
 import { erc20Abi, permit2Abi, v4PositionManagerAbi } from './abis'
 import {
-  getAmount0ForLiquidity,
-  getAmount1ForLiquidity,
   getAmountsForPosition,
   getLiquidityForAmounts,
   nearestUsableTick,
@@ -22,7 +20,6 @@ import {
   priceToClosestTick,
   priceToSqrtPriceX96,
   rangeFromPercent,
-  tickToSqrtRatioX96,
 } from './math'
 import type { PoolInfo, PositionRow } from './lp'
 import { publicClient } from './wallet'
@@ -234,10 +231,14 @@ function bumpAmountMax(amount: bigint, slippageBps: number): bigint {
 }
 
 /**
- * Mint/加仓的 amount0Max/amount1Max：
- * 用该 liquidity 在区间内「最坏情况」所需量 + 滑点，避免：
- * 1) 硬编码 1% 缓冲太紧
- * 2) 单边时另一侧 max=1，等签名期间价格走进区间直接 MaximumAmountExceeded
+ * Mint/加仓的 amount0Max/amount1Max。
+ *
+ * 必须用「现价所需 + 滑点」，不能用全区间 worst-case：
+ * Rabby 等钱包模拟时常按 amountMax 检查余额/授权，worst-case 往往远超钱包余额，
+ * 会误报「授权额度不足或代币余额不足」，网络费显示 --。
+ *
+ * 新建池（同笔 initialize）现价即初始价，更不需要 worst-case。
+ * 单边仓另一侧 needed=0 时给极小垫值，防签名期间价格擦边。
  */
 function maxAmountsForLiquidity(opts: {
   sqrtPriceX96: bigint
@@ -248,15 +249,16 @@ function maxAmountsForLiquidity(opts: {
 }): { amount0: bigint; amount1: bigint; amount0Max: bigint; amount1Max: bigint } {
   const { sqrtPriceX96, tickLower, tickUpper, liquidity, slippageBps } = opts
   const needed = getAmountsForPosition(sqrtPriceX96, tickLower, tickUpper, liquidity)
-  const sqrtA = tickToSqrtRatioX96(tickLower)
-  const sqrtB = tickToSqrtRatioX96(tickUpper)
-  const worst0 = getAmount0ForLiquidity(sqrtA, sqrtB, liquidity)
-  const worst1 = getAmount1ForLiquidity(sqrtA, sqrtB, liquidity)
+  let amount0Max = needed.amount0 > 0n ? bumpAmountMax(needed.amount0, slippageBps) : 0n
+  let amount1Max = needed.amount1 > 0n ? bumpAmountMax(needed.amount1, slippageBps) : 0n
+  // 单边：另一侧留 1 wei 垫，避免部分路由把 max=0 当成未设置
+  if (liquidity > 0n && amount0Max === 0n && amount1Max > 0n) amount0Max = 1n
+  if (liquidity > 0n && amount1Max === 0n && amount0Max > 0n) amount1Max = 1n
   return {
     amount0: needed.amount0,
     amount1: needed.amount1,
-    amount0Max: bumpAmountMax(worst0 > 0n ? worst0 : needed.amount0, slippageBps),
-    amount1Max: bumpAmountMax(worst1 > 0n ? worst1 : needed.amount1, slippageBps),
+    amount0Max,
+    amount1Max,
   }
 }
 
@@ -558,6 +560,86 @@ async function ensurePermit2(
   sessionPermit2PmOk.add(pKey)
   onStatus?.(ok2 ? 'Permit2 授权已生效' : 'Permit2 已提交，继续交易…')
   if (!ok2) await sleep(1200)
+}
+
+async function readTokenBalance(token: Address, owner: Address): Promise<bigint> {
+  if (isNativeCurrency(token)) {
+    return withTimeout(publicClient.getBalance({ address: owner }), 8_000, '读取原生余额')
+  }
+  return withTimeout(
+    publicClient.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: 'balanceOf',
+      args: [owner],
+    }),
+    8_000,
+    '读取代币余额',
+  )
+}
+
+/** 注入前检查钱包余额；原生侧还要留 gas */
+async function assertV4SeedBalances(opts: {
+  owner: Address
+  currency0: Address
+  currency1: Address
+  need0: bigint
+  need1: bigint
+  value: bigint
+}) {
+  const { owner, currency0, currency1, need0, need1, value } = opts
+  const gasReserve = 10n ** 15n // 0.001 原生币留作 gas
+  const [bal0, bal1] = await Promise.all([
+    readTokenBalance(currency0, owner),
+    readTokenBalance(currency1, owner),
+  ])
+
+  const check = (currency: Address, need: bigint, bal: bigint, side: '0' | '1') => {
+    if (need <= 0n) return
+    if (isNativeCurrency(currency)) {
+      const needNative = value > need ? value : need
+      const total = needNative + gasReserve
+      if (bal < total) {
+        throw new Error(
+          `BNB/原生币不足：注入约需 ${(Number(needNative) / 1e18).toPrecision(6)}，另留 gas，当前余额 ${(Number(bal) / 1e18).toPrecision(6)}。请减少注入或取消「用原生 BNB」。`,
+        )
+      }
+      return
+    }
+    if (bal < need) {
+      throw new Error(
+        `代币${side} 余额不足：需要 ${need.toString()}（最小单位），钱包只有 ${bal.toString()}。请减少注入数量或先买入该代币。`,
+      )
+    }
+  }
+  check(currency0, need0, bal0, '0')
+  check(currency1, need1, bal1, '1')
+}
+
+/** V4 必须 ERC20→Permit2→PositionManager；缺一不可 */
+async function assertPermit2Ready(owner: Address, token: Address, amount: bigint) {
+  if (isNativeCurrency(token) || amount <= 0n) return
+  try {
+    const erc20 = await readErc20Allowance(token, owner, CONTRACTS.permit2)
+    if (erc20 < amount) {
+      sessionErc20Permit2Ok.delete(erc20Permit2Key(token, owner))
+      throw new Error(
+        '代币尚未授权给 Permit2（或授权未上链）。请重新点创建，先完成「授权给 Permit2」那一笔。',
+      )
+    }
+    const [allowed, expiration] = await readPermit2Allowance(owner, token)
+    const now = Math.floor(Date.now() / 1000)
+    if (allowed < amount || Number(expiration) <= now + 30) {
+      sessionPermit2PmOk.delete(permit2PmKey(token, owner))
+      throw new Error(
+        'Permit2 尚未授权 PositionManager（或已过期）。V4 需要两步授权：①代币→Permit2 ②Permit2→仓位管理。请重新操作并确认两笔授权。',
+      )
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (/Permit2|授权/.test(msg)) throw e instanceof Error ? e : new Error(msg)
+    // 读失败不硬挡（部分 RPC 抖），交给链上/钱包
+  }
 }
 
 async function writeModifyLiquidities(opts: {
@@ -885,6 +967,13 @@ export async function createV4PoolAndSeed(opts: {
   tickSpacing: number
   /** 人类价：tokenB per tokenA */
   initialPriceBPerA: number
+  /**
+   * 与 tokenA / tokenB 对齐的注入数量（推荐）。
+   * 勿按 WBNB 地址排序后再当 amount0/1 传入——原生 BNB 在 V4 是 0x0，排序与 WBNB 不同。
+   */
+  amountA?: bigint
+  amountB?: bigint
+  /** @deprecated 已按 currency0/1 排好的数量；若同时给了 amountA/B 则忽略 */
   amount0?: bigint
   amount1?: bigint
   tickLower?: number
@@ -917,6 +1006,12 @@ export async function createV4PoolAndSeed(opts: {
   if (rawA.toLowerCase() === rawB.toLowerCase()) throw new Error('两个 Currency 不能相同')
 
   const [currency0, currency1] = sortCurrencies(rawA, rawB)
+
+  // tokenA/B 数量 → 排序后的 amount0/1（原生=0x0，切勿用 WBNB 地址参与排序）
+  const mapAbTo01 = (amtA: bigint, amtB: bigint): { amount0: bigint; amount1: bigint } => {
+    if (currency0.toLowerCase() === rawA.toLowerCase()) return { amount0: amtA, amount1: amtB }
+    return { amount0: amtB, amount1: amtA }
+  }
   const key: V4PoolKey = {
     currency0,
     currency1,
@@ -945,10 +1040,15 @@ export async function createV4PoolAndSeed(opts: {
   const sqrtPriceX96 = priceToSqrtPriceX96(sortedPrice, dec0, dec1)
   const initTick = priceToClosestTick(sortedPrice, dec0, dec1)
 
+  const seedFromAb = opts.amountA != null || opts.amountB != null
+  const seedMapped = seedFromAb
+    ? mapAbTo01(opts.amountA ?? 0n, opts.amountB ?? 0n)
+    : { amount0: opts.amount0 ?? 0n, amount1: opts.amount1 ?? 0n }
+
   // 已存在且已初始化 → 只走 mint（如有数量）
   const existing = await loadV4Pool(key).catch(() => null)
   if (existing && existing.sqrtPriceX96 > 0n) {
-    if ((opts.amount0 ?? 0n) <= 0n && (opts.amount1 ?? 0n) <= 0n) {
+    if (seedMapped.amount0 <= 0n && seedMapped.amount1 <= 0n) {
       throw new Error('该 V4 池已存在；请到下方直接加仓，或更换 Fee / spacing')
     }
     onStatus?.('池已存在，改为注入流动性…')
@@ -956,8 +1056,8 @@ export async function createV4PoolAndSeed(opts: {
       walletClient,
       owner,
       pool: existing,
-      amount0: opts.amount0 ?? 0n,
-      amount1: opts.amount1 ?? 0n,
+      amount0: seedMapped.amount0,
+      amount1: seedMapped.amount1,
       tickLower: opts.tickLower,
       tickUpper: opts.tickUpper,
       useNativeEth: useNative,
@@ -967,11 +1067,11 @@ export async function createV4PoolAndSeed(opts: {
     return { pool: await loadV4Pool(key), hash, seeded: true }
   }
 
-  const wantSeed = (opts.amount0 ?? 0n) > 0n || (opts.amount1 ?? 0n) > 0n
+  const wantSeed = seedMapped.amount0 > 0n || seedMapped.amount1 > 0n
   let tickLower = opts.tickLower
   let tickUpper = opts.tickUpper
-  let amount0 = opts.amount0 ?? 0n
-  let amount1 = opts.amount1 ?? 0n
+  let amount0 = seedMapped.amount0
+  let amount1 = seedMapped.amount1
   let liquidity = 0n
   let amount0Max = 0n
   let amount1Max = 0n
@@ -1021,10 +1121,23 @@ export async function createV4PoolAndSeed(opts: {
     })
     amount0Max = maxed.amount0Max
     amount1Max = maxed.amount1Max
-    await ensurePermit2(walletClient, currency0, owner, amount0Max, onStatus)
-    await ensurePermit2(walletClient, currency1, owner, amount1Max, onStatus)
     if (isNativeCurrency(currency0)) value = bumpAmountMax(maxed.amount0, slippageBps)
     if (isNativeCurrency(currency1)) value = bumpAmountMax(maxed.amount1, slippageBps)
+
+    // 弹钱包前预检：余额不足时给出明确原因，避免 Rabby 笼统报「授权/余额不足」
+    await assertV4SeedBalances({
+      owner,
+      currency0,
+      currency1,
+      need0: maxed.amount0,
+      need1: maxed.amount1,
+      value,
+    })
+
+    await ensurePermit2(walletClient, currency0, owner, amount0Max, onStatus)
+    await ensurePermit2(walletClient, currency1, owner, amount1Max, onStatus)
+    await assertPermit2Ready(owner, currency0, amount0Max)
+    await assertPermit2Ready(owner, currency1, amount1Max)
   }
 
   const initData = encodeFunctionData({
