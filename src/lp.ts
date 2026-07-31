@@ -3411,7 +3411,21 @@ export function pairHasWeth(token0: Address, token1: Address) {
 function friendlyTxError(e: unknown, action: string): string {
   const raw = e instanceof Error ? e.message : String(e)
   const lower = raw.toLowerCase()
-  if (lower.includes('slippage') || lower.includes('price slippage') || lower.includes('stf') || lower.includes('too little')) {
+  // Uniswap TransferHelper: STF = safeTransferFrom 失败（余额/授权/税币到账变少），不是滑点
+  if (
+    /\bstf\b/.test(lower) ||
+    lower.includes('transfer_from_failed') ||
+    lower.includes('transferhelper') ||
+    lower.includes('transfer amount exceeds') ||
+    lower.includes('exceeds balance')
+  ) {
+    return (
+      `${action} 失败：代币转账未成功（STF）。常见原因：余额不足、授权未生效、` +
+      `或税币/Flap 币转入 V3 池时被抽税导致到账变少。` +
+      `Flap 税币请走其 V2 主池，不要用本工具组 V3。`
+    )
+  }
+  if (lower.includes('slippage') || lower.includes('price slippage') || lower.includes('too little')) {
     return `${action} 失败：滑点保护触发（价被推偏或变动过大）。把顶部滑点调高再试，或用私有交易防夹；薄 meme 池建议小额分批。`
   }
   if (lower.includes('insufficient') && (lower.includes('fund') || lower.includes('balance'))) {
@@ -3420,7 +3434,7 @@ function friendlyTxError(e: unknown, action: string): string {
   if (lower.includes('user rejected') || lower.includes('denied')) {
     return `${action} 已取消`
   }
-  if (lower.includes('allowance') || lower.includes('transfer amount exceeds') || lower.includes('exceeds balance')) {
+  if (lower.includes('allowance')) {
     return `${action} 失败：代币余额不足或授权未生效。`
   }
   if (lower.includes('execution reverted') || lower.includes('estimate')) {
