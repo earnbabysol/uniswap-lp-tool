@@ -1,4 +1,10 @@
-/** 代币兼容性预检：Flap / 税币 / 拦截 PoolManager，避免弹钱包后才失败。 */
+/**
+ * 代币兼容性预检。
+ *
+ * 注意：Flap 税币的买卖税通常只作用于 `pools[addr]==true` 的主池/登记池，
+ * 不是「任意 V3 都不能 mint」。用户已在 Uniswap UI 上对未登记池成功组仓，
+ * 因此 V3 路径不得因 taxProcessor/税率一刀切拦截。
+ */
 import { erc20Abi, parseAbi, zeroAddress, type Address } from 'viem'
 import { CONTRACTS } from './chain'
 import { withTimeout } from './async'
@@ -6,11 +12,7 @@ import { publicClient } from './wallet'
 
 const flapProbeAbi = parseAbi([
   'function flapV4Hook() view returns (address)',
-  'function mainPool() view returns (address)',
-  'function taxProcessor() view returns (address)',
-  'function buyTaxRate() view returns (uint16)',
-  'function sellTaxRate() view returns (uint16)',
-  'function taxRate() view returns (uint16)',
+  'function pools(address) view returns (bool)',
 ])
 
 function isSkipToken(token: Address) {
@@ -18,37 +20,12 @@ function isSkipToken(token: Address) {
   return t === zeroAddress || t === CONTRACTS.weth.toLowerCase()
 }
 
-async function readMainPool(token: Address): Promise<Address | null> {
-  try {
-    const mainPool = await publicClient.readContract({
-      address: token,
-      abi: flapProbeAbi,
-      functionName: 'mainPool',
-    })
-    return mainPool && mainPool !== zeroAddress ? mainPool : null
-  } catch {
-    return null
-  }
-}
-
-function flapLpBlockedMessage(kind: string, detail: string, mainPool: Address | null) {
-  return (
-    `这是 Flap ${kind}（${detail}）。` +
-    `Flap 税币/发射台币的流动性由毕业 migrator 注入主池` +
-    (mainPool ? `（V2 mainPool ${mainPool.slice(0, 10)}…）` : '') +
-    `，Uniswap 官方 V3/V4 标准 Mint 不支持转账抽税。` +
-    `本工具无法绕过；请在 Flap / Pancake V2 主池路径操作，或换 0 税普通 ERC-20。`
-  )
-}
-
 /**
- * Flap 非税 TokenV3（常 …8888）：可能带 flapV4Hook，禁止直转 PoolManager。
- * Flap 税币 TaxTokenV3（常 …7777）：有 taxProcessor + buy/sell tax，官方只迁 V2。
+ * 仅拦截带 flapV4Hook、禁止直转 PoolManager 的 Flap TokenV3（…8888 一类）。
+ * 税币（…7777）不在这里拦——V3 能否 mint 取决于目标池是否被登记进 token.pools。
  */
-export async function assertNotFlapLaunchpadToken(token: Address) {
+export async function assertNotFlapV4HookToken(token: Address) {
   if (isSkipToken(token)) return
-
-  // 1) 带 V4 hook 的 Flap TokenV3
   try {
     const hook = await withTimeout(
       publicClient.readContract({
@@ -57,103 +34,68 @@ export async function assertNotFlapLaunchpadToken(token: Address) {
         functionName: 'flapV4Hook',
       }),
       8_000,
-      '检测 Flap',
+      '检测 Flap hook',
     )
-    if (hook && hook !== zeroAddress) {
-      throw new Error(
-        flapLpBlockedMessage(
-          '发射台代币',
-          `flapV4Hook=${hook.slice(0, 10)}…`,
-          await readMainPool(token),
-        ),
-      )
-    }
+    if (!hook || hook === zeroAddress) return
+    throw new Error(
+      `这是带 flapV4Hook 的 Flap 代币（${hook.slice(0, 10)}…），` +
+        `合约禁止普通路径往 V4 PoolManager 注资（DirectPoolManagerTransferBlocked）。` +
+        `请改用 V3（选未被该币登记为税池的交易对），或在 Flap 主池路径操作。`,
+    )
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
-    if (msg.includes('Flap ')) throw e instanceof Error ? e : new Error(msg)
-  }
-
-  // 2) FlapTaxTokenV3：taxProcessor + 非零税率
-  try {
-    const taxProcessor = await withTimeout(
-      publicClient.readContract({
-        address: token,
-        abi: flapProbeAbi,
-        functionName: 'taxProcessor',
-      }),
-      8_000,
-      '检测税币',
-    )
-    if (!taxProcessor || taxProcessor === zeroAddress) return
-
-    let buy = 0
-    let sell = 0
-    let flat = 0
-    try {
-      buy = Number(
-        await publicClient.readContract({
-          address: token,
-          abi: flapProbeAbi,
-          functionName: 'buyTaxRate',
-        }),
-      )
-    } catch {
-      /* older */
-    }
-    try {
-      sell = Number(
-        await publicClient.readContract({
-          address: token,
-          abi: flapProbeAbi,
-          functionName: 'sellTaxRate',
-        }),
-      )
-    } catch {
-      /* older */
-    }
-    try {
-      flat = Number(
-        await publicClient.readContract({
-          address: token,
-          abi: flapProbeAbi,
-          functionName: 'taxRate',
-        }),
-      )
-    } catch {
-      /* ignore */
-    }
-
-    if (buy > 0 || sell > 0 || flat > 0) {
-      throw new Error(
-        flapLpBlockedMessage(
-          '税币',
-          `买税 ${(buy / 100).toFixed(2)}% / 卖税 ${(Math.max(sell, flat) / 100).toFixed(2)}%`,
-          await readMainPool(token),
-        ),
-      )
-    }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    if (msg.includes('Flap ')) throw e instanceof Error ? e : new Error(msg)
-    // 无 taxProcessor / RPC 失败：不拦
+    if (msg.includes('flapV4Hook')) throw e instanceof Error ? e : new Error(msg)
   }
 }
 
-/** V3/V4 建仓前：两边代币都过一遍 Flap / 税币检测。 */
-export async function assertTokensAllowStandardLp(tokens: Address[], onStatus?: (msg: string) => void) {
-  onStatus?.('检测代币是否支持标准加池…')
+/**
+ * Flap 税币若把某 V3 池登记进 `pools[]`，转入该池会走卖税，标准 V3 mint 常 revert（如 M1/STF）。
+ * 未登记的池（例如用户手组的 USDT 对）可以正常 mint——与 Uniswap 官方 UI 一致。
+ */
+export async function assertV3PoolNotFlapTaxed(token: Address, poolAddress: Address | undefined) {
+  if (isSkipToken(token) || !poolAddress) return
+  try {
+    const taxed = await withTimeout(
+      publicClient.readContract({
+        address: token,
+        abi: flapProbeAbi,
+        functionName: 'pools',
+        args: [poolAddress],
+      }),
+      8_000,
+      '检测 Flap 税池',
+    )
+    if (!taxed) return
+    throw new Error(
+      `该代币已把池 ${poolAddress.slice(0, 10)}… 登记为 Flap 税池（pools=true），` +
+        `往此池转入会抽卖税，Uniswap V3 标准 Mint 会失败。` +
+        `请换未被登记的交易对（例如用 USDT 而不是已登记的 WBNB 池），或在 Flap/V2 主池操作。`,
+    )
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (msg.includes('登记为 Flap 税池')) throw e instanceof Error ? e : new Error(msg)
+    // 无 pools() / RPC 失败：不拦
+  }
+}
+
+/** V3 建仓前：两边代币检查目标池是否被 Flap 登记为税池。 */
+export async function assertTokensAllowV3Mint(
+  tokens: Address[],
+  poolAddress: Address | undefined,
+  onStatus?: (msg: string) => void,
+) {
+  onStatus?.('检测目标池是否被标记为税池…')
   for (const t of tokens) {
-    await assertNotFlapLaunchpadToken(t)
+    await assertV3PoolNotFlapTaxed(t, poolAddress)
   }
 }
 
 /**
  * V4 settle 必须能把 ERC20 转入 PoolManager。
- * 部分 meme（含非 Flap）会黑名单 PoolManager，钱包常误报「授权/余额不足」。
  */
 export async function assertTokenAllowsV4PoolManager(owner: Address, token: Address) {
   if (isSkipToken(token)) return
-  await assertNotFlapLaunchpadToken(token)
+  await assertNotFlapV4HookToken(token)
 
   const dust = 1n
   try {
@@ -177,12 +119,11 @@ export async function assertTokenAllowsV4PoolManager(owner: Address, token: Addr
     )
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
-    if (msg.includes('Flap ')) throw e instanceof Error ? e : new Error(msg)
+    if (msg.includes('flapV4Hook')) throw e instanceof Error ? e : new Error(msg)
     if (/超时|timeout|network|fetch/i.test(msg)) return
     throw new Error(
       `该代币禁止转入 Uniswap V4 PoolManager（${CONTRACTS.v4PoolManager.slice(0, 10)}…），` +
-        `标准 V4 建池/加仓会失败。` +
-        `若也不是普通 ERC-20，V3 同样可能失败。` +
+        `标准 V4 建池/加仓会失败。可改试 V3。` +
         `（钱包里的「授权/余额不足」多半是这个原因。）`,
     )
   }

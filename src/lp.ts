@@ -54,7 +54,7 @@ import {
   tickToPrice,
 } from './math'
 import { fetchJson, withTimeout } from './async'
-import { assertTokensAllowStandardLp } from './tokenGuards'
+import { assertTokensAllowV3Mint } from './tokenGuards'
 import { publicClient } from './wallet'
 import {
   registerV4Deps,
@@ -1046,7 +1046,7 @@ export async function createV3PoolAndSeed(opts: {
   const useNative = Boolean(opts.useNativeEth) && pairHasWeth(token0Addr, token1Addr)
   const poolAddr = predictV3PoolAddress(token0Addr, token1Addr, fee)
 
-  await assertTokensAllowStandardLp([token0Addr, token1Addr], onStatus)
+  await assertTokensAllowV3Mint([token0Addr, token1Addr], poolAddr, onStatus)
 
   // 授权（非原生侧）
   if (!(useNative && isWeth(token0Addr)) && amount0 > 0n) {
@@ -3411,7 +3411,7 @@ export function pairHasWeth(token0: Address, token1: Address) {
 function friendlyTxError(e: unknown, action: string): string {
   const raw = e instanceof Error ? e.message : String(e)
   const lower = raw.toLowerCase()
-  // Uniswap TransferHelper: STF = safeTransferFrom 失败（余额/授权/税币到账变少），不是滑点
+  // Uniswap TransferHelper: STF = safeTransferFrom 失败（余额/授权/到账变少），不是滑点
   if (
     /\bstf\b/.test(lower) ||
     lower.includes('transfer_from_failed') ||
@@ -3421,8 +3421,13 @@ function friendlyTxError(e: unknown, action: string): string {
   ) {
     return (
       `${action} 失败：代币转账未成功（STF）。常见原因：余额不足、授权未生效、` +
-      `或税币/Flap 币转入 V3 池时被抽税导致到账变少。` +
-      `Flap 税币请走其 V2 主池，不要用本工具组 V3。`
+      `或目标池被 Flap 登记为税池导致转入抽税。可换未被登记的交易对（如 USDT）再试。`
+    )
+  }
+  if (/\bm1\b/.test(lower)) {
+    return (
+      `${action} 失败：链上返回 M1（常见于 Flap 已登记税池）。` +
+      `同一币种若 Uniswap 上手动能组，多半是交易对不同——请加载未被登记的池（例如 USDT 对）再 Mint。`
     )
   }
   if (lower.includes('slippage') || lower.includes('price slippage') || lower.includes('too little')) {
@@ -3479,11 +3484,16 @@ async function writeMintOrIncrease(opts: {
     ])
     gasWithBuffer = estimated < 21000n ? fallbackGas : estimated
   } catch (e) {
-    // 预检失败仍用固定 gas 尝试弹窗；真正失败由钱包/链上回报
     const msg = e instanceof Error ? e.message : String(e)
-    if (/insufficient|exceeds balance|transfer amount/i.test(msg)) {
+    // 明确 revert（STF/M1/税池等）直接抛出，避免再弹钱包浪费授权确认
+    if (
+      /reverted|stf|\bm1\b|insufficient|exceeds balance|transfer amount|execution reverted/i.test(
+        msg,
+      )
+    ) {
       throw new Error(friendlyTxError(e, action))
     }
+    // 仅 RPC/超时类失败才用固定 gas 继续弹窗
     gasWithBuffer = fallbackGas
   }
 
@@ -3613,7 +3623,11 @@ export async function mintV3Position(opts: {
   const use1 = paired.amount1
   if (use0 === 0n && use1 === 0n) throw new Error('当前区间下组仓数量为 0，请调整区间或重新填数量')
 
-  await assertTokensAllowStandardLp([usePool.token0.address, usePool.token1.address], onStatus)
+  await assertTokensAllowV3Mint(
+    [usePool.token0.address, usePool.token1.address],
+    usePool.poolAddress,
+    onStatus,
+  )
 
   const nativeValueFinal = useNative ? (wethIs0 ? use0 : wethIs1 ? use1 : 0n) : 0n
   if (useNative && nativeValueFinal > 0n) {
@@ -3707,7 +3721,10 @@ export async function increaseV3Liquidity(opts: {
   }
   if (amount0 === 0n && amount1 === 0n) throw new Error('当前区间下加仓数量为 0，请重新填数量')
 
-  await assertTokensAllowStandardLp([position.token0.address, position.token1.address])
+  await assertTokensAllowV3Mint(
+    [position.token0.address, position.token1.address],
+    position.poolAddress,
+  )
 
   const nativeValue = useNative ? (wethIs0 ? amount0 : wethIs1 ? amount1 : 0n) : 0n
 
