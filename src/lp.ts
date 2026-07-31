@@ -54,7 +54,6 @@ import {
   tickToPrice,
 } from './math'
 import { fetchJson, withTimeout } from './async'
-import { assertTokensAllowV3Mint } from './tokenGuards'
 import { publicClient } from './wallet'
 import {
   registerV4Deps,
@@ -1045,8 +1044,6 @@ export async function createV3PoolAndSeed(opts: {
 
   const useNative = Boolean(opts.useNativeEth) && pairHasWeth(token0Addr, token1Addr)
   const poolAddr = predictV3PoolAddress(token0Addr, token1Addr, fee)
-
-  await assertTokensAllowV3Mint([token0Addr, token1Addr], poolAddr, onStatus)
 
   // 授权（非原生侧）
   if (!(useNative && isWeth(token0Addr)) && amount0 > 0n) {
@@ -3623,12 +3620,6 @@ export async function mintV3Position(opts: {
   const use1 = paired.amount1
   if (use0 === 0n && use1 === 0n) throw new Error('当前区间下组仓数量为 0，请调整区间或重新填数量')
 
-  await assertTokensAllowV3Mint(
-    [usePool.token0.address, usePool.token1.address],
-    usePool.poolAddress,
-    onStatus,
-  )
-
   const nativeValueFinal = useNative ? (wethIs0 ? use0 : wethIs1 ? use1 : 0n) : 0n
   if (useNative && nativeValueFinal > 0n) {
     if (ethBal < nativeValueFinal + 10n ** 15n) {
@@ -3720,11 +3711,6 @@ export async function increaseV3Liquidity(opts: {
     }
   }
   if (amount0 === 0n && amount1 === 0n) throw new Error('当前区间下加仓数量为 0，请重新填数量')
-
-  await assertTokensAllowV3Mint(
-    [position.token0.address, position.token1.address],
-    position.poolAddress,
-  )
 
   const nativeValue = useNative ? (wethIs0 ? amount0 : wethIs1 ? amount1 : 0n) : 0n
 

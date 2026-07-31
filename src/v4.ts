@@ -22,7 +22,6 @@ import {
   rangeFromPercent,
 } from './math'
 import type { PoolInfo, PositionRow } from './lp'
-import { assertCurrenciesAllowV4 } from './tokenGuards'
 import { publicClient } from './wallet'
 
 export const NATIVE_ETH = zeroAddress
@@ -925,9 +924,6 @@ export async function mintV4Position(opts: {
     liquidity,
     slippageBps,
   })
-
-  onStatus?.('检测代币是否兼容 V4…')
-  await assertCurrenciesAllowV4(owner, key.currency0, key.currency1)
 
   // 原生 ETH 侧不走 Permit2
   await ensurePermit2(walletClient, key.currency0, owner, nativeIs0 ? 0n : amount0Max, onStatus)
