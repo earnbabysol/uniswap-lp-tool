@@ -22,6 +22,7 @@ import {
   rangeFromPercent,
 } from './math'
 import type { PoolInfo, PositionRow } from './lp'
+import { assertCurrenciesAllowV4 } from './tokenGuards'
 import { publicClient } from './wallet'
 
 export const NATIVE_ETH = zeroAddress
@@ -640,44 +641,6 @@ async function assertPermit2Ready(owner: Address, token: Address, amount: bigint
     if (/Permit2|授权/.test(msg)) throw e instanceof Error ? e : new Error(msg)
     // 读失败不硬挡（部分 RPC 抖），交给链上/钱包
   }
-}
-
-/**
- * V4 注资时代币必须能转入 PoolManager（settle 路径）。
- * 不少 meme 会黑名单/拦截 PoolManager，钱包会误报成「授权或余额不足」。
- */
-async function assertTokenAllowsV4PoolManager(owner: Address, token: Address) {
-  if (isNativeCurrency(token)) return
-  const dust = 1n
-  try {
-    const bal = await readTokenBalance(token, owner)
-    if (bal < dust) return // 余额检查另做；这里只测收款方是否被拒
-    await withTimeout(
-      publicClient.simulateContract({
-        address: token,
-        abi: erc20Abi,
-        functionName: 'transfer',
-        args: [CONTRACTS.v4PoolManager, dust],
-        account: owner,
-      }),
-      12_000,
-      '检测 V4 兼容性',
-    )
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    // RPC/超时不误伤；明确 revert 才判定不兼容
-    if (/超时|timeout|network|fetch/i.test(msg)) return
-    throw new Error(
-      `该代币禁止转入 Uniswap V4 PoolManager（${CONTRACTS.v4PoolManager.slice(0, 10)}…），V4 建池/加仓会失败。` +
-        `请改用「V3」创建池并注入，或换没有拦截 PoolManager 的代币。` +
-        `（钱包里的「授权/余额不足」多半是这个原因，不是真没授权。）`,
-    )
-  }
-}
-
-async function assertCurrenciesAllowV4(owner: Address, currency0: Address, currency1: Address) {
-  await assertTokenAllowsV4PoolManager(owner, currency0)
-  await assertTokenAllowsV4PoolManager(owner, currency1)
 }
 
 async function writeModifyLiquidities(opts: {
@@ -1304,6 +1267,9 @@ export async function increaseV4Liquidity(opts: {
     amount1 = paired.amount1
   }
   if (amount0 <= 0n && amount1 <= 0n) throw new Error('数量必须 > 0')
+
+  onStatus?.('检测代币是否兼容 V4…')
+  await assertCurrenciesAllowV4(owner, key.currency0, key.currency1)
 
   const nativeIs0 = isNativeCurrency(key.currency0)
   const nativeIs1 = isNativeCurrency(key.currency1)
