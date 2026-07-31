@@ -1,5 +1,5 @@
 import { useMemo, type ReactNode } from 'react'
-import { getPositionCoinPrices, type PositionRow } from './lp'
+import { getPositionCoinPrices, getPositionUsdRange, type PositionRow } from './lp'
 import { formatAge, formatPrice, formatUsd } from './math'
 import { PositionLegs } from './PositionLegs'
 
@@ -54,6 +54,7 @@ export function PositionDetailCard({
   poolHref,
 }: PositionDetailCardProps) {
   const cq = useMemo(() => getPositionCoinPrices(p), [p])
+  const usdRange = useMemo(() => getPositionUsdRange(p), [p])
   const unclaimedRaw = p.fees0 + p.fees1
   const hasUnclaimed = unclaimedRaw > 0n
   const unclaimedUsd = p.fees0Usd + p.fees1Usd
@@ -166,6 +167,13 @@ export function PositionDetailCard({
           <span className="pdc-unit">{cq.priceUnit}</span>
           <span className="mono right">{formatPrice(hi)}</span>
         </div>
+        {usdRange && (
+          <div className="pdc-range-ends pdc-range-usd" title="U 本位（$ / 币）">
+            <span className="mono">${formatPrice(usdRange.usdLower)}</span>
+            <span className="pdc-unit">$/{cq.coin.symbol}</span>
+            <span className="mono right">${formatPrice(usdRange.usdUpper)}</span>
+          </div>
+        )}
         <p className="pdc-range-hint">{rangeHint}</p>
       </div>
 

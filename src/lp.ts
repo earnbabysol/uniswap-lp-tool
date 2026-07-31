@@ -4481,6 +4481,45 @@ export function getPositionCoinPrices(p: PositionRow) {
   }
 }
 
+/**
+ * 把「报价币 / 币」区间换算成 U 本位（$ / 币）。
+ * 报价侧是稳定币 → 系数 1；是 ETH → 从仓位金额反推 ETH/$；否则用报价腿或币腿推算。
+ */
+export function getPositionUsdRange(p: PositionRow): {
+  usdLower: number
+  usdUpper: number
+  usdSpot: number
+  quoteUsd: number
+} | null {
+  const cq = getPositionCoinPrices(p)
+  if (!(cq.coinPriceLower > 0) || !(cq.coinPriceUpper > 0)) return null
+
+  let quoteUsd = 0
+  if (isUsdStable(cq.quote.address)) {
+    quoteUsd = 1
+  } else {
+    const [coinLeg, quoteLeg] = getPositionLegs(p)
+    const quoteQty = rawToNumber(quoteLeg.amount, quoteLeg.token.decimals)
+    if (quoteQty > 0 && quoteLeg.amountUsd > 0) {
+      quoteUsd = quoteLeg.amountUsd / quoteQty
+    } else {
+      const coinQty = rawToNumber(coinLeg.amount, coinLeg.token.decimals)
+      if (coinQty > 0 && coinLeg.amountUsd > 0 && cq.coinPrice > 0) {
+        // 1 币 ≈ coinPrice 份报价 → 报价/$ = (币/$)/coinPrice
+        quoteUsd = (coinLeg.amountUsd / coinQty) / cq.coinPrice
+      }
+    }
+  }
+  if (!(quoteUsd > 0) || !Number.isFinite(quoteUsd)) return null
+
+  return {
+    quoteUsd,
+    usdLower: cq.coinPriceLower * quoteUsd,
+    usdUpper: cq.coinPriceUpper * quoteUsd,
+    usdSpot: cq.coinPrice > 0 ? cq.coinPrice * quoteUsd : 0,
+  }
+}
+
 export function getCoinQuote(pool: PoolInfo): {
   invert: boolean
   coin: TokenMeta

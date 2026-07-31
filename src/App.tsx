@@ -63,6 +63,7 @@ import {
   ticksFromCoinPrices,
   getCoinQuote,
   getPositionCoinPrices,
+  getPositionUsdRange,
   oneSidedEthPercents,
   suggestV4TickSpacing,
   unwrapWeth,
@@ -2982,6 +2983,7 @@ export default function App() {
                 const id = `${p.version}-${p.tokenId}`
                 const selectedRow = selectedId === id
                 const cq = getPositionCoinPrices(p)
+                const usdRange = getPositionUsdRange(p)
                 const feeUsd = p.fees0Usd + p.fees1Usd
                 const poolSum = poolFeeByKey.get(positionPoolKey(p))
                 const poolFeesUsd = poolSum?.totalFeesUsd ?? p.totalFeesUsd
@@ -3070,9 +3072,19 @@ export default function App() {
                         />
                       </div>
                       <div className="pc-scale mono">
-                        <span title={String(cq.coinPriceLower)}>{formatPrice(cq.coinPriceLower)}</span>
-                        <span title={String(cq.coinPriceUpper)}>{formatPrice(cq.coinPriceUpper)}</span>
+                        <span title={`${cq.priceUnit} ${cq.coinPriceLower}`}>
+                          {formatPrice(cq.coinPriceLower)}
+                        </span>
+                        <span title={`${cq.priceUnit} ${cq.coinPriceUpper}`}>
+                          {formatPrice(cq.coinPriceUpper)}
+                        </span>
                       </div>
+                      {usdRange && (
+                        <div className="pc-scale pc-scale-usd mono" title="U 本位（$ / 币）">
+                          <span>${formatPrice(usdRange.usdLower)}</span>
+                          <span>${formatPrice(usdRange.usdUpper)}</span>
+                        </div>
+                      )}
                     </div>
                   </button>
                 )

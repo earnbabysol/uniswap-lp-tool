@@ -1891,6 +1891,12 @@ input:focus-visible, select:focus-visible, select:focus {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.pc-scale-usd {
+  margin-top: -2px;
+  font-size: 10.5px;
+  color: var(--muted-2);
+  opacity: 0.92;
+}
 
 /* legacy hooks kept so older selectors do not break */
 .pc-id, .pc-meta, .pc-ver, .pc-fee, .pc-money, .pc-stats, .pc-stat, .pc-k, .pc-v, .pc-scale-now { }
