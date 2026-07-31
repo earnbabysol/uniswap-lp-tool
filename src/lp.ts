@@ -4482,8 +4482,50 @@ export function getPositionCoinPrices(p: PositionRow) {
 }
 
 /**
- * 把「报价币 / 币」区间换算成 U 本位（$ / 币）。
- * 报价侧是稳定币 → 系数 1；是 ETH → 从仓位金额反推 ETH/$；否则用报价腿或币腿推算。
+ * 1 单位报价币折合多少 USD。
+ * - 稳定币 → 1
+ * - ETH/WETH → 用仓位里已按 WETH/$ 计价的 amountUsd 反推（与 enrichUsd 同源）
+ * - 其它报价币 → 无法严格换算，返回 null（宁可不显示，不瞎乘）
+ */
+function usdPerQuoteUnit(p: PositionRow, quote: TokenMeta, coinPrice: number): number | null {
+  if (isUsdStable(quote.address)) return 1
+  if (!isEthLikeCurrency(quote.address)) return null
+
+  // 优先：仓位里还有 ETH/WETH 腿，直接 amountUsd/数量 = ETH/$
+  if (isEthLikeCurrency(p.token0.address) && p.amount0 > 0n && p.amount0Usd > 0) {
+    const qty = rawToNumber(p.amount0, p.token0.decimals)
+    if (qty > 0) {
+      const v = p.amount0Usd / qty
+      if (Number.isFinite(v) && v > 0) return v
+    }
+  }
+  if (isEthLikeCurrency(p.token1.address) && p.amount1 > 0n && p.amount1Usd > 0) {
+    const qty = rawToNumber(p.amount1, p.token1.decimals)
+    if (qty > 0) {
+      const v = p.amount1Usd / qty
+      if (Number.isFinite(v) && v > 0) return v
+    }
+  }
+
+  // 出区间只剩币侧：enrichUsd 已按「币数量 × (报价币/币) × ETH/$」计价
+  // → ETH/$ = (币/$ ) / coinPrice
+  if (!(coinPrice > 0)) return null
+  const coinIs0 = !isEthLikeCurrency(p.token0.address) && isEthLikeCurrency(p.token1.address)
+  const coinIs1 = isEthLikeCurrency(p.token0.address) && !isEthLikeCurrency(p.token1.address)
+  if (!coinIs0 && !coinIs1) return null
+  const coinAmt = coinIs0 ? p.amount0 : p.amount1
+  const coinDec = coinIs0 ? p.token0.decimals : p.token1.decimals
+  const coinUsd = coinIs0 ? p.amount0Usd : p.amount1Usd
+  const qty = rawToNumber(coinAmt, coinDec)
+  if (!(qty > 0) || !(coinUsd > 0)) return null
+  const v = coinUsd / qty / coinPrice
+  return Number.isFinite(v) && v > 0 ? v : null
+}
+
+/**
+ * U 本位区间：严格定义为「1 枚 coin 值多少 USD」。
+ * 公式：usd = coinPrice(报价币/币) × (USD/报价币)
+ * 要求 getCoinQuote 已把稳定币或 ETH 放在报价侧。
  */
 export function getPositionUsdRange(p: PositionRow): {
   usdLower: number
@@ -4494,32 +4536,29 @@ export function getPositionUsdRange(p: PositionRow): {
   const cq = getPositionCoinPrices(p)
   if (!(cq.coinPriceLower > 0) || !(cq.coinPriceUpper > 0)) return null
 
-  let quoteUsd = 0
-  if (isUsdStable(cq.quote.address)) {
-    quoteUsd = 1
-  } else {
-    const [coinLeg, quoteLeg] = getPositionLegs(p)
-    const quoteQty = rawToNumber(quoteLeg.amount, quoteLeg.token.decimals)
-    if (quoteQty > 0 && quoteLeg.amountUsd > 0) {
-      quoteUsd = quoteLeg.amountUsd / quoteQty
-    } else {
-      const coinQty = rawToNumber(coinLeg.amount, coinLeg.token.decimals)
-      if (coinQty > 0 && coinLeg.amountUsd > 0 && cq.coinPrice > 0) {
-        // 1 币 ≈ coinPrice 份报价 → 报价/$ = (币/$)/coinPrice
-        quoteUsd = (coinLeg.amountUsd / coinQty) / cq.coinPrice
-      }
-    }
-  }
-  if (!(quoteUsd > 0) || !Number.isFinite(quoteUsd)) return null
+  const quoteUsd = usdPerQuoteUnit(p, cq.quote, cq.coinPrice)
+  if (quoteUsd == null || !(quoteUsd > 0) || !Number.isFinite(quoteUsd)) return null
+
+  const usdLower = cq.coinPriceLower * quoteUsd
+  const usdUpper = cq.coinPriceUpper * quoteUsd
+  const usdSpot = cq.coinPrice > 0 ? cq.coinPrice * quoteUsd : 0
+  if (![usdLower, usdUpper].every((n) => Number.isFinite(n) && n > 0)) return null
 
   return {
     quoteUsd,
-    usdLower: cq.coinPriceLower * quoteUsd,
-    usdUpper: cq.coinPriceUpper * quoteUsd,
-    usdSpot: cq.coinPrice > 0 ? cq.coinPrice * quoteUsd : 0,
+    // 乘完后仍保持下限 < 上限（coinPrice 已 min/max 过）
+    usdLower: Math.min(usdLower, usdUpper),
+    usdUpper: Math.max(usdLower, usdUpper),
+    usdSpot,
   }
 }
 
+/**
+ * 展示口径：coin = 标的，quote = 计价货币，spot = quote per coin。
+ * 优先级：稳定币作报价 → ETH/WETH 作报价 → 默认 token1/token0。
+ * （旧逻辑无 ETH 时死板用 token0 作币，USDT 当地址更小会变成「币」，
+ *  区间价变成「币/U」而 U 本位又去乘，数字会完全反了。）
+ */
 export function getCoinQuote(pool: PoolInfo): {
   invert: boolean
   coin: TokenMeta
@@ -4530,6 +4569,28 @@ export function getCoinQuote(pool: PoolInfo): {
   const t1 = pool.token1
   const eth0 = isEthLikeCurrency(t0.address)
   const eth1 = isEthLikeCurrency(t1.address)
+  const usd0 = isUsdStable(t0.address)
+  const usd1 = isUsdStable(t1.address)
+
+  // 1) 单边稳定币：稳定币永远是报价（U 本位）
+  if (usd0 && !usd1) {
+    return {
+      invert: true,
+      coin: t1,
+      quote: t0,
+      spot: pool.price > 0 ? 1 / pool.price : 0,
+    }
+  }
+  if (usd1 && !usd0) {
+    return {
+      invert: false,
+      coin: t0,
+      quote: t1,
+      spot: pool.price,
+    }
+  }
+
+  // 2) 单边 ETH/WETH：原生币作报价（如 NVDA/ETH；WETH/USDC 已在上面被稳定币分支接住）
   if (eth0 && !eth1) {
     return {
       invert: true,
@@ -4546,7 +4607,8 @@ export function getCoinQuote(pool: PoolInfo): {
       spot: pool.price,
     }
   }
-  // 无 ETH：按 token1 per token0 原样
+
+  // 3) 其它：池子原始 token1 per token0
   return { invert: false, coin: t0, quote: t1, spot: pool.price }
 }
 

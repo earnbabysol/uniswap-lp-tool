@@ -3080,7 +3080,10 @@ export default function App() {
                         </span>
                       </div>
                       {usdRange && (
-                        <div className="pc-scale pc-scale-usd mono" title="U 本位（$ / 币）">
+                        <div
+                          className="pc-scale pc-scale-usd mono"
+                          title={`U 本位：1 ${cq.coin.symbol} = $×（由 ${cq.priceUnit} × USD/${cq.quote.symbol}）`}
+                        >
                           <span>${formatPrice(usdRange.usdLower)}</span>
                           <span>${formatPrice(usdRange.usdUpper)}</span>
                         </div>
