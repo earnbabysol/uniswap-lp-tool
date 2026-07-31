@@ -1124,9 +1124,7 @@ export async function createV4PoolAndSeed(opts: {
     if (isNativeCurrency(currency0)) value = bumpAmountMax(maxed.amount0, slippageBps)
     if (isNativeCurrency(currency1)) value = bumpAmountMax(maxed.amount1, slippageBps)
 
-    // 弹钱包前预检：余额 / 代币是否兼容 V4 / Permit2
-    onStatus?.('检测代币是否兼容 V4…')
-    await assertCurrenciesAllowV4(owner, currency0, currency1)
+    // 弹钱包前预检：余额 / Permit2
     await assertV4SeedBalances({
       owner,
       currency0,
@@ -1263,9 +1261,6 @@ export async function increaseV4Liquidity(opts: {
     amount1 = paired.amount1
   }
   if (amount0 <= 0n && amount1 <= 0n) throw new Error('数量必须 > 0')
-
-  onStatus?.('检测代币是否兼容 V4…')
-  await assertCurrenciesAllowV4(owner, key.currency0, key.currency1)
 
   const nativeIs0 = isNativeCurrency(key.currency0)
   const nativeIs1 = isNativeCurrency(key.currency1)
