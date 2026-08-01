@@ -14,89 +14,57 @@ export type Toast = {
   detail?: string
   /** 交易哈希对应的浏览器链接 */
   href?: string
-  /** pending 不自动消失 */
+  /** true 时不自动消失（需手动点掉） */
   sticky?: boolean
+}
+
+/** 各类型默认停留时长；pending 也给兜底，避免一直占着右下角 */
+export const TOAST_TTL_MS: Record<ToastKind, number> = {
+  info: 4_500,
+  success: 4_500,
+  error: 8_000,
+  pending: 120_000,
 }
 
 let toastSeq = 1
 
 export function useToasts() {
   const [toasts, setToasts] = useState<Toast[]>([])
-  const timers = useRef(new Map<number, ReturnType<typeof setTimeout>>())
 
   const dismiss = useCallback((id: number) => {
     setToasts((prev) => prev.filter((t) => t.id !== id))
-    const t = timers.current.get(id)
-    if (t) {
-      clearTimeout(t)
-      timers.current.delete(id)
-    }
   }, [])
 
-  const schedule = useCallback(
-    (id: number, ms: number) => {
-      const existing = timers.current.get(id)
-      if (existing) clearTimeout(existing)
-      timers.current.set(
-        id,
-        setTimeout(() => {
-          setToasts((prev) => prev.filter((t) => t.id !== id))
-          timers.current.delete(id)
-        }, ms),
-      )
-    },
-    [],
-  )
-
-  /** 新建一条通知，返回 id 供后续 update */
-  const push = useCallback(
-    (t: Omit<Toast, 'id'>) => {
-      const id = toastSeq++
-      setToasts((prev) => {
-        const next = [...prev, { ...t, id }]
-        if (next.length <= 6) return next
-        // 优先丢掉已结束的旧通知，尽量保留 pending，避免「进行中」被挤掉后无法 update
-        const dropIdx = next.findIndex((x) => x.kind !== 'pending')
-        if (dropIdx >= 0) {
-          next.splice(dropIdx, 1)
-          return next
-        }
-        return next.slice(-6)
-      })
-      if (!t.sticky && t.kind !== 'pending') schedule(id, t.kind === 'error' ? 9000 : 5000)
-      return id
-    },
-    [schedule],
-  )
+  /** 新建一条通知，返回 id 供后续 update；自动消失由 ToastItem 按 kind 调度 */
+  const push = useCallback((t: Omit<Toast, 'id'>) => {
+    const id = toastSeq++
+    setToasts((prev) => {
+      const next = [...prev, { ...t, id }]
+      if (next.length <= 6) return next
+      // 优先丢掉已结束的旧通知，尽量保留 pending，避免「进行中」被挤掉后无法 update
+      const dropIdx = next.findIndex((x) => x.kind !== 'pending')
+      if (dropIdx >= 0) {
+        next.splice(dropIdx, 1)
+        return next
+      }
+      return next.slice(-6)
+    })
+    return id
+  }, [])
 
   /**
    * 就地更新（pending → success/error）。
    * 若该 id 已被挤出栈，返回 false，调用方应再 push 一条，避免永久停在「进行中…」。
    */
-  const update = useCallback(
-    (id: number, patch: Partial<Omit<Toast, 'id'>>): boolean => {
-      let found = false
-      setToasts((prev) => {
-        found = prev.some((t) => t.id === id)
-        if (!found) return prev
-        return prev.map((t) => (t.id === id ? { ...t, ...patch } : t))
-      })
-      const kind = patch.kind
-      if (found && kind && kind !== 'pending' && !patch.sticky) {
-        schedule(id, kind === 'error' ? 9000 : 5000)
-      }
-      return found
-    },
-    [schedule],
-  )
-
-  useEffect(
-    () => () => {
-      for (const t of timers.current.values()) clearTimeout(t)
-      timers.current.clear()
-    },
-    [],
-  )
+  const update = useCallback((id: number, patch: Partial<Omit<Toast, 'id'>>): boolean => {
+    let found = false
+    setToasts((prev) => {
+      found = prev.some((t) => t.id === id)
+      if (!found) return prev
+      return prev.map((t) => (t.id === id ? { ...t, ...patch } : t))
+    })
+    return found
+  }, [])
 
   return { toasts, push, update, dismiss }
 }
@@ -108,6 +76,48 @@ const KIND_ICON: Record<ToastKind, string> = {
   error: '!',
 }
 
+function ToastItem({
+  toast,
+  onDismiss,
+}: {
+  toast: Toast
+  onDismiss: (id: number) => void
+}) {
+  // 在条目级用 effect 调度消失：kind 从 pending→success 会重调度；
+  // 避免挂在 useToasts 的 timer map 上被卸载/严格模式清掉后永远不消失。
+  useEffect(() => {
+    if (toast.sticky) return
+    const ms = TOAST_TTL_MS[toast.kind] ?? 5_000
+    const timer = setTimeout(() => onDismiss(toast.id), ms)
+    return () => clearTimeout(timer)
+  }, [toast.id, toast.kind, toast.sticky, onDismiss])
+
+  return (
+    <div className={`toast ${toast.kind}`}>
+      <span className="toast-icon" aria-hidden>
+        {toast.kind === 'pending' ? <i className="toast-spin" /> : KIND_ICON[toast.kind]}
+      </span>
+      <div className="toast-body">
+        <strong className="toast-title">{toast.title}</strong>
+        {toast.detail && <span className="toast-detail">{toast.detail}</span>}
+        {toast.href && (
+          <a className="toast-link" href={toast.href} target="_blank" rel="noreferrer">
+            查看交易 ↗
+          </a>
+        )}
+      </div>
+      <button
+        type="button"
+        className="toast-close"
+        aria-label="关闭通知"
+        onClick={() => onDismiss(toast.id)}
+      >
+        ×
+      </button>
+    </div>
+  )
+}
+
 export function ToastStack({
   toasts,
   onDismiss,
@@ -117,30 +127,9 @@ export function ToastStack({
 }) {
   if (!toasts.length) return null
   return (
-    <div className="toast-stack" role="region" aria-label="通知" aria-live="polite">
+    <div className="toast-stack" role="region" aria-label="操作通知" aria-live="polite">
       {toasts.map((t) => (
-        <div key={t.id} className={`toast ${t.kind}`}>
-          <span className="toast-icon" aria-hidden>
-            {t.kind === 'pending' ? <i className="toast-spin" /> : KIND_ICON[t.kind]}
-          </span>
-          <div className="toast-body">
-            <strong className="toast-title">{t.title}</strong>
-            {t.detail && <span className="toast-detail">{t.detail}</span>}
-            {t.href && (
-              <a className="toast-link" href={t.href} target="_blank" rel="noreferrer">
-                查看交易 ↗
-              </a>
-            )}
-          </div>
-          <button
-            type="button"
-            className="toast-close"
-            aria-label="关闭通知"
-            onClick={() => onDismiss(t.id)}
-          >
-            ×
-          </button>
-        </div>
+        <ToastItem key={t.id} toast={t} onDismiss={onDismiss} />
       ))}
     </div>
   )
