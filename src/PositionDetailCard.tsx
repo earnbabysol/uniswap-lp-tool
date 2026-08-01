@@ -59,7 +59,8 @@ export function PositionDetailCard({
   const hasUnclaimed = unclaimedRaw > 0n
   const unclaimedUsd = p.fees0Usd + p.fees1Usd
   const principalUsd = p.amount0Usd + p.amount1Usd
-  const deposited = p.costBasisUsd > 0 ? p.costBasisUsd : principalUsd > 0 ? principalUsd : 0
+  // 已存入 = 锁定成本，勿回退到持仓市值（否则会随币价飘）
+  const deposited = p.costBasisUsd > 0 ? p.costBasisUsd : 0
   const pnlBasis = Math.max(p.costBasisUsd, principalUsd, 1e-9)
   const pnlPct = formatPnlPct(p.pnlUsd, pnlBasis)
   const pnlUp = p.pnlUsd >= 0
@@ -204,15 +205,15 @@ export function PositionDetailCard({
           <span className="pdc-v ok">{formatUsd(unclaimedUsd)}</span>
         </div>
         <div className="pdc-stat">
-          <span className="pdc-k">已领手续费</span>
+          <span className="pdc-k" title="按领取时价格锁定，不随市值重估；未领仍用现价">已领手续费</span>
           <span className="pdc-v ok">{formatUsd(p.claimedFeesUsd)}</span>
         </div>
         <div className="pdc-stat">
-          <span className="pdc-k">累计手续费</span>
+          <span className="pdc-k" title="未领(现价) + 已领(锁定)">累计手续费</span>
           <span className="pdc-v ok">{formatUsd(p.totalFeesUsd)}</span>
         </div>
         <div className="pdc-stat">
-          <span className="pdc-k">已存入</span>
+          <span className="pdc-k" title="净存入成本：存入−取出，按发现增量时价格锁定，不随市值重估">已存入</span>
           <span className="pdc-v">{deposited > 0 ? formatUsd(deposited) : '—'}</span>
         </div>
         <div className="pdc-stat">
