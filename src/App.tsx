@@ -433,8 +433,11 @@ export default function App() {
   const [seedAmtB, setSeedAmtB] = useState('')
   const [createSeedBalA, setCreateSeedBalA] = useState<bigint>(0n)
   const [createSeedBalB, setCreateSeedBalB] = useState<bigint>(0n)
-  /** 创建时初仓区间预设 */
-  const [createRangePreset, setCreateRangePreset] = useState<'onesided-eth' | 'full' | number>('onesided-eth')
+  /** 创建时初仓区间预设；custom = U 本位手填上下限 */
+  const [createRangePreset, setCreateRangePreset] = useState<'onesided-eth' | 'full' | 'custom' | number>('onesided-eth')
+  /** 自定义区间：USD per 币（与初始价同一本位） */
+  const [createUsdLo, setCreateUsdLo] = useState('')
+  const [createUsdHi, setCreateUsdHi] = useState('')
 
   const [wrapAmt, setWrapAmt] = useState('')
   const [vacantV3Ids, setVacantV3Ids] = useState<bigint[] | null>(null)
@@ -1882,16 +1885,29 @@ export default function App() {
       liquidity: 0n,
     }
 
-    const pct =
-      createRangePreset === 'onesided-eth' && (ethA || ethB)
-        ? oneSidedEthPercents()
-        : typeof createRangePreset === 'number'
-          ? { percentLower: -createRangePreset, percentUpper: createRangePreset }
-          : { percentLower, percentUpper: percentUp }
-    const range =
-      createRangePreset === 'full'
-        ? describeFullRange(synth)
-        : describeRange(synth, pct.percentLower, pct.percentUpper)
+    let range: ReturnType<typeof describeRange>
+    if (createRangePreset === 'full') {
+      range = describeFullRange(synth)
+    } else if (createRangePreset === 'custom') {
+      const usdLo = Number(createUsdLo.replace(/,/g, ''))
+      const usdHi = Number(createUsdHi.replace(/,/g, ''))
+      if (!(usdLo > 0) || !(usdHi > 0) || usdLo >= usdHi) return null
+      if (!(quoteUsd > 0)) return null
+      // U 本位 → 报价 per 币（与初始价同一换算），再落成 tick
+      try {
+        range = ticksFromCoinPrices(synth, usdLo / quoteUsd, usdHi / quoteUsd)
+      } catch {
+        return null
+      }
+    } else {
+      const pct =
+        createRangePreset === 'onesided-eth' && (ethA || ethB)
+          ? oneSidedEthPercents()
+          : typeof createRangePreset === 'number'
+            ? { percentLower: -createRangePreset, percentUpper: createRangePreset }
+            : { percentLower, percentUpper: percentUp }
+      range = describeRange(synth, pct.percentLower, pct.percentUpper)
+    }
 
     return { synth, range, sortedAFirst, rawA, rawB, initialPriceBPerA, useFee, decA, decB }
   }, [
@@ -1905,6 +1921,8 @@ export default function App() {
     customFeeInput,
     useNativeEth,
     createRangePreset,
+    createUsdLo,
+    createUsdHi,
     percentLower,
     percentUp,
     tokenOptions,
@@ -2081,6 +2099,10 @@ export default function App() {
       return
     }
     if (!createSynth) {
+      if (createRangePreset === 'custom') {
+        setStatus('请填写有效的 U 本位区间（下限 < 上限），并确保初始价与报价汇率可用')
+        return
+      }
       if (quoteUsdBusy) setStatus('正在拉取报价币 USD 汇率…')
       else setStatus(`无法换算链上价格：请确认 ${tokenLabel(createSides.quote)} 汇率可用，或换稳定币作报价`)
       return
@@ -3931,16 +3953,67 @@ export default function App() {
                           ±{n}%
                         </button>
                       ))}
+                      <button
+                        type="button"
+                        className={`chip ${createRangePreset === 'custom' ? 'on' : ''}`}
+                        onClick={() => {
+                          setCreateRangePreset('custom')
+                          const spot = Number(initPrice.replace(/,/g, ''))
+                          if (spot > 0) {
+                            if (!createUsdLo.trim()) setCreateUsdLo(formatPrice(spot * 0.9))
+                            if (!createUsdHi.trim()) setCreateUsdHi(formatPrice(spot * 1.1))
+                          }
+                        }}
+                      >
+                        自定义 U
+                      </button>
                     </div>
                   </div>
+                  {createRangePreset === 'custom' && (
+                    <div className="mint-pct-grid" style={{ marginBottom: 8 }}>
+                      <label className="mint-pct-field">
+                        <span className="mint-pct-label">下限 · USD / 币</span>
+                        <div className="mint-pct-input">
+                          <input
+                            value={createUsdLo}
+                            onChange={(e) => setCreateUsdLo(e.target.value)}
+                            inputMode="decimal"
+                            placeholder="例如 0.001"
+                          />
+                        </div>
+                      </label>
+                      <label className="mint-pct-field">
+                        <span className="mint-pct-label">上限 · USD / 币</span>
+                        <div className="mint-pct-input">
+                          <input
+                            value={createUsdHi}
+                            onChange={(e) => setCreateUsdHi(e.target.value)}
+                            inputMode="decimal"
+                            placeholder="例如 0.01"
+                          />
+                        </div>
+                      </label>
+                    </div>
+                  )}
                   <p className="muted" style={{ margin: '0 0 8px', fontSize: 12 }}>
                     {createRangePreset === 'onesided-eth'
                       ? `单边 ${getNativeSymbol()}：区间放到币价下方，创建时通常只需付报价侧（${tokenLabel(createSides.quote)}）。`
                       : createRangePreset === 'full'
                         ? '全区间：覆盖全部价格，需同时准备两侧代币（按初始价比例）。'
-                        : `双边 ±${createRangePreset}%：区间围绕初始价，通常需两侧代币。`}
+                        : createRangePreset === 'custom'
+                          ? '自定义 U 本位：按「1 枚币值多少美元」填上下限（与上方初始价同一口径），会对齐到 tick。'
+                          : `双边 ±${createRangePreset}%：区间围绕初始价，通常需两侧代币。`}
+                    {createSynth?.range && createRangePreset === 'custom' ? (
+                      <>
+                        {' '}链上对齐后约 $
+                        {formatPrice((createSynth.range.coinPriceLower * quoteUsd))} – $
+                        {formatPrice((createSynth.range.coinPriceUpper * quoteUsd))} / 币。
+                      </>
+                    ) : null}
                     {createSynth && initPrice.trim() ? (
                       <> 填<strong>一边数量</strong>，另一边按初始价+区间自动配平。</>
+                    ) : createRangePreset === 'custom' ? (
+                      <> 填好初始价与 U 区间后，这里填一边就会自动配平。</>
                     ) : (
                       <> 上方初始价填好后，这里填一边就会自动配平（可点「取现价」从已有池子带过来）。</>
                     )}
