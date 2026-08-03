@@ -51,6 +51,12 @@ export type AppChainConfig = {
   explorerUrl: string
   /** Blockscout / explorer API 根（日志、NFT 扫描） */
   explorerApi: string
+  /**
+   * 是否可用 Blockscout 风格 `/api/v2/...` NFT 索引。
+   * BSC 的 bsc.blockscout.com 常 404，开启会白白多等几秒再落入慢路径。
+   * 缺省 true；显式 false 则跳过 explorer NFT 列表。
+   */
+  supportsBlockscoutNftApi?: boolean
   contracts: ChainContracts
   knownTokens: Record<string, { symbol: string; decimals: number }>
   v3PoolInitCodeHash: `0x${string}`
@@ -305,6 +311,7 @@ export const CHAIN_CONFIGS: Record<SupportedChainId, AppChainConfig> = {
     ],
     explorerUrl: 'https://www.oklink.com/xlayer',
     explorerApi: 'https://www.oklink.com/api/v5/explorer/xlayer/api',
+    supportsBlockscoutNftApi: false,
     contracts: XLAYER_CONTRACTS,
     knownTokens: tokensFromContracts(
       XLAYER_CONTRACTS,
@@ -402,14 +409,17 @@ export const CHAIN_CONFIGS: Record<SupportedChainId, AppChainConfig> = {
     label: 'BNB Smart Chain',
     shortLabel: 'BSC',
     chain: bsc,
+    // 官方 dataseed 优先；publicnode/drpc 易慢或 429，仅作垫底
     defaultRpcUrls: [
-      'https://bsc.publicnode.com',
-      'https://bsc.drpc.org',
       'https://bsc-dataseed.binance.org',
-      'https://bsc-dataseed.bnbchain.org',
+      'https://bsc-dataseed1.bnbchain.org',
+      'https://bsc-dataseed2.bnbchain.org',
+      'https://bsc-dataseed3.defibit.io',
+      'https://bsc.publicnode.com',
     ],
     explorerUrl: 'https://bscscan.com',
     explorerApi: 'https://bsc.blockscout.com',
+    supportsBlockscoutNftApi: false,
     contracts: BSC_CONTRACTS,
     knownTokens: tokensFromContracts(
       BSC_CONTRACTS,
@@ -537,6 +547,11 @@ export function getV3PoolInitCodeHash(): `0x${string}` {
 
 export function getExplorerApi(): string {
   return CHAIN_CONFIGS[activeChainId].explorerApi
+}
+
+/** 当前链是否可走 Blockscout `/api/v2` NFT 索引 */
+export function chainSupportsBlockscoutNftApi(chainId: SupportedChainId = activeChainId): boolean {
+  return CHAIN_CONFIGS[chainId].supportsBlockscoutNftApi !== false
 }
 
 /** 当前链要扫的全部 V3 工厂：主 Uniswap + 备用 DEX */

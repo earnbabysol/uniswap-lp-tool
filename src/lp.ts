@@ -23,6 +23,7 @@ import {
   chainHasWrappedNative,
   getActiveChainConfig,
   getActiveChainId,
+  chainSupportsBlockscoutNftApi,
   getExplorerApi,
   getNativeSymbol,
   getStableAddress,
@@ -1426,25 +1427,44 @@ export async function getWethUsdPrice(): Promise<number> {
 
   try {
     for (const fee of fees) {
-      // 同费率下并行试各 DEX × 稳定币，避免串行空转
-      const hits = await Promise.all(
-        dexes.flatMap((dex) =>
-          stables.map(async (stable) => {
-            const poolAddr = await findV3Pool(CONTRACTS.weth, stable, fee, dex.factory).catch(() => null)
-            if (!poolAddr) return 0
-            const pool = await loadV3Pool(poolAddr).catch(() => null)
-            if (!pool || !(pool.price > 0)) return 0
-            let usd = 0
-            if (pool.token0.address.toLowerCase() === CONTRACTS.weth.toLowerCase()) usd = pool.price
-            else if (pool.token1.address.toLowerCase() === CONTRACTS.weth.toLowerCase()) {
-              usd = pool.price > 0 ? 1 / pool.price : 0
-            }
-            usd = clampUsd(usd)
-            return usd >= 1 && usd <= 100_000 ? usd : 0
-          }),
-        ),
+      // 同费率下并行试各 DEX × 稳定币；任一命中即用，不必等全部失败路径跑完
+      const tasks = dexes.flatMap((dex) =>
+        stables.map(async (stable) => {
+          const poolAddr = await findV3Pool(CONTRACTS.weth, stable, fee, dex.factory).catch(() => null)
+          if (!poolAddr) return 0
+          const pool = await loadV3Pool(poolAddr).catch(() => null)
+          if (!pool || !(pool.price > 0)) return 0
+          let usd = 0
+          if (pool.token0.address.toLowerCase() === CONTRACTS.weth.toLowerCase()) usd = pool.price
+          else if (pool.token1.address.toLowerCase() === CONTRACTS.weth.toLowerCase()) {
+            usd = pool.price > 0 ? 1 / pool.price : 0
+          }
+          usd = clampUsd(usd)
+          return usd >= 1 && usd <= 100_000 ? usd : 0
+        }),
       )
-      const found = hits.find((v) => v > 0)
+      const found = await new Promise<number>((resolve) => {
+        let pending = tasks.length
+        if (!pending) {
+          resolve(0)
+          return
+        }
+        let done = false
+        for (const t of tasks) {
+          void t.then((v) => {
+            if (!done && v > 0) {
+              done = true
+              resolve(v)
+              return
+            }
+            pending -= 1
+            if (!done && pending === 0) resolve(0)
+          }).catch(() => {
+            pending -= 1
+            if (!done && pending === 0) resolve(0)
+          })
+        }
+      })
       if (found) {
         wethUsdCache = { chainId, at: Date.now(), value: found }
         return found
@@ -2754,31 +2774,36 @@ async function listV4TokenIds(
       : '扫描 V4 NFT…',
   )
 
-  // 校验缓存 id 是否仍属本人（并行、限并发）
+  // 校验缓存 id 是否仍属本人（限并发，避免 BSC 公共 RPC 被打爆）
   if (ids.size > 0) {
     const cachedList = [...ids]
     ids.clear()
-    await Promise.all(
-      cachedList.map(async (idStr) => {
-        try {
-          const who = await publicClient.readContract({
-            address: CONTRACTS.v4PositionManager,
-            abi: v4PositionManagerAbi,
-            functionName: 'ownerOf',
-            args: [BigInt(idStr)],
-          })
-          if (who.toLowerCase() === own) add(idStr)
-        } catch {
-          /* burned / transferred */
-        }
-      }),
-    )
+    const conc = chainId === 56 ? 6 : 16
+    for (let i = 0; i < cachedList.length; i += conc) {
+      const slice = cachedList.slice(i, i + conc)
+      await Promise.all(
+        slice.map(async (idStr) => {
+          try {
+            const who = await publicClient.readContract({
+              address: CONTRACTS.v4PositionManager,
+              abi: v4PositionManagerAbi,
+              functionName: 'ownerOf',
+              args: [BigInt(idStr)],
+            })
+            if (who.toLowerCase() === own) add(idStr)
+          } catch {
+            /* burned / transferred */
+          }
+        }),
+      )
+    }
   }
 
   const complete = () => balance === 0n || BigInt(ids.size) >= balance
+  const useBlockscout = chainSupportsBlockscoutNftApi(chainId)
 
-  // 1) Blockscout / explorer 实例列表（通常最快最全）
-  if (!complete() || deep) {
+  // 1) Blockscout / explorer 实例列表（通常最快最全；BSC 等链已关闭）
+  if (useBlockscout && (!complete() || deep)) {
     try {
       let url: string | null =
         `${getExplorerApi()}/api/v2/tokens/${CONTRACTS.v4PositionManager}/instances?holder_address_hash=${owner}`
@@ -2786,7 +2811,7 @@ async function listV4TokenIds(
         const json = await fetchJson<{
           items?: Array<{ id?: string; token_id?: string }>
           next_page_params?: Record<string, string | number>
-        }>(url, deep ? 12_000 : 8_000)
+        }>(url, deep ? 12_000 : 5_000)
         for (const it of json.items ?? []) add(it.id ?? it.token_id)
         if (json.next_page_params) {
           const q = new URLSearchParams(
@@ -2816,7 +2841,7 @@ async function listV4TokenIds(
   }
 
   // 2) 全量 NFT 页兜底
-  if (ids.size < Number(balance) || (ids.size === 0 && balance === 0n)) {
+  if (useBlockscout && (ids.size < Number(balance) || (ids.size === 0 && balance === 0n))) {
     try {
       let url: string | null =
         `${getExplorerApi()}/api/v2/addresses/${owner}/nft?type=ERC-721`
@@ -2824,7 +2849,7 @@ async function listV4TokenIds(
         const json = await fetchJson<{
           items?: Array<{ id?: string; token?: { address_hash?: string; address?: string } }>
           next_page_params?: Record<string, string>
-        }>(url, 6_000)
+        }>(url, 4_000)
         for (const it of json.items ?? []) {
           const addr = (it.token?.address_hash || it.token?.address || '').toLowerCase()
           if (addr === npm && it.id) add(it.id)
@@ -2853,17 +2878,23 @@ async function listV4TokenIds(
     return list
   }
 
-  // 3) 近端 ownerOf：仅补漏；普通刷新只探最近一小段
+  // 3) 近端 ownerOf：仅补漏；普通刷新只探最近一小段（BSC 限并发，避免公共 RPC 限流雪崩）
   try {
     const nextId = await publicClient.readContract({
       address: CONTRACTS.v4PositionManager,
       abi: v4PositionManagerAbi,
       functionName: 'nextTokenId',
     })
-    const probe = deep ? 500n : chainId === 1 || chainId === 196 || chainId === 8453 || chainId === 56 ? 80n : 120n
+    const probe = deep
+      ? 500n
+      : chainId === 56
+        ? 48n
+        : chainId === 1 || chainId === 196 || chainId === 8453
+          ? 80n
+          : 120n
     const start = nextId > probe ? nextId - probe : 1n
     opts?.onStatus?.(`校验近 ${probe.toString()} 个 V4 tokenId…`)
-    const batch = 40n
+    const batch = chainId === 56 ? 8n : 24n
     for (let from = start; from < nextId; from += batch) {
       const to = from + batch > nextId ? nextId : from + batch
       const checks: Promise<void>[] = []

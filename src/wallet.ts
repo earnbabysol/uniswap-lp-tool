@@ -34,17 +34,22 @@ function makeReadTransport() {
   const cfg = getActiveChainConfig()
   const customUrl = loadCustomRpcUrl(cfg.id)
   const httpUrls = customUrl ? [customUrl] : [...cfg.defaultRpcUrls]
-  const httpTimeout = customUrl
+  // BSC 公共节点常挂起/限流：短超时快切下一个，避免单次卡 12s 拖垮整次刷新
+  const baseTimeout = customUrl
     ? 30_000
     : cfg.key === 'arc'
       ? 6_000
-      : cfg.key === 'bsc' || cfg.key === 'ethereum' || cfg.key === 'xlayer'
-        ? 12_000
-        : 20_000
-  const httpTransports = httpUrls.map((url) =>
+      : cfg.key === 'bsc'
+        ? 4_000
+        : cfg.key === 'ethereum' || cfg.key === 'xlayer'
+          ? 8_000
+          : 20_000
+  const retryCount = customUrl ? 2 : cfg.key === 'bsc' ? 0 : 1
+  const httpTransports = httpUrls.map((url, i) =>
     http(url, {
-      timeout: httpTimeout,
-      retryCount: customUrl ? 2 : 1,
+      // 首节点更短；后续略放宽，避免整串都过早放弃
+      timeout: cfg.key === 'bsc' && !customUrl ? (i === 0 ? 3_500 : baseTimeout) : baseTimeout,
+      retryCount,
     }),
   )
 
