@@ -1235,18 +1235,31 @@ async function resolveV4PoolKeyFromId(poolId: `0x${string}`): Promise<{
       functionName: 'poolKeys',
       args: [id25],
     })
-    const currency0 = key[0] as Address
-    const currency1 = key[1] as Address
-    const fee = Number(key[2])
-    const tickSpacing = Number(key[3])
-    const hooks = key[4] as Address
+    // viem 对多返回值可能给数组，对 tuple 可能给命名对象
+    const row = key as unknown as Address[] & {
+      currency0?: Address
+      currency1?: Address
+      fee?: number | bigint
+      tickSpacing?: number | bigint
+      hooks?: Address
+    }
+    const currency0 = (row.currency0 ?? row[0]) as Address
+    const currency1 = (row.currency1 ?? row[1]) as Address
+    const fee = Number(row.fee ?? row[2])
+    const tickSpacing = Number(row.tickSpacing ?? row[3])
+    const hooks = (row.hooks ?? row[4]) as Address
     // 未登记过的 id 会返回全零；与真实零地址 hooks / 空池区分开
     if (
-      currency0 !== zeroAddress
-      || currency1 !== zeroAddress
-      || fee !== 0
-      || tickSpacing !== 0
-      || hooks !== zeroAddress
+      currency0
+      && currency1
+      && hooks
+      && (
+        currency0 !== zeroAddress
+        || currency1 !== zeroAddress
+        || fee !== 0
+        || tickSpacing !== 0
+        || hooks !== zeroAddress
+      )
     ) {
       return { currency0, currency1, fee, tickSpacing, hooks }
     }

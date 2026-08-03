@@ -330,7 +330,8 @@ function encodeV4ExactInSingle(opts: {
         {
           type: 'tuple',
           components: [
-            poolKeyAbi,
+            // 必须带 name：对象入参靠 component.name 取字段，缺 name 会读到 undefined.currency0
+            { name: 'poolKey', ...poolKeyAbi },
             { name: 'zeroForOne', type: 'bool' },
             { name: 'amountIn', type: 'uint128' },
             { name: 'amountOutMinimum', type: 'uint128' },
