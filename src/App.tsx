@@ -4006,8 +4006,8 @@ export default function App() {
                     {createSynth?.range && createRangePreset === 'custom' ? (
                       <>
                         {' '}链上对齐后约 $
-                        {formatPrice((createSynth.range.coinPriceLower * quoteUsd))} – $
-                        {formatPrice((createSynth.range.coinPriceUpper * quoteUsd))} / 币。
+                        {formatPrice(createSynth.range.coinPriceLower * quoteUsd)} – $
+                        {formatPrice(createSynth.range.coinPriceUpper * quoteUsd)} / 币。
                       </>
                     ) : null}
                     {createSynth && initPrice.trim() ? (

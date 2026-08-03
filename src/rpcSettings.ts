@@ -9,6 +9,7 @@ const CHAIN_KEY_PREFIX = 'rangedesk.customRpc.v1.'
 export function defaultRpcUrl(chainId: SupportedChainId = getActiveChainId()): string {
   const fromCfg = getActiveChainConfig().defaultRpcUrls[0]
   if (fromCfg) return fromCfg
+  if (chainId === 1) return 'https://ethereum.publicnode.com'
   if (chainId === 8453) return 'https://mainnet.base.org'
   if (chainId === 5042) return 'https://5042.rpc.thirdweb.com'
   if (chainId === 56) return 'https://bsc-dataseed.binance.org'

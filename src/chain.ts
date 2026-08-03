@@ -1,6 +1,7 @@
 import { defineChain, type Address, type Chain } from 'viem'
+import { mainnet } from 'viem/chains'
 
-export type SupportedChainId = 4663 | 8453 | 5042 | 56
+export type SupportedChainId = 1 | 4663 | 8453 | 5042 | 56
 
 /** 同链上额外的 Uniswap-V3 兼容 DEX（如 BSC Pancake） */
 export type V3DexFactory = {
@@ -17,7 +18,7 @@ export type ChainContracts = {
    * 且 `hasWrappedNative === false` 时不得当包装原生币用。
    */
   weth: Address
-  /** 稳定币：Robinhood=USDG，Base/Arc/BSC=USDC */
+  /** 稳定币：Robinhood=USDG，Ethereum/Base/Arc/BSC=USDC */
   stable: Address
   /** @deprecated 兼容旧代码，等同 stable */
   usdg: Address
@@ -42,7 +43,7 @@ export type ChainContracts = {
 
 export type AppChainConfig = {
   id: SupportedChainId
-  key: 'robinhood' | 'base' | 'arc' | 'bsc'
+  key: 'ethereum' | 'robinhood' | 'base' | 'arc' | 'bsc'
   label: string
   shortLabel: string
   chain: Chain
@@ -58,7 +59,7 @@ export type AppChainConfig = {
   defaultTokenB: Address
   /** 是否有可 wrap 的原生币（Arc 为 false：gas=USDC，无 WETH） */
   hasWrappedNative: boolean
-  /** 额外按 $1 计价的稳定币（如 BSC 的 USDT）；默认含 contracts.stable */
+  /** 额外按 $1 计价的稳定币（如 BSC/ETH 的 USDT）；默认含 contracts.stable */
   usdStables?: Address[]
   /** BSC 等：额外扫 Pancake 等 V3 工厂 */
   altV3Factories?: V3DexFactory[]
@@ -112,6 +113,32 @@ export const bsc = defineChain({
     default: { name: 'BscScan', url: 'https://bscscan.com' },
   },
 })
+
+export const ethereum = mainnet
+
+/**
+ * Ethereum 主网 Uniswap 官方部署：
+ * V3 https://docs.uniswap.org/contracts/v3/reference/deployments/ethereum-deployments
+ * V4 https://developers.uniswap.org/docs/protocols/v4/deployments
+ */
+const ETHEREUM_CONTRACTS: ChainContracts = {
+  weth: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+  stable: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', // USDC
+  usdg: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+  v3Factory: '0x1F98431c8aD98523631AE4a59f267346ea31F984',
+  v3Npm: '0xC36442b4a4522E871399CD717aBDD847Ab11FE88',
+  v3SwapRouter: '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45', // SwapRouter02
+  v3Quoter: '0x61fFE014bA17989E743c5F6cB21bF9697530B21e', // QuoterV2
+  v3QuoterIsV2: true,
+  v4PoolManager: '0x000000000004444c5dc75cB358380D2e3dE08A90',
+  v4PositionManager: '0xbd216513d74c8cf14cf4747e6aaa6420ff64ee9e',
+  v4StateView: '0x7ffe42c4a5deea5b0fec41c94c136cf115597227',
+  v4Quoter: '0x52f0e24d1c21c8a0cb1e5a5dd6198556bd9e1203',
+  permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
+  universalRouter: '0x66a9893cc07d91d95644aedd05d03f95e1dba8af',
+}
+
+const ETHEREUM_USDT: Address = '0xdAC17F958D2ee523a2206206994597C13D831ec7'
 
 const ROBINHOOD_CONTRACTS: ChainContracts = {
   weth: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
@@ -213,6 +240,31 @@ function tokensFromContracts(
 }
 
 export const CHAIN_CONFIGS: Record<SupportedChainId, AppChainConfig> = {
+  1: {
+    id: 1,
+    key: 'ethereum',
+    label: 'Ethereum',
+    shortLabel: 'ETH',
+    chain: ethereum,
+    defaultRpcUrls: [
+      'https://ethereum.publicnode.com',
+      'https://rpc.ankr.com/eth',
+      'https://eth.drpc.org',
+      'https://cloudflare-eth.com',
+    ],
+    explorerUrl: 'https://etherscan.io',
+    explorerApi: 'https://eth.blockscout.com',
+    contracts: ETHEREUM_CONTRACTS,
+    knownTokens: tokensFromContracts(ETHEREUM_CONTRACTS, {
+      [ETHEREUM_CONTRACTS.stable.toLowerCase()]: { symbol: 'USDC', decimals: 6 },
+      [ETHEREUM_USDT.toLowerCase()]: { symbol: 'USDT', decimals: 6 },
+    }),
+    v3PoolInitCodeHash: '0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54',
+    defaultTokenA: ETHEREUM_CONTRACTS.stable,
+    defaultTokenB: ETHEREUM_CONTRACTS.weth,
+    hasWrappedNative: true,
+    usdStables: [ETHEREUM_USDT],
+  },
   4663: {
     id: 4663,
     key: 'robinhood',
@@ -336,7 +388,7 @@ function readSavedChainId(): SupportedChainId {
   try {
     const raw = localStorage.getItem(CHAIN_KEY)
     const id = Number(raw)
-    if (id === 4663 || id === 8453 || id === 5042 || id === 56) return id
+    if (id === 1 || id === 4663 || id === 8453 || id === 5042 || id === 56) return id
   } catch {
     /* ignore */
   }
@@ -366,7 +418,7 @@ export function setActiveChainId(id: SupportedChainId): AppChainConfig {
 }
 
 export function isSupportedChainId(id: number): id is SupportedChainId {
-  return id === 4663 || id === 8453 || id === 5042 || id === 56
+  return id === 1 || id === 4663 || id === 8453 || id === 5042 || id === 56
 }
 
 /** 当前链是否有可 wrap 的原生币（WETH / WBNB） */

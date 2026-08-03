@@ -2847,7 +2847,7 @@ async function listV4TokenIds(
       abi: v4PositionManagerAbi,
       functionName: 'nextTokenId',
     })
-    const probe = deep ? 500n : chainId === 8453 || chainId === 56 ? 80n : 120n
+    const probe = deep ? 500n : chainId === 1 || chainId === 8453 || chainId === 56 ? 80n : 120n
     const start = nextId > probe ? nextId - probe : 1n
     opts?.onStatus?.(`校验近 ${probe.toString()} 个 V4 tokenId…`)
     const batch = 40n
@@ -2883,7 +2883,8 @@ async function listV4TokenIds(
   // 普通刷新绝不回溯几万块——Base 公共 RPC 极慢；索引用 Blockscout（类似 Uniswap Subgraph，但免 API Key）。
   // Uniswap 官方 GraphQL/The Graph 需鉴权，本地工具默认不依赖。
   if (deep) {
-    const lookback = chainId === 8453 ? 120_000n : 800_000n
+    // Base 出块快用较短回溯；ETH/BSC 等用较长窗口扫 Transfer
+    const lookback = chainId === 8453 ? 120_000n : chainId === 1 ? 400_000n : 800_000n
     try {
       opts?.onStatus?.(`深度扫描：扫链上 Transfer（回溯 ${lookback.toString()} 块）…`)
       const fromLogs = await withTimeout(
@@ -2920,7 +2921,7 @@ async function scanV4TokenIdsByLogs(owner: Address, lookbackBlocks: bigint): Pro
   const latest = await publicClient.getBlockNumber()
   const owned = new Set<string>()
   // Base / BSC / 多数公共 RPC 对 eth_getLogs 窗口很严
-  const span = getActiveChainId() === 8453 || getActiveChainId() === 56 ? 2_000n : 8_000n
+  const span = getActiveChainId() === 1 || getActiveChainId() === 8453 || getActiveChainId() === 56 ? 2_000n : 8_000n
   const start = latest > lookbackBlocks ? latest - lookbackBlocks : 0n
   for (let from = start; from <= latest; from += span) {
     const to = from + span - 1n > latest ? latest : from + span - 1n
@@ -2996,7 +2997,7 @@ async function collectV4ModifyLogs(opts: {
   const { poolId, tokenId, fromBlock } = opts
   const salt = v4Salt(tokenId).toLowerCase()
   const latest = await publicClient.getBlockNumber()
-  const span = getActiveChainId() === 8453 || getActiveChainId() === 56 ? 2_000n : 8_000n
+  const span = getActiveChainId() === 1 || getActiveChainId() === 8453 || getActiveChainId() === 56 ? 2_000n : 8_000n
   const out: Array<{
     blockNumber: bigint
     transactionHash: Hash
