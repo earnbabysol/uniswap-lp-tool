@@ -1,7 +1,7 @@
 import { defineChain, type Address, type Chain } from 'viem'
-import { mainnet } from 'viem/chains'
+import { mainnet, xLayer } from 'viem/chains'
 
-export type SupportedChainId = 1 | 4663 | 8453 | 5042 | 56
+export type SupportedChainId = 1 | 196 | 4663 | 8453 | 5042 | 56
 
 /** 同链上额外的 Uniswap-V3 兼容 DEX（如 BSC Pancake） */
 export type V3DexFactory = {
@@ -18,7 +18,7 @@ export type ChainContracts = {
    * 且 `hasWrappedNative === false` 时不得当包装原生币用。
    */
   weth: Address
-  /** 稳定币：Robinhood=USDG，Ethereum/Base/Arc/BSC=USDC */
+  /** 稳定币：Robinhood=USDG，其它链多为 USDC */
   stable: Address
   /** @deprecated 兼容旧代码，等同 stable */
   usdg: Address
@@ -43,7 +43,7 @@ export type ChainContracts = {
 
 export type AppChainConfig = {
   id: SupportedChainId
-  key: 'ethereum' | 'robinhood' | 'base' | 'arc' | 'bsc'
+  key: 'ethereum' | 'xlayer' | 'robinhood' | 'base' | 'arc' | 'bsc'
   label: string
   shortLabel: string
   chain: Chain
@@ -115,6 +115,7 @@ export const bsc = defineChain({
 })
 
 export const ethereum = mainnet
+export const xlayer = xLayer
 
 /**
  * Ethereum 主网 Uniswap 官方部署：
@@ -139,6 +140,32 @@ const ETHEREUM_CONTRACTS: ChainContracts = {
 }
 
 const ETHEREUM_USDT: Address = '0xdAC17F958D2ee523a2206206994597C13D831ec7'
+
+/**
+ * X Layer 主网 Uniswap 官方部署：
+ * V3 https://developers.uniswap.org/docs/protocols/v3/deployments/v3-xlayer-deployments
+ * V4 https://developers.uniswap.org/docs/protocols/v4/deployments
+ */
+const XLAYER_CONTRACTS: ChainContracts = {
+  weth: '0xe538905cf8410324e03A5A23C1c177a474D59b2b', // WOKB
+  stable: '0x74b7F16337b8972027F6196A17a631aC6dE26d22', // USDC
+  usdg: '0x74b7F16337b8972027F6196A17a631aC6dE26d22',
+  v3Factory: '0x4B2ab38DBF28D31D467aA8993f6c2585981D6804',
+  v3Npm: '0x315e413A11AB0df498eF83873012430ca36638Ae',
+  v3SwapRouter: '0x4f0c28f5926afda16bf2506d5d9e57ea190f9bca', // SwapRouter02
+  v3Quoter: '0xd1b797d92d87b688193a2b976efc8d577d204343', // QuoterV2
+  v3QuoterIsV2: true,
+  v4PoolManager: '0x360e68faccca8ca495c1b759fd9eee466db9fb32',
+  v4PositionManager: '0xcf1eafc6928dc385a342e7c6491d371d2871458b',
+  v4StateView: '0x76fd297e2d437cd7f76d50f01afe6160f86e9990',
+  v4Quoter: '0x8928074ca1b241d8ec02815881c1af11e8bc5219',
+  permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
+  // V4 文档 Universal Router 2.1.1（支持 V4_SWAP）
+  universalRouter: '0x8b844f885672f333bc0042cb669255f93a4c1e6b',
+}
+
+/** OKX 官方 tokenlist：USD₮0 */
+const XLAYER_USDT0: Address = '0x779Ded0c9e1022225f8E0630b35a9b54bE713736'
 
 const ROBINHOOD_CONTRACTS: ChainContracts = {
   weth: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
@@ -265,6 +292,34 @@ export const CHAIN_CONFIGS: Record<SupportedChainId, AppChainConfig> = {
     hasWrappedNative: true,
     usdStables: [ETHEREUM_USDT],
   },
+  196: {
+    id: 196,
+    key: 'xlayer',
+    label: 'X Layer',
+    shortLabel: 'X Layer',
+    chain: xlayer,
+    defaultRpcUrls: [
+      'https://xlayerrpc.okx.com',
+      'https://rpc.xlayer.tech',
+      'https://xlayer.drpc.org',
+    ],
+    explorerUrl: 'https://www.oklink.com/xlayer',
+    explorerApi: 'https://www.oklink.com/api/v5/explorer/xlayer/api',
+    contracts: XLAYER_CONTRACTS,
+    knownTokens: tokensFromContracts(
+      XLAYER_CONTRACTS,
+      {
+        [XLAYER_CONTRACTS.stable.toLowerCase()]: { symbol: 'USDC', decimals: 6 },
+        [XLAYER_USDT0.toLowerCase()]: { symbol: 'USDT0', decimals: 6 },
+      },
+      { wrappedSymbol: 'WOKB' },
+    ),
+    v3PoolInitCodeHash: '0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54',
+    defaultTokenA: XLAYER_CONTRACTS.stable,
+    defaultTokenB: XLAYER_CONTRACTS.weth,
+    hasWrappedNative: true,
+    usdStables: [XLAYER_USDT0],
+  },
   4663: {
     id: 4663,
     key: 'robinhood',
@@ -388,7 +443,7 @@ function readSavedChainId(): SupportedChainId {
   try {
     const raw = localStorage.getItem(CHAIN_KEY)
     const id = Number(raw)
-    if (id === 1 || id === 4663 || id === 8453 || id === 5042 || id === 56) return id
+    if (id === 1 || id === 196 || id === 4663 || id === 8453 || id === 5042 || id === 56) return id
   } catch {
     /* ignore */
   }
@@ -418,7 +473,7 @@ export function setActiveChainId(id: SupportedChainId): AppChainConfig {
 }
 
 export function isSupportedChainId(id: number): id is SupportedChainId {
-  return id === 1 || id === 4663 || id === 8453 || id === 5042 || id === 56
+  return id === 1 || id === 196 || id === 4663 || id === 8453 || id === 5042 || id === 56
 }
 
 /** 当前链是否有可 wrap 的原生币（WETH / WBNB） */
@@ -431,11 +486,11 @@ export function getNativeSymbol(chainId: SupportedChainId = activeChainId): stri
   return CHAIN_CONFIGS[chainId].chain.nativeCurrency.symbol
 }
 
-/** 包装原生币符号：WETH / WBNB */
+/** 包装原生币符号：WETH / WBNB / WOKB */
 export function getWrappedNativeSymbol(chainId: SupportedChainId = activeChainId): string {
   if (!CHAIN_CONFIGS[chainId].hasWrappedNative) return getNativeSymbol(chainId)
   return CHAIN_CONFIGS[chainId].knownTokens[CHAIN_CONFIGS[chainId].contracts.weth.toLowerCase()]?.symbol
-    ?? (chainId === 56 ? 'WBNB' : 'WETH')
+    ?? (chainId === 56 ? 'WBNB' : chainId === 196 ? 'WOKB' : 'WETH')
 }
 
 /** 当前链 V3 Quoter 是否为 QuoterV2 */

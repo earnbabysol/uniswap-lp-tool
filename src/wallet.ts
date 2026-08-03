@@ -38,7 +38,7 @@ function makeReadTransport() {
     ? 30_000
     : cfg.key === 'arc'
       ? 6_000
-      : cfg.key === 'bsc' || cfg.key === 'ethereum'
+      : cfg.key === 'bsc' || cfg.key === 'ethereum' || cfg.key === 'xlayer'
         ? 12_000
         : 20_000
   const httpTransports = httpUrls.map((url) =>

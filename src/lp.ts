@@ -2860,7 +2860,7 @@ async function listV4TokenIds(
       abi: v4PositionManagerAbi,
       functionName: 'nextTokenId',
     })
-    const probe = deep ? 500n : chainId === 1 || chainId === 8453 || chainId === 56 ? 80n : 120n
+    const probe = deep ? 500n : chainId === 1 || chainId === 196 || chainId === 8453 || chainId === 56 ? 80n : 120n
     const start = nextId > probe ? nextId - probe : 1n
     opts?.onStatus?.(`校验近 ${probe.toString()} 个 V4 tokenId…`)
     const batch = 40n
@@ -2934,7 +2934,13 @@ async function scanV4TokenIdsByLogs(owner: Address, lookbackBlocks: bigint): Pro
   const latest = await publicClient.getBlockNumber()
   const owned = new Set<string>()
   // Base / BSC / 多数公共 RPC 对 eth_getLogs 窗口很严
-  const span = getActiveChainId() === 1 || getActiveChainId() === 8453 || getActiveChainId() === 56 ? 2_000n : 8_000n
+  const span =
+    getActiveChainId() === 1
+    || getActiveChainId() === 196
+    || getActiveChainId() === 8453
+    || getActiveChainId() === 56
+      ? 2_000n
+      : 8_000n
   const start = latest > lookbackBlocks ? latest - lookbackBlocks : 0n
   for (let from = start; from <= latest; from += span) {
     const to = from + span - 1n > latest ? latest : from + span - 1n
@@ -3010,7 +3016,13 @@ async function collectV4ModifyLogs(opts: {
   const { poolId, tokenId, fromBlock } = opts
   const salt = v4Salt(tokenId).toLowerCase()
   const latest = await publicClient.getBlockNumber()
-  const span = getActiveChainId() === 1 || getActiveChainId() === 8453 || getActiveChainId() === 56 ? 2_000n : 8_000n
+  const span =
+    getActiveChainId() === 1
+    || getActiveChainId() === 196
+    || getActiveChainId() === 8453
+    || getActiveChainId() === 56
+      ? 2_000n
+      : 8_000n
   const out: Array<{
     blockNumber: bigint
     transactionHash: Hash
