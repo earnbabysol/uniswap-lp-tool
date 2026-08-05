@@ -1867,11 +1867,11 @@ export function computeFeeApr(opts: {
 
 /**
  * 已领 / 已存入成本缓存。
- * v6：USD 改为「增量锁定」——token 数量增加时按当时价格累加 USD，之后不随市价重估。
- * （v5 把 claimedUsd 每次现价重算，已领/已存入会跟着市值飘。）
+ * v7：修复 RPC+浏览器日志重复计入导致「已存入」只增不减；复投 Increase 不再算存入。
+ * v6：USD 增量锁定（已被重复日志污染的本地缓存需升级清掉）。
  */
-const FEE_CACHE_KEY = 'uniswap-lp-lifetime-fees-v6'
-const FEE_CACHE_KEY_LEGACY = 'uniswap-lp-lifetime-fees-v5'
+const FEE_CACHE_KEY = 'uniswap-lp-lifetime-fees-v7'
+const FEE_CACHE_KEY_LEGACY = 'uniswap-lp-lifetime-fees-v6'
 
 type FeeCacheEntry = {
   claimed0: string
@@ -2165,26 +2165,49 @@ function applyLockedCostBasis(
   const cached = readFeeCache()[key]
   const allowDown = Boolean(opts?.allowDown)
 
-  const depositedUsd = lockUsdForTokenGrowth({
-    prev0: parseCacheBigint(cached?.deposited0),
-    prev1: parseCacheBigint(cached?.deposited1),
-    next0: cf.deposited0,
-    next1: cf.deposited1,
-    prevLockedUsd: cached?.depositedUsd ?? 0,
-    row,
-    wethUsd,
-    allowDown,
-  })
-  const withdrawnUsd = lockUsdForTokenGrowth({
-    prev0: parseCacheBigint(cached?.withdrawn0),
-    prev1: parseCacheBigint(cached?.withdrawn1),
-    next0: cf.withdrawn0,
-    next1: cf.withdrawn1,
-    prevLockedUsd: cached?.withdrawnUsd ?? 0,
-    row,
-    wethUsd,
-    allowDown,
-  })
+  // 日志不完整时绝不上调存/取成本（RPC 缺页 + 浏览器补扫曾把同一笔加两次，越刷越大）
+  const prevDep0 = parseCacheBigint(cached?.deposited0)
+  const prevDep1 = parseCacheBigint(cached?.deposited1)
+  const prevWdw0 = parseCacheBigint(cached?.withdrawn0)
+  const prevWdw1 = parseCacheBigint(cached?.withdrawn1)
+  const depGrew = cf.deposited0 > prevDep0 || cf.deposited1 > prevDep1
+  const wdwGrew = cf.withdrawn0 > prevWdw0 || cf.withdrawn1 > prevWdw1
+  const useDep = allowDown || !depGrew || !cached ? cf : {
+    ...cf,
+    deposited0: prevDep0,
+    deposited1: prevDep1,
+  }
+  const useWdw = allowDown || !wdwGrew || !cached ? cf : {
+    ...cf,
+    withdrawn0: prevWdw0,
+    withdrawn1: prevWdw1,
+  }
+
+  // 可信完整扫描：按当前扫到的净存取代币一次性锚定 USD，清掉历史重复累加
+  const depositedUsd = allowDown
+    ? tokensUsdNow(row, useDep.deposited0, useDep.deposited1, wethUsd)
+    : lockUsdForTokenGrowth({
+      prev0: prevDep0,
+      prev1: prevDep1,
+      next0: useDep.deposited0,
+      next1: useDep.deposited1,
+      prevLockedUsd: cached?.depositedUsd ?? 0,
+      row,
+      wethUsd,
+      allowDown: false,
+    })
+  const withdrawnUsd = allowDown
+    ? tokensUsdNow(row, useWdw.withdrawn0, useWdw.withdrawn1, wethUsd)
+    : lockUsdForTokenGrowth({
+      prev0: prevWdw0,
+      prev1: prevWdw1,
+      next0: useWdw.withdrawn0,
+      next1: useWdw.withdrawn1,
+      prevLockedUsd: cached?.withdrawnUsd ?? 0,
+      row,
+      wethUsd,
+      allowDown: false,
+    })
 
   const withClaimTokens: PositionRow = {
     ...row,
@@ -2209,10 +2232,10 @@ function applyLockedCostBasis(
     claimed0: merged.claimed0.toString(),
     claimed1: merged.claimed1.toString(),
     claimedUsd: merged.claimedFeesUsd,
-    deposited0: cf.deposited0.toString(),
-    deposited1: cf.deposited1.toString(),
-    withdrawn0: cf.withdrawn0.toString(),
-    withdrawn1: cf.withdrawn1.toString(),
+    deposited0: useDep.deposited0.toString(),
+    deposited1: useDep.deposited1.toString(),
+    withdrawn0: useWdw.withdrawn0.toString(),
+    withdrawn1: useWdw.withdrawn1.toString(),
     depositedUsd,
     withdrawnUsd,
     lastFees0: merged.fees0.toString(),
@@ -2352,14 +2375,38 @@ async function v3MintBlock(tokenId: bigint): Promise<bigint | null> {
   }
 }
 
-type NpmAmountLog = { args: { amount0?: bigint; amount1?: bigint }; transactionHash: Hash }
+type NpmAmountLog = {
+  args: { amount0?: bigint; amount1?: bigint; liquidity?: bigint }
+  transactionHash: Hash
+  logIndex?: number
+}
 
-function dedupeNpmLogs<T extends { transactionHash: Hash; logIndex?: number }>(logs: T[]): T[] {
-  const m = new Map<string, T>()
+/** 去重：浏览器 API 常无 logIndex，不能只用 txHash-0，否则会和 RPC 日志重复累加 */
+function dedupeNpmLogs(logs: NpmAmountLog[]): NpmAmountLog[] {
+  const m = new Map<string, NpmAmountLog>()
   for (const l of logs) {
-    m.set(`${l.transactionHash}-${l.logIndex ?? 0}`, l)
+    const a0 = (l.args.amount0 ?? 0n).toString()
+    const a1 = (l.args.amount1 ?? 0n).toString()
+    const liq = (l.args.liquidity ?? 0n).toString()
+    const idx = l.logIndex != null ? String(l.logIndex) : ''
+    // 优先 tx+logIndex；无 index 时用金额指纹，避免 RPC+Blockscout 双计
+    const key = idx !== ''
+      ? `${l.transactionHash}-${idx}`
+      : `${l.transactionHash}-${a0}-${a1}-${liq}`
+    const prev = m.get(key)
+    if (!prev || (prev.logIndex == null && l.logIndex != null)) m.set(key, l)
   }
-  return [...m.values()]
+  // 再按金额指纹收一遍：同一 tx 里 RPC(有 index) 与 BS(无 index) 各一份
+  const byAmt = new Map<string, NpmAmountLog>()
+  for (const l of m.values()) {
+    const a0 = (l.args.amount0 ?? 0n).toString()
+    const a1 = (l.args.amount1 ?? 0n).toString()
+    const liq = (l.args.liquidity ?? 0n).toString()
+    const k = `${l.transactionHash}-${a0}-${a1}-${liq}`
+    const prev = byAmt.get(k)
+    if (!prev || (prev.logIndex == null && l.logIndex != null)) byAmt.set(k, l)
+  }
+  return [...byAmt.values()]
 }
 
 async function fetchNpmLogsBlockscout(
@@ -2367,6 +2414,7 @@ async function fetchNpmLogsBlockscout(
   eventName: 'Collect' | 'IncreaseLiquidity' | 'DecreaseLiquidity',
   tokenId: bigint,
   fromBlock: bigint,
+  npm: Address = CONTRACTS.v3Npm,
 ): Promise<NpmAmountLog[]> {
   try {
     const topics = encodeEventTopics({
@@ -2379,13 +2427,18 @@ async function fetchNpmLogsBlockscout(
     if (!t0 || !t1) return []
     const url =
       `${getExplorerApi()}/api?module=logs&action=getLogs` +
-      `&fromBlock=${fromBlock}&toBlock=latest&address=${CONTRACTS.v3Npm}` +
+      `&fromBlock=${fromBlock}&toBlock=latest&address=${npm}` +
       `&topic0=${t0}&topic1=${t1}&topic0_1_opr=and`
     const res = await fetch(url)
     if (!res.ok) return []
     const json = (await res.json()) as {
       status?: string
-      result?: Array<{ data: `0x${string}`; topics: `0x${string}`[]; transactionHash: Hash }>
+      result?: Array<{
+        data: `0x${string}`
+        topics: `0x${string}`[]
+        transactionHash: Hash
+        logIndex?: string
+      }>
     }
     if (json.status !== '1' || !json.result?.length) return []
     const out: NpmAmountLog[] = []
@@ -2396,9 +2449,11 @@ async function fetchNpmLogsBlockscout(
           data: log.data,
           topics: log.topics,
         })
+        const li = log.logIndex != null ? Number(log.logIndex) : undefined
         out.push({
-          args: decoded.args as { amount0?: bigint; amount1?: bigint },
+          args: decoded.args as { amount0?: bigint; amount1?: bigint; liquidity?: bigint },
           transactionHash: log.transactionHash,
+          logIndex: Number.isFinite(li) ? li : undefined,
         })
       } catch {
         /* skip */
@@ -2427,11 +2482,11 @@ async function loadV3NpmLogs(
     toBlock,
   })
   // RPC 完整扫完（含 0 条）直接用，避免 Blockscout 缺页把「无 Collect」误成有领取
-  if (!rpc.incomplete) return rpc
-  const bs = await fetchNpmLogsBlockscout(event, eventName, tokenId, fromBlock)
-  if (bs.length === 0) return { logs: rpc.logs, incomplete: true }
-  // 合并去重前先拼上；仍标 incomplete——缺 chunk 时 Collect−Decrease 不可信
-  return { logs: [...rpc.logs, ...bs], incomplete: true }
+  if (!rpc.incomplete) return { logs: dedupeNpmLogs(rpc.logs), incomplete: false }
+  const bs = await fetchNpmLogsBlockscout(event, eventName, tokenId, fromBlock, npm)
+  if (bs.length === 0) return { logs: dedupeNpmLogs(rpc.logs), incomplete: true }
+  // 合并后严格去重；缺 chunk 仍标 incomplete，成本腿禁止上调
+  return { logs: dedupeNpmLogs([...rpc.logs, ...bs]), incomplete: true }
 }
 
 export async function loadPositionCashflow(
@@ -2459,13 +2514,17 @@ export async function loadPositionCashflow(
       loadV3NpmLogs(colEvent, 'Collect', tokenId, fromBlock, latest, npm),
     ])
     const incomplete = incRes.incomplete || decRes.incomplete || colRes.incomplete
-    const inc = dedupeNpmLogs(incRes.logs)
-    const dec = dedupeNpmLogs(decRes.logs)
-    const col = dedupeNpmLogs(colRes.logs)
+    const inc = incRes.logs
+    const dec = decRes.logs
+    const col = colRes.logs
+
+    // 同笔 Collect 的 Increase = 复投加回，不算用户「新存入」（否则已存入会越刷越大）
+    const collectTx = new Set(col.map((l) => l.transactionHash.toLowerCase()))
 
     let deposited0 = 0n
     let deposited1 = 0n
     for (const l of inc) {
+      if (collectTx.has(l.transactionHash.toLowerCase())) continue
       deposited0 += l.args.amount0 ?? 0n
       deposited1 += l.args.amount1 ?? 0n
     }
@@ -2481,7 +2540,7 @@ export async function loadPositionCashflow(
      * 历史已领（含复投）= ΣCollect − ΣDecrease
      * - 纯 Claim：无 Decrease，Collect 全算已领
      * - 同笔/分笔撤出再 Collect：超出已撤本金的部分才是手续费
-     * - 复投：Collect 后 Increase，Collect 仍计入已领
+     * - 复投：Collect 后 Increase，Collect 仍计入已领；Increase 已从 deposited 排除
      * - 无任何 Collect → 已领必为 0（用户从未领取）
      */
     let collected0 = 0n
