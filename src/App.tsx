@@ -449,6 +449,9 @@ export default function App() {
   const [discoverNote, setDiscoverNote] = useState('')
 
   const tabRef = useRef(tab)
+  /** 递增可使进行中的刷新结果全部作废（切链 / 重新刷新 / 断开） */
+  const refreshGenRef = useRef(0)
+  const refreshingRef = useRef(false)
   useEffect(() => {
     tabRef.current = tab
   }, [tab])
@@ -703,6 +706,10 @@ export default function App() {
   }, [])
 
   const disconnect = () => {
+    refreshGenRef.current += 1
+    refreshingRef.current = false
+    setRefreshing(false)
+    setRefreshStatus('')
     if (signerMode === 'local') lockSigner()
     setAddress(null)
     setWallet(null)
@@ -802,67 +809,28 @@ export default function App() {
     }
   }
 
-  const onSwitchChain = async (nextId: SupportedChainId) => {
-    if (nextId === chainId) return
-    try {
-      setBusy(true)
-      const cfg = switchAppChain(nextId)
-      setChainId(nextId)
-      setTokenA(cfg.defaultTokenA)
-      setTokenB(cfg.defaultTokenB)
-      setTokenMetaCache({})
-      setGasTokenDisplay({ raw: 0n, decimals: cfg.key === 'arc' ? 6 : 18 })
-      setPool(null)
-      setScannedPools([])
-      setPositions([])
-      setSelectedId(null)
-      setPoolInput('')
-      setAmount0('')
-      setAmount1('')
-      setInitPrice('')
-      setMintSwapOpen(false)
-      setSwapAmount('')
-      setSwapQuote(null)
-      setRpcInput(loadCustomRpcUrl(nextId) ?? '')
-      setActiveRpcLabel(describeActiveRpc(nextId))
-      setRpcLatency(null)
-      setRpcBlock(null)
-      setStatus(`已切换到 ${cfg.label}`)
-      setStatusHash(null)
-      if (address) {
-        try {
-          await ensureActiveChain()
-          setWallet(makeWalletClient(address))
-          setStatus(`已切换到 ${cfg.label}，正在刷新仓位…`)
-          await refreshPositions({ silent: false })
-        } catch (e) {
-          setStatus(
-            `应用已切到 ${cfg.label}，请在钱包中切换网络后点连接：${e instanceof Error ? e.message : String(e)}`,
-          )
-        }
-      }
-    } catch (e) {
-      setStatus(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
+  /** 递增可使进行中的刷新结果全部作废（切链 / 重新刷新） */
+  const refreshGenRef = useRef(0)
   const refreshingRef = useRef(false)
+
   const refreshPositions = useCallback(async (opts?: { silent?: boolean; deep?: boolean }) => {
-    if (!address) return
+    if (!address) return []
     // 设计模式下仓位是写死的夹具，真去链上拉一遍只会把它们冲掉
-    if (designMode()) return
+    if (designMode()) return []
     const silent = opts?.silent ?? tabRef.current !== 'positions'
     const deep = Boolean(opts?.deep)
-    if (refreshingRef.current) {
-      if (!silent) setRefreshStatus('仍在刷新中，请稍候…')
-      return
-    }
+    // 静默自动刷新不打断用户手动/深度刷新；手动刷新可覆盖旧任务
+    if (refreshingRef.current && silent) return []
+
+    const gen = ++refreshGenRef.current
+    const startedChainId = getActiveChainId()
+    const stillCurrent = () =>
+      gen === refreshGenRef.current && getActiveChainId() === startedChainId
+
     refreshingRef.current = true
     setRefreshing(true)
     if (!silent) {
-      setRefreshStatus(deep ? '深度扫描仓位…' : '刷新 V3 仓位…')
+      setRefreshStatus(deep ? '深度扫描仓位…' : '刷新 V3 / V4 仓位…')
     }
     const started = Date.now()
     const partial: string[] = []
@@ -871,10 +839,15 @@ export default function App() {
     /** 本轮拿到的完整快照，给自动化用（两侧都失败时为空） */
     let merged: PositionRow[] = []
     try {
-      if (!silent) setRefreshStatus(deep ? '深度扫描仓位…' : '刷新 V3 / V4 仓位…')
+      const onV4Status = silent
+        ? undefined
+        : (msg: string) => {
+            if (stillCurrent()) setRefreshStatus(msg)
+          }
 
       const v3P = withTimeout(loadV3Positions(address), deep ? 90_000 : 35_000, 'V3 仓位')
         .then((rows) => {
+          if (!stillCurrent()) return null
           v3 = rows
           setPositions((prev) => {
             const keepV4 = prev.filter((p) => p.version === 'v4')
@@ -883,6 +856,7 @@ export default function App() {
           return rows
         })
         .catch((e) => {
+          if (!stillCurrent()) return null
           partial.push(e instanceof Error ? e.message : String(e))
           console.warn('loadV3Positions failed', e)
           return null
@@ -892,12 +866,13 @@ export default function App() {
         loadV4Positions(address, {
           deep,
           skipPnl: true,
-          onStatus: silent ? undefined : setRefreshStatus,
+          onStatus: onV4Status,
         }),
         deep ? 90_000 : 35_000,
         'V4 仓位',
       )
         .then((rows) => {
+          if (!stillCurrent()) return null
           v4 = rows
           setPositions((prev) => {
             const keepV3 = prev.filter((p) => p.version === 'v3')
@@ -906,12 +881,14 @@ export default function App() {
           return rows
         })
         .catch((e) => {
+          if (!stillCurrent()) return null
           partial.push(e instanceof Error ? e.message : String(e))
           console.warn('loadV4Positions failed', e)
           return null
         })
 
       await Promise.all([v3P, v4P])
+      if (!stillCurrent()) return []
 
       setPositions((prev) => {
         const nextV3 = v3 ?? prev.filter((p) => p.version === 'v3')
@@ -947,6 +924,7 @@ export default function App() {
         if (!silent) setRefreshStatus((s) => `${s} · 补扫历史手续费…`)
         void enrichPositionsLifetimeFees(feeBase, address, {
           onRow: (row) => {
+            if (!stillCurrent()) return
             setPositions((prev) => {
               const i = prev.findIndex(
                 (p) => p.version === row.version && p.tokenId === row.tokenId,
@@ -958,6 +936,7 @@ export default function App() {
             })
           },
         }).then((rows) => {
+          if (!stillCurrent()) return
           setPositions((prev) => {
             const map = new Map(rows.map((r) => [`${r.version}-${r.tokenId}`, r]))
             return prev.map((p) => map.get(`${p.version}-${p.tokenId}`) ?? p)
@@ -973,15 +952,71 @@ export default function App() {
         }).catch((e) => console.warn('lifetime fees enrich failed', e))
       }
     } catch (e) {
-      if (!silent || tabRef.current === 'positions') {
+      if (stillCurrent() && (!silent || tabRef.current === 'positions')) {
         setRefreshStatus(e instanceof Error ? e.message : String(e))
       }
     } finally {
-      refreshingRef.current = false
-      setRefreshing(false)
+      if (gen === refreshGenRef.current) {
+        refreshingRef.current = false
+        setRefreshing(false)
+      }
     }
     return merged
   }, [address, refreshBalances])
+
+  const onSwitchChain = async (nextId: SupportedChainId) => {
+    if (nextId === chainId) return
+    // 立刻作废进行中的刷新，避免旧链结果写回新链
+    refreshGenRef.current += 1
+    refreshingRef.current = false
+    setRefreshing(false)
+    setRefreshStatus('')
+    try {
+      const cfg = switchAppChain(nextId)
+      setChainId(nextId)
+      setTokenA(cfg.defaultTokenA)
+      setTokenB(cfg.defaultTokenB)
+      setTokenMetaCache({})
+      setGasTokenDisplay({ raw: 0n, decimals: cfg.key === 'arc' ? 6 : 18 })
+      setPool(null)
+      setScannedPools([])
+      setPositions([])
+      setSelectedId(null)
+      setPoolInput('')
+      setAmount0('')
+      setAmount1('')
+      setInitPrice('')
+      setMintSwapOpen(false)
+      setSwapAmount('')
+      setSwapQuote(null)
+      setRpcInput(loadCustomRpcUrl(nextId) ?? '')
+      setActiveRpcLabel(describeActiveRpc(nextId))
+      setRpcLatency(null)
+      setRpcBlock(null)
+      setStatusHash(null)
+      setStatus(`已切换到 ${cfg.label}`)
+      if (address) {
+        try {
+          // 只在钱包切网时短暂 busy，不因刷新锁整页
+          setBusy(true)
+          await ensureActiveChain()
+          setWallet(makeWalletClient(address))
+        } catch (e) {
+          setStatus(
+            `应用已切到 ${cfg.label}，请在钱包中切换网络后点连接：${e instanceof Error ? e.message : String(e)}`,
+          )
+          return
+        } finally {
+          setBusy(false)
+        }
+        setStatus(`已切换到 ${cfg.label}，正在刷新仓位…`)
+        void refreshPositions({ silent: false })
+      }
+    } catch (e) {
+      setBusy(false)
+      setStatus(e instanceof Error ? e.message : String(e))
+    }
+  }
 
   useEffect(() => {
     if (address) void refreshPositions({ silent: true })
@@ -1589,13 +1624,16 @@ export default function App() {
         detail: pair,
         href: hash ? explorerTx(hash) : undefined,
       })
-      try {
-        await withTimeout(refreshPositions({ silent: true }), 45_000, '刷新仓位')
-        if (address) await withTimeout(refreshBalances(address), 20_000, '刷新余额')
-      } catch (e) {
-        console.warn('post-tx refresh failed', e)
-      }
       opts?.afterSuccess?.()
+      // 后台刷新，不占用 busy，避免交易成功后按钮还锁几十秒
+      void (async () => {
+        try {
+          await withTimeout(refreshPositions({ silent: true }), 45_000, '刷新仓位')
+          if (address) await withTimeout(refreshBalances(address), 20_000, '刷新余额')
+        } catch (e) {
+          console.warn('post-tx refresh failed', e)
+        }
+      })()
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       const cancelled = /user rejected|denied|已取消/i.test(msg)
@@ -2670,7 +2708,6 @@ export default function App() {
               className="chain-select"
               aria-label="网络"
               value={chainId}
-              disabled={busy || refreshing}
               onChange={(e) => void onSwitchChain(Number(e.target.value) as SupportedChainId)}
             >
               {SUPPORTED_CHAINS.map((c) => (
@@ -2698,17 +2735,15 @@ export default function App() {
                 </div>
                 <div className="btn-split">
                   <button
-                    className="btn"
-                    disabled={refreshing}
-                    title="刷新仓位（快捷键 R）"
+                    className={`btn ${refreshing ? 'active' : ''}`}
+                    title={refreshing ? '刷新进行中，再次点击将重新开始' : '刷新仓位（快捷键 R）'}
                     onClick={() => void refreshPositions({ silent: false })}
                   >
                     {refreshing ? '刷新中…' : '刷新'}
                   </button>
                   <button
                     className="btn"
-                    disabled={refreshing}
-                    title="深度扫描：扩大回溯 + ownerOf 校验，较慢"
+                    title={refreshing ? '深度扫描将覆盖当前刷新' : '深度扫描：扩大回溯 + ownerOf 校验，较慢'}
                     onClick={() => void refreshPositions({ silent: false, deep: true })}
                   >
                     深度
@@ -2870,8 +2905,9 @@ export default function App() {
             <div className="pos-page-actions">
               <button
                 type="button"
-                className="btn primary"
-                disabled={!address || refreshing}
+                className={`btn primary ${refreshing ? 'active' : ''}`}
+                disabled={!address}
+                title={refreshing ? '刷新进行中，再次点击将重新开始' : undefined}
                 onClick={() => void refreshPositions()}
               >
                 {refreshing ? '刷新中…' : '刷新仓位'}
