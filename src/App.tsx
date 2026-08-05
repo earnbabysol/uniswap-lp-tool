@@ -809,10 +809,6 @@ export default function App() {
     }
   }
 
-  /** 递增可使进行中的刷新结果全部作废（切链 / 重新刷新） */
-  const refreshGenRef = useRef(0)
-  const refreshingRef = useRef(false)
-
   const refreshPositions = useCallback(async (opts?: { silent?: boolean; deep?: boolean }) => {
     if (!address) return []
     // 设计模式下仓位是写死的夹具，真去链上拉一遍只会把它们冲掉
@@ -839,6 +835,10 @@ export default function App() {
     /** 本轮拿到的完整快照，给自动化用（两侧都失败时为空） */
     let merged: PositionRow[] = []
     try {
+      // 让出主线程一帧，避免刷新一启动就卡死下拉框点击
+      await new Promise<void>((r) => setTimeout(r, 0))
+      if (!stillCurrent()) return []
+
       const onV4Status = silent
         ? undefined
         : (msg: string) => {
@@ -964,7 +964,7 @@ export default function App() {
     return merged
   }, [address, refreshBalances])
 
-  const onSwitchChain = async (nextId: SupportedChainId) => {
+  const onSwitchChain = (nextId: SupportedChainId) => {
     if (nextId === chainId) return
     // 立刻作废进行中的刷新，避免旧链结果写回新链
     refreshGenRef.current += 1
@@ -994,23 +994,37 @@ export default function App() {
       setRpcLatency(null)
       setRpcBlock(null)
       setStatusHash(null)
+      setBusy(false)
       setStatus(`已切换到 ${cfg.label}`)
+
+      // 应用内立刻切链；钱包弹窗 / 刷新都后台跑，绝不 await 卡住下拉框
       if (address) {
-        try {
-          // 只在钱包切网时短暂 busy，不因刷新锁整页
-          setBusy(true)
-          await ensureActiveChain()
-          setWallet(makeWalletClient(address))
-        } catch (e) {
-          setStatus(
-            `应用已切到 ${cfg.label}，请在钱包中切换网络后点连接：${e instanceof Error ? e.message : String(e)}`,
-          )
-          return
-        } finally {
-          setBusy(false)
+        if (signerMode === 'local') {
+          try {
+            setWallet(makeLocalWalletClient().walletClient)
+          } catch {
+            /* 未解锁则仅切应用链 */
+          }
+          setStatus(`已切换到 ${cfg.label}，正在刷新仓位…`)
+          void refreshPositions({ silent: false })
+        } else if (signerMode === 'wallet' && window.ethereum) {
+          setStatus(`已切换到 ${cfg.label}，请在钱包确认网络（可继续点别的）…`)
+          void ensureActiveChain()
+            .then(() => {
+              setWallet(makeWalletClient(address))
+              setStatus(`已切换到 ${cfg.label}，正在刷新仓位…`)
+              void refreshPositions({ silent: false })
+            })
+            .catch((e) => {
+              setStatus(
+                `应用已切到 ${cfg.label}，请在钱包切换到该网后点刷新：${e instanceof Error ? e.message : String(e)}`,
+              )
+              // 即便钱包未切，也用新链 RPC 试刷只读数据
+              void refreshPositions({ silent: false })
+            })
+        } else {
+          void refreshPositions({ silent: false })
         }
-        setStatus(`已切换到 ${cfg.label}，正在刷新仓位…`)
-        void refreshPositions({ silent: false })
       }
     } catch (e) {
       setBusy(false)
@@ -2708,7 +2722,8 @@ export default function App() {
               className="chain-select"
               aria-label="网络"
               value={chainId}
-              onChange={(e) => void onSwitchChain(Number(e.target.value) as SupportedChainId)}
+              title="随时可切换；刷新中切换会取消旧刷新"
+              onChange={(e) => onSwitchChain(Number(e.target.value) as SupportedChainId)}
             >
               {SUPPORTED_CHAINS.map((c) => (
                 <option key={c.id} value={c.id}>{c.label}</option>
@@ -2931,8 +2946,13 @@ export default function App() {
               <strong className={summary.feeAprPct != null ? 'ok-text' : ''}>{formatApr(summary.feeAprPct)}</strong>
             </div>
             <div>
-              <span className="sum-label">盈亏</span>
-              <strong className={summary.pnlUsd >= 0 ? 'ok-text' : 'bad-text'}>{formatPnl(summary.pnlUsd)}</strong>
+              <span className="sum-label">
+                盈亏
+                <InfoHint text="现价本金 + 未领手续费 + 已领手续费 − 净存入。净存入在扫到存取事件时按当时币价锁定。山寨币若记账时池价失真，盈亏会偏大；不是钱包里的已实现盈亏。" />
+              </span>
+              <strong className={summary.pnlUsd >= 0 ? 'ok-text' : 'bad-text'}>
+                {positions.some((p) => p.pnlReady) ? formatPnl(summary.pnlUsd) : '—'}
+              </strong>
             </div>
             <div>
               <span className="sum-label">区间内</span>
@@ -3099,12 +3119,25 @@ export default function App() {
 
                     <div className="pc-hero">
                       <div className="pc-value">{formatUsd(p.totalUsd)}</div>
-                      <div className={`pc-pnl ${p.pnlUsd >= 0 ? 'up' : 'down'}`}>
-                        PnL {formatPnl(p.pnlUsd)}
-                        {p.costBasisUsd > 0 && (
-                          <span className="pc-pnl-pct">
-                            {' '}({p.pnlUsd >= 0 ? '+' : '−'}{Math.abs((p.pnlUsd / p.costBasisUsd) * 100).toFixed(1)}%)
-                          </span>
+                      <div
+                        className={`pc-pnl ${!p.pnlReady ? '' : p.pnlUsd >= 0 ? 'up' : 'down'}`}
+                        title={
+                          p.pnlReady
+                            ? `盈亏 = 现价本金 + 未领 + 已领 − 净存入(约 ${formatUsd(p.costBasisUsd)})`
+                            : '正在根据链上存取记录计算盈亏…'
+                        }
+                      >
+                        {p.pnlReady ? (
+                          <>
+                            盈亏 {formatPnl(p.pnlUsd)}
+                            {p.costBasisUsd > 0 && (
+                              <span className="pc-pnl-pct">
+                                {' '}({p.pnlUsd >= 0 ? '+' : '−'}{Math.abs((p.pnlUsd / p.costBasisUsd) * 100).toFixed(1)}%)
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          <span className="muted">盈亏 —</span>
                         )}
                       </div>
                       <div className="pc-fee-line">

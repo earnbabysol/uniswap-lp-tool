@@ -62,7 +62,8 @@ export function PositionDetailCard({
   // 已存入 = 锁定成本，勿回退到持仓市值（否则会随币价飘）
   const deposited = p.costBasisUsd > 0 ? p.costBasisUsd : 0
   const pnlBasis = Math.max(p.costBasisUsd, principalUsd, 1e-9)
-  const pnlPct = formatPnlPct(p.pnlUsd, pnlBasis)
+  const pnlReady = Boolean(p.pnlReady) && (p.costBasisUsd > 0 || Math.abs(p.pnlUsd) > 1e-9)
+  const pnlPct = pnlReady ? formatPnlPct(p.pnlUsd, pnlBasis) : ''
   const pnlUp = p.pnlUsd >= 0
 
   const lo = cq.coinPriceLower
@@ -126,9 +127,17 @@ export function PositionDetailCard({
       )}
 
       <div className="pdc-badges">
-        <span className={`pdc-badge pnl ${pnlUp ? 'up' : 'down'}`}>
-          {pnlUp ? '▲' : '▼'} {formatPnlAmount(p.pnlUsd)}
-          {pnlPct ? ` (${pnlPct})` : ''}
+        <span
+          className={`pdc-badge pnl ${!pnlReady ? '' : pnlUp ? 'up' : 'down'}`}
+          title={
+            pnlReady
+              ? `盈亏 = 现价本金 + 未领 + 已领 − 净存入。净存入约 $${deposited.toFixed(2)}（扫链锁定，山寨币池价失真时会偏）`
+              : '补扫存取记录后显示盈亏'
+          }
+        >
+          {pnlReady
+            ? `${pnlUp ? '▲' : '▼'} ${formatPnlAmount(p.pnlUsd)}${pnlPct ? ` (${pnlPct})` : ''}`
+            : '盈亏 —'}
         </span>
         <span className={`pdc-badge range ${p.inRange ? 'in' : 'out'}`}>
           <i className="pdc-dot" />
@@ -213,7 +222,7 @@ export function PositionDetailCard({
           <span className="pdc-v ok">{formatUsd(p.totalFeesUsd)}</span>
         </div>
         <div className="pdc-stat">
-          <span className="pdc-k" title="净存入成本：存入−取出，按发现增量时价格锁定，不随市值重估">已存入</span>
+          <span className="pdc-k" title="净存入 = 链上存入−取出的代币，按记账时币价换成 USD 后锁定。盈亏用它做成本，不是钱包已实现盈亏。">已存入</span>
           <span className="pdc-v">{deposited > 0 ? formatUsd(deposited) : '—'}</span>
         </div>
         <div className="pdc-stat">

@@ -150,8 +150,13 @@ export type PositionRow = {
    * 已存入净成本 USD（锁定）：Σ存入估值 − Σ取出估值；增量按事件发现时价格计入，不随市价飘。
    */
   costBasisUsd: number
-  /** PnL = 当前本金(现价) + 未领(现价) + 已领(锁定) + 已取出(锁定) − 存入(锁定) */
+  /**
+   * 盈亏 USD = 当前本金(现价) + 未领(现价) + 已领(锁定) − 净存入(锁定)。
+   * 净存入在首次扫到存取事件时按当时币价锁定；山寨币若当时池价失真会偏大。
+   */
   pnlUsd: number
+  /** 是否已用现金流/缓存算出可靠盈亏；未就绪时 UI 应显示 — 而非 0 */
+  pnlReady?: boolean
   /** 首次建仓时间（秒）；后台补扫得到，可能为空 */
   openedAt?: number
   /** 持仓天数 */
@@ -2097,6 +2102,15 @@ function mergeCachedLifetimeFees(
     ? clampUsd((cached.depositedUsd ?? 0) - (cached.withdrawnUsd ?? 0))
     : 0
   const costBasisUsd = row.costBasisUsd > 0 ? row.costBasisUsd : cachedCost
+  const principalUsd = clampUsd(row.amount0Usd + row.amount1Usd)
+  // 盈亏 = 现价本金 + 未领 + 已领 − 净存入（与 applyLockedCostBasis 同口径）
+  const pnlReady = costBasisUsd > 0 || Boolean(row.pnlReady)
+  const pnlUsd = pnlReady
+    ? (() => {
+        const raw = principalUsd + unclaimedFeesUsd + claimedFeesUsd - costBasisUsd
+        return Number.isFinite(raw) && Math.abs(raw) <= 1e11 ? raw : 0
+      })()
+    : 0
 
   const next: PositionRow = {
     ...row,
@@ -2105,6 +2119,8 @@ function mergeCachedLifetimeFees(
     claimedFeesUsd,
     totalFeesUsd: clampUsd(unclaimedFeesUsd + claimedFeesUsd),
     costBasisUsd,
+    pnlUsd,
+    pnlReady,
   }
 
   const prevLast0 = cached?.lastFees0 ?? ''
@@ -2186,6 +2202,8 @@ function applyLockedCostBasis(
   const pnlUsdRaw =
     principalUsd + unclaimedFeesUsd + merged.claimedFeesUsd + withdrawnUsd - depositedUsd
   const pnlUsd = Number.isFinite(pnlUsdRaw) && Math.abs(pnlUsdRaw) <= 1e11 ? pnlUsdRaw : 0
+  // 有可信流水，或已扫到非零存取，才标就绪；否则别拿 0 成本骗用户
+  const pnlReady = Boolean(cf.trusted) || depositedUsd > 0 || withdrawnUsd > 0 || costBasisUsd > 0
 
   writeFeeCacheEntry(key, {
     claimed0: merged.claimed0.toString(),
@@ -2207,6 +2225,7 @@ function applyLockedCostBasis(
     ...merged,
     costBasisUsd,
     pnlUsd,
+    pnlReady,
     totalFeesUsd: clampUsd(unclaimedFeesUsd + merged.claimedFeesUsd),
   }
 }
