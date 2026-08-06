@@ -133,6 +133,13 @@ import {
   type ConfirmRequest,
 } from './ui'
 import { TokenPicker, type TokenOption } from './TokenPicker'
+import FlowMonitor from './FlowMonitor'
+import type { FlowChainId, FlowVersion } from './flowEvents'
+import {
+  describeGraphApiKey,
+  loadGraphApiKey,
+  saveGraphApiKey,
+} from './graphSettings'
 import './App.css'
 import './signer.css'
 
@@ -140,7 +147,7 @@ type SortKey = 'value' | 'fees' | 'pnl' | 'pair' | 'apr' | 'risk'
 type FilterKey = 'all' | 'in' | 'out' | 'v3' | 'v4' | 'risk'
 type RangeMode = 'percent' | 'custom' | 'full'
 type Density = 'cozy' | 'compact'
-type TabKey = 'positions' | 'mint' | 'tools' | 'auto' | 'history'
+type TabKey = 'positions' | 'mint' | 'tools' | 'auto' | 'history' | 'flow'
 
 const REFRESH_OPTIONS = [30, 60, 180, 600] as const
 
@@ -151,6 +158,7 @@ const NAV_ITEMS: { key: TabKey; label: string; icon: string; hotkey: string; blu
   { key: 'tools', label: '工具', icon: '⚒', hotkey: '3', blurb: '批量操作与链上辅助查询' },
   { key: 'auto', label: '自动化', icon: '◈', hotkey: '4', blurb: '本地私钥签名与自动复投 / Rebalance' },
   { key: 'history', label: '交易历史', icon: '⇅', hotkey: '5', blurb: '本机记录的交易与浏览器链接' },
+  { key: 'flow', label: '动向', icon: '↗', hotkey: '6', blurb: 'BSC / Robinhood 大额开仓与撤出' },
 ]
 
 function formatPnl(n: number): string {
@@ -395,6 +403,8 @@ export default function App() {
   const [rpcLatency, setRpcLatency] = useState<number | null>(null)
   const [rpcBlock, setRpcBlock] = useState<bigint | null>(null)
   const [rpcBusy, setRpcBusy] = useState(false)
+  const [graphKeyInput, setGraphKeyInput] = useState(() => loadGraphApiKey() ?? '')
+  const [graphKeyLabel, setGraphKeyLabel] = useState(() => describeGraphApiKey())
   const [chainId, setChainId] = useState<SupportedChainId>(() => getActiveChainId())
   const chainCfg = getActiveChainConfig()
 
@@ -809,6 +819,19 @@ export default function App() {
     }
   }
 
+  const saveGraphKey = () => {
+    try {
+      const saved = saveGraphApiKey(graphKeyInput)
+      setGraphKeyInput(saved ?? '')
+      setGraphKeyLabel(describeGraphApiKey())
+      setStatus(saved ? '已保存 The Graph API Key' : '已清除 The Graph API Key')
+      setStatusHash(null)
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : String(e))
+      setStatusHash(null)
+    }
+  }
+
   const refreshPositions = useCallback(async (opts?: { silent?: boolean; deep?: boolean }) => {
     if (!address) return []
     // 设计模式下仓位是写死的夹具，真去链上拉一遍只会把它们冲掉
@@ -1032,6 +1055,48 @@ export default function App() {
     }
   }
 
+  const openFlowPool = async (args: {
+    chainId: FlowChainId
+    version: FlowVersion
+    poolAddress?: Address
+    poolId?: `0x${string}`
+  }) => {
+    if (args.chainId !== getActiveChainId()) {
+      onSwitchChain(args.chainId)
+    }
+    setTab('mint')
+    setMintProtocol(args.version)
+    const ref = args.version === 'v4' ? args.poolId : args.poolAddress
+    if (!ref) {
+      setStatus('动向条目缺少池引用')
+      return
+    }
+    setPoolInput(ref)
+    setBusy(true)
+    setStatus(`从动向加载 ${args.version.toUpperCase()} 池 ${shortAddr(ref)}…`)
+    try {
+      const info =
+        args.version === 'v4'
+          ? await loadV4PoolById(args.poolId!)
+          : await loadV3Pool(args.poolAddress!)
+      setDiscovered(null)
+      setPool(info)
+      const q = getCoinQuote(info)
+      setTokenA(q.coin.address)
+      setTokenB(q.quote.address)
+      setFee(info.fee)
+      if (args.version === 'v4' && info.tickSpacing) setV4TickSpacing(info.tickSpacing)
+      applyDefaultCoinRange(info, setPriceLo, setPriceHi)
+      setStatus(
+        `已从动向加载 ${args.version.toUpperCase()} · ${q.coin.symbol}/${q.quote.symbol} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`,
+      )
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   useEffect(() => {
     if (address) void refreshPositions({ silent: true })
   }, [address]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -1119,6 +1184,7 @@ export default function App() {
       else if (e.key === '3') setTab('tools')
       else if (e.key === '4') setTab('auto')
       else if (e.key === '5') setTab('history')
+      else if (e.key === '6') setTab('flow')
       else if (e.key === 'r' || e.key === 'R') {
         if (address) void refreshPositions({ silent: false })
       } else if (e.key === '/') {
@@ -2889,8 +2955,36 @@ export default function App() {
         </p>
       </div>
 
+      <div className="rpc-panel">
+        <div className="rpc-panel-head">
+          <strong>The Graph API Key</strong>
+          <span className="muted">{graphKeyLabel}</span>
+        </div>
+        <div className="rpc-panel-row">
+          <input
+            className="rpc-input mono"
+            type="password"
+            autoComplete="off"
+            value={graphKeyInput}
+            placeholder="可选 · Studio → API Keys"
+            onChange={(e) => setGraphKeyInput(e.target.value)}
+          />
+          <button className="btn primary" type="button" onClick={saveGraphKey}>
+            保存
+          </button>
+        </div>
+        <p className="rpc-panel-note muted">
+          可选。有效 Gateway Key 可加速 BSC 动向；不填或 Key 无效时自动改用链上扫描，功能不受影响。申请：
+          {' '}
+          <a href="https://thegraph.com/studio/apikeys/" target="_blank" rel="noreferrer">
+            The Graph Studio → API Keys
+          </a>
+          （不是 Deploy Key）。留空保存即清除。
+        </p>
+      </div>
+
       <p className="shortcut-hint muted">
-        快捷键：<kbd>1</kbd>–<kbd>5</kbd> 切换标签 · <kbd>R</kbd> 刷新 · <kbd>/</kbd> 搜索仓位 · <kbd>Esc</kbd> 收起详情
+        快捷键：<kbd>1</kbd>–<kbd>6</kbd> 切换标签 · <kbd>R</kbd> 刷新 · <kbd>/</kbd> 搜索仓位 · <kbd>Esc</kbd> 收起详情
       </p>
       </div>
       </>
@@ -5330,6 +5424,8 @@ export default function App() {
           )}
         </section>
       )}
+
+      {tab === 'flow' && <FlowMonitor onOpenPool={(args) => void openFlowPool(args)} />}
 
       {/*
        * 页脚。原来是两个裸 <p> 顺着往下堆，灰字挂在一片空白里，是全站最像

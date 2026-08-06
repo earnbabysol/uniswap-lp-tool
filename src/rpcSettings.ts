@@ -1,5 +1,5 @@
 import {
-  getActiveChainConfig,
+  CHAIN_CONFIGS,
   getActiveChainId,
   type SupportedChainId,
 } from './chain'
@@ -7,7 +7,10 @@ import {
 const CHAIN_KEY_PREFIX = 'rangedesk.customRpc.v1.'
 
 export function defaultRpcUrl(chainId: SupportedChainId = getActiveChainId()): string {
-  const fromCfg = getActiveChainConfig().defaultRpcUrls[0]
+  // 这里必须按传入的 chainId 取配置。动向页会同时读取两条链；若使用当前 UI
+  // 活跃链，BSC client 可能实际连到 Robinhood RPC（反之亦然），且普通读请求
+  // 仍会“成功”，导致 fallback 永远不会纠正到目标链。
+  const fromCfg = CHAIN_CONFIGS[chainId].defaultRpcUrls[0]
   if (fromCfg) return fromCfg
   if (chainId === 1) return 'https://ethereum.publicnode.com'
   if (chainId === 196) return 'https://xlayerrpc.okx.com'

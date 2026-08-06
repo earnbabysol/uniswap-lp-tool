@@ -230,7 +230,8 @@ const BSC_CONTRACTS: ChainContracts = {
   v4StateView: '0xd13dd3d6e93f276fafc9db9e6bb47c1180aee0c4',
   v4Quoter: '0x9f75dd27d6664c475b90e105573e550ff69437b0',
   permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
-  universalRouter: '0x1906c1d672b88cd1b9ac7593301ca990f94eae07',
+  // Uniswap contracts/deployments/56.md，2025-11-20 更新的 Universal Router
+  universalRouter: '0x91bf3bfaef8d771a74e1a8fe460b3ee646b2e588',
 }
 
 /** Binance-Peg USDT（BSC 上常用） */
