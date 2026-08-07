@@ -533,7 +533,9 @@ export default function App() {
     const feesUsd = positions.reduce((s, p) => s + p.totalFeesUsd, 0)
     const unclaimedUsd = positions.reduce((s, p) => s + p.fees0Usd + p.fees1Usd, 0)
     const claimedUsd = positions.reduce((s, p) => s + p.claimedFeesUsd, 0)
-    const pnlUsd = positions.reduce((s, p) => s + p.pnlUsd, 0)
+    const pnlRows = positions.filter((p) => p.pnlReady)
+    const pnlUsd = pnlRows.reduce((s, p) => s + p.pnlUsd, 0)
+    const pnlEstimated = pnlRows.filter((p) => p.pnlQuality === 'estimated').length
     const inRange = positions.filter((p) => p.inRange).length
     const atRisk = positions.filter((p) => {
       const r = riskLevel(p)
@@ -550,7 +552,12 @@ export default function App() {
       aprSum += p.feeAprPct * w
     }
     const feeAprPct = aprWeight > 0 ? aprSum / aprWeight : undefined
-    return { totalUsd, feesUsd, unclaimedUsd, claimedUsd, pnlUsd, inRange, atRisk, feeAprPct, n: positions.length }
+    return {
+      totalUsd, feesUsd, unclaimedUsd, claimedUsd, pnlUsd, inRange, atRisk, feeAprPct,
+      pnlReady: pnlRows.length,
+      pnlEstimated,
+      n: positions.length,
+    }
   }, [positions])
 
   const poolFeeSummaries = useMemo(() => aggregateFeesByPool(positions), [positions])
@@ -620,13 +627,14 @@ export default function App() {
     }
     const head = [
       '协议', 'tokenId', '交易对', '费率', '状态', '价值USD', '未领手续费USD', '已领手续费USD',
-      '累计手续费USD', '成本USD', 'PnL USD', '手续费年化%', '持仓天数', '下界', '上界', '当前价', '距边界%',
+      '累计手续费USD', '累计投入USD', '累计收回USD', 'PnL USD', 'PnL口径', '手续费年化%', '持仓天数', '下界', '上界', '当前价', '距边界%',
     ]
     const rows = filteredPositions.map((p) => [
       p.version.toUpperCase(), p.tokenId.toString(), `${p.token0.symbol}/${p.token1.symbol}`,
       `${p.fee / 10_000}%`, p.inRange ? 'in range' : 'out of range',
       p.totalUsd.toFixed(2), (p.fees0Usd + p.fees1Usd).toFixed(2), p.claimedFeesUsd.toFixed(2),
-      p.totalFeesUsd.toFixed(2), p.costBasisUsd.toFixed(2), p.pnlUsd.toFixed(2),
+      p.totalFeesUsd.toFixed(2), p.costBasisUsd.toFixed(2), (p.cashOutUsd ?? 0).toFixed(2),
+      p.pnlReady ? p.pnlUsd.toFixed(2) : '', p.pnlQuality ?? 'unavailable',
       p.feeAprPct == null ? '' : p.feeAprPct.toFixed(2),
       p.ageDays == null ? '' : p.ageDays.toFixed(2),
       formatPrice(p.priceLower), formatPrice(p.priceUpper), formatPrice(p.price),
@@ -3042,11 +3050,17 @@ export default function App() {
             <div>
               <span className="sum-label">
                 盈亏
-                <InfoHint text="现价本金 + 未领手续费 + 已领手续费 − 净存入。净存入在扫到存取事件时按当时币价锁定。山寨币若记账时池价失真，盈亏会偏大；不是钱包里的已实现盈亏。" />
+                <InfoHint text="当前仓位资产（本金 + 可领取）+ 累计 Collect 收回 − 累计 Increase 投入。V3 的 Decrease 只把本金移入可领取余额，不会提前当作回款；复投的 Collect 与 Increase 会相互抵消。该口径不含 gas，也不追踪资产离开仓位后的钱包涨跌。" />
               </span>
               <strong className={summary.pnlUsd >= 0 ? 'ok-text' : 'bad-text'}>
-                {positions.some((p) => p.pnlReady) ? formatPnl(summary.pnlUsd) : '—'}
+                {summary.pnlReady > 0 ? formatPnl(summary.pnlUsd) : '—'}
               </strong>
+              {summary.n > 0 && (
+                <span className="sum-sub muted">
+                  {summary.pnlReady}/{summary.n} 已完成
+                  {summary.pnlEstimated > 0 ? ` · ${summary.pnlEstimated} 个估算` : ''}
+                </span>
+              )}
             </div>
             <div>
               <span className="sum-label">区间内</span>
@@ -3217,8 +3231,8 @@ export default function App() {
                         className={`pc-pnl ${!p.pnlReady ? '' : p.pnlUsd >= 0 ? 'up' : 'down'}`}
                         title={
                           p.pnlReady
-                            ? `盈亏 = 现价本金 + 未领 + 已领 − 净存入(约 ${formatUsd(p.costBasisUsd)})`
-                            : '正在根据链上存取记录计算盈亏…'
+                            ? `盈亏 = 当前资产 ${formatUsd(p.totalUsd)} + 累计收回 ${formatUsd(p.cashOutUsd ?? 0)} − 累计投入 ${formatUsd(p.costBasisUsd)}。${p.pnlNote ?? ''}`
+                            : p.pnlNote ?? '正在根据链上现金流与历史价格计算盈亏…'
                         }
                       >
                         {p.pnlReady ? (
@@ -3227,6 +3241,7 @@ export default function App() {
                             {p.costBasisUsd > 0 && (
                               <span className="pc-pnl-pct">
                                 {' '}({p.pnlUsd >= 0 ? '+' : '−'}{Math.abs((p.pnlUsd / p.costBasisUsd) * 100).toFixed(1)}%)
+                                {' · '}{p.pnlQuality === 'historical' ? '历史价' : '估算'}
                               </span>
                             )}
                           </>
@@ -3240,6 +3255,9 @@ export default function App() {
                         ) : null}
                         <span>未领 {formatUsd(feeUsd)}</span>
                         <span>已领 {formatUsd(p.claimedFeesUsd)}</span>
+                        {((p.owedPrincipal0Usd ?? 0) + (p.owedPrincipal1Usd ?? 0)) > 0 && (
+                          <span>待收本金 {formatUsd((p.owedPrincipal0Usd ?? 0) + (p.owedPrincipal1Usd ?? 0))}</span>
+                        )}
                         {p.feeAprPct != null && <span>年化 {formatApr(p.feeAprPct)}</span>}
                       </div>
                     </div>
@@ -3317,7 +3335,7 @@ export default function App() {
                       v3Npm: pos.v3Npm,
                     })
                   const wethUsd = await getWethUsdPrice().catch(() => 0)
-                  const next = recordPositionClaim(pos, wethUsd)
+                  const next = recordPositionClaim(pos, wethUsd, 'collect')
                   setPositions((prev) => prev.map((p) =>
                     p.version === next.version && p.tokenId === next.tokenId ? next : p,
                   ))
@@ -3351,7 +3369,7 @@ export default function App() {
                       // 只要领取成功（不论复投是否成功），未领都应记入已领
                       if (result.claimHash) {
                         const wethUsd = await getWethUsdPrice().catch(() => 0)
-                        const next = recordPositionClaim(pos, wethUsd)
+                        const next = recordPositionClaim(pos, wethUsd, 'compound')
                         setPositions((prev) => prev.map((p) =>
                           p.version === next.version && p.tokenId === next.tokenId ? next : p,
                         ))

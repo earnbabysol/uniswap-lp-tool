@@ -57,12 +57,15 @@ export function PositionDetailCard({
   const usdRange = useMemo(() => getPositionUsdRange(p), [p])
   const unclaimedRaw = p.fees0 + p.fees1
   const hasUnclaimed = unclaimedRaw > 0n
+  const owedPrincipalRaw = (p.owedPrincipal0 ?? 0n) + (p.owedPrincipal1 ?? 0n)
+  const owedPrincipalUsd = (p.owedPrincipal0Usd ?? 0) + (p.owedPrincipal1Usd ?? 0)
+  const hasCollectable = hasUnclaimed || owedPrincipalRaw > 0n
   const unclaimedUsd = p.fees0Usd + p.fees1Usd
-  const principalUsd = p.amount0Usd + p.amount1Usd
-  // 已存入 = 锁定成本，勿回退到持仓市值（否则会随币价飘）
+  // 累计投入/收回均来自链上事件；勿回退到持仓市值（否则会随币价飘）
   const deposited = p.costBasisUsd > 0 ? p.costBasisUsd : 0
-  const pnlBasis = Math.max(p.costBasisUsd, principalUsd, 1e-9)
-  const pnlReady = Boolean(p.pnlReady) && (p.costBasisUsd > 0 || Math.abs(p.pnlUsd) > 1e-9)
+  const cashOut = p.cashOutUsd ?? 0
+  const pnlBasis = Math.max(p.costBasisUsd, 1e-9)
+  const pnlReady = Boolean(p.pnlReady)
   const pnlPct = pnlReady ? formatPnlPct(p.pnlUsd, pnlBasis) : ''
   const pnlUp = p.pnlUsd >= 0
 
@@ -131,12 +134,12 @@ export function PositionDetailCard({
           className={`pdc-badge pnl ${!pnlReady ? '' : pnlUp ? 'up' : 'down'}`}
           title={
             pnlReady
-              ? `盈亏 = 现价本金 + 未领 + 已领 − 净存入。净存入约 $${deposited.toFixed(2)}（扫链锁定，山寨币池价失真时会偏）`
-              : '补扫存取记录后显示盈亏'
+              ? `盈亏 = 当前资产 $${p.totalUsd.toFixed(2)} + 累计收回 $${cashOut.toFixed(2)} − 累计投入 $${deposited.toFixed(2)}。${p.pnlNote ?? ''}`
+              : p.pnlNote ?? '补扫完整现金流与历史价格后显示盈亏'
           }
         >
           {pnlReady
-            ? `${pnlUp ? '▲' : '▼'} ${formatPnlAmount(p.pnlUsd)}${pnlPct ? ` (${pnlPct})` : ''}`
+            ? `${pnlUp ? '▲' : '▼'} ${formatPnlAmount(p.pnlUsd)}${pnlPct ? ` (${pnlPct})` : ''} · ${p.pnlQuality === 'historical' ? '历史价' : '估算'}`
             : '盈亏 —'}
         </span>
         <span className={`pdc-badge range ${p.inRange ? 'in' : 'out'}`}>
@@ -213,6 +216,12 @@ export function PositionDetailCard({
           <span className="pdc-k">未领手续费</span>
           <span className="pdc-v ok">{formatUsd(unclaimedUsd)}</span>
         </div>
+        {owedPrincipalRaw > 0n && (
+          <div className="pdc-stat">
+            <span className="pdc-k" title="已执行 Decrease，但还留在 V3 Position Manager 中；它属于本金，不是手续费。">待 Collect 本金</span>
+            <span className="pdc-v">{formatUsd(owedPrincipalUsd)}</span>
+          </div>
+        )}
         <div className="pdc-stat">
           <span className="pdc-k" title="按领取时价格锁定，不随市值重估；未领仍用现价">已领手续费</span>
           <span className="pdc-v ok">{formatUsd(p.claimedFeesUsd)}</span>
@@ -222,8 +231,12 @@ export function PositionDetailCard({
           <span className="pdc-v ok">{formatUsd(p.totalFeesUsd)}</span>
         </div>
         <div className="pdc-stat">
-          <span className="pdc-k" title="净存入 = 链上存入−取出的代币，按记账时币价换成 USD 后锁定。盈亏用它做成本，不是钱包已实现盈亏。">已存入</span>
+          <span className="pdc-k" title="所有 Increase/加仓按事件时价格计入；复投也会同时形成一笔投入和一笔收回。">累计投入</span>
           <span className="pdc-v">{deposited > 0 ? formatUsd(deposited) : '—'}</span>
+        </div>
+        <div className="pdc-stat">
+          <span className="pdc-k" title="V3 只有 Collect 才算收回；Decrease 只是把本金移入可领取余额。">累计收回</span>
+          <span className="pdc-v">{pnlReady || cashOut > 0 ? formatUsd(cashOut) : '—'}</span>
         </div>
         <div className="pdc-stat">
           <span className="pdc-k">手续费年化</span>
@@ -254,11 +267,11 @@ export function PositionDetailCard({
         <button
           type="button"
           className="btn"
-          disabled={busy || !hasUnclaimed}
+          disabled={busy || !hasCollectable}
           onClick={onCollect}
-          title={!hasUnclaimed ? '暂无未领手续费' : undefined}
+          title={!hasCollectable ? '暂无可领取手续费或已减本金' : undefined}
         >
-          领取手续费
+          {owedPrincipalRaw > 0n ? '领取资产' : '领取手续费'}
         </button>
         <button
           type="button"

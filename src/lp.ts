@@ -55,6 +55,7 @@ import {
   tickToPrice,
 } from './math'
 import { fetchJson, withTimeout } from './async'
+import { buildV3AccountingLedger, computePositionPnlUsd } from './pnlAccounting'
 import { publicClient } from './wallet'
 import {
   registerV4Deps,
@@ -129,10 +130,15 @@ export type PositionRow = {
   amount1: bigint
   fees0: bigint
   fees1: bigint
+  /** V3 Decrease 后尚未 Collect、暂时混在 tokensOwed 里的本金；已计入 amount，不计入 fees。 */
+  owedPrincipal0?: bigint
+  owedPrincipal1?: bigint
   amount0Usd: number
   amount1Usd: number
   fees0Usd: number
   fees1Usd: number
+  owedPrincipal0Usd?: number
+  owedPrincipal1Usd?: number
   totalUsd: number
   pct0: number
   pct1: number
@@ -147,16 +153,22 @@ export type PositionRow = {
   /** 累计手续费 = 未领(现价) + 已领(锁定) */
   totalFeesUsd: number
   /**
-   * 已存入净成本 USD（锁定）：Σ存入估值 − Σ取出估值；增量按事件发现时价格计入，不随市价飘。
+   * 累计投入 USD：所有 Increase/加仓在事件发生时的 USD 估值。
+   * 复投会同时形成一笔收回和一笔投入，两腿在盈亏里相互抵消。
    */
   costBasisUsd: number
+  /** 累计收回 USD：V3 只在 Collect 真正转出时入账；Decrease 本身不算钱包现金流。 */
+  cashOutUsd?: number
   /**
-   * 盈亏 USD = 当前本金(现价) + 未领(现价) + 已领(锁定) − 净存入(锁定)。
-   * 净存入在首次扫到存取事件时按当时币价锁定；山寨币若当时池价失真会偏大。
+   * 盈亏 USD = 当前仓位资产(本金 + 可领取) + 累计收回 − 累计投入。
    */
   pnlUsd: number
   /** 是否已用现金流/缓存算出可靠盈亏；未就绪时 UI 应显示 — 而非 0 */
   pnlReady?: boolean
+  /** historical=逐事件历史池价；estimated=至少一笔退回现价/近似；unavailable=无法安全计价。 */
+  pnlQuality?: 'historical' | 'estimated' | 'unavailable'
+  /** 给 UI 的简短口径/降级原因。 */
+  pnlNote?: string
   /** 首次建仓时间（秒）；后台补扫得到，可能为空 */
   openedAt?: number
   /** 持仓天数 */
@@ -1596,6 +1608,331 @@ function tokenUsd(
   return clampUsd(usd)
 }
 
+const V3_SWAP_PRICE_EVENT = parseAbiItem(
+  'event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)',
+)
+const V4_SWAP_PRICE_EVENT = parseAbiItem(
+  'event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)',
+)
+
+type HistoricalPricePoint = {
+  price: number
+  sqrtPriceX96: bigint
+}
+
+type FlowValuation = {
+  usd: number
+  quality: 'historical' | 'estimated' | 'unavailable'
+}
+
+const historicalPriceMem = new Map<string, HistoricalPricePoint>()
+
+function historicalPriceKey(
+  kind: 'v3' | 'v4',
+  pool: string,
+  blockNumber: bigint,
+  beforeLogIndex?: number,
+): string {
+  return `${getActiveChainId()}-${kind}-${pool.toLowerCase()}-${blockNumber.toString()}-${beforeLogIndex ?? 'end'}`
+}
+
+/**
+ * 找事件发生前的 V3 池价。优先同区块 Swap 日志；其次 archive slot0；最后向前找最近 Swap。
+ * 公共 BSC / Robinhood RPC 常没有深 archive，因此日志回退是必要路径。
+ */
+async function historicalV3Price(
+  row: Pick<PositionRow, 'poolAddress' | 'token0' | 'token1'>,
+  blockNumber: bigint,
+  beforeLogIndex?: number,
+): Promise<HistoricalPricePoint | null> {
+  if (!row.poolAddress) return null
+  const key = historicalPriceKey('v3', row.poolAddress, blockNumber, beforeLogIndex)
+  if (historicalPriceMem.has(key)) return historicalPriceMem.get(key) ?? null
+  let hasLaterSameBlockSwap = false
+
+  const fromSwap = (log: {
+    args: { tick?: number; sqrtPriceX96?: bigint }
+  }): HistoricalPricePoint | null => {
+    const tick = Number(log.args.tick)
+    const sqrtPriceX96 = log.args.sqrtPriceX96 ?? 0n
+    const price = tickToPrice(tick, row.token0.decimals, row.token1.decimals)
+    return sqrtPriceX96 > 0n && price > 0 && Number.isFinite(price)
+      ? { price, sqrtPriceX96 }
+      : null
+  }
+
+  try {
+    const sameBlock = await publicClient.getLogs({
+      address: row.poolAddress,
+      event: V3_SWAP_PRICE_EVENT,
+      fromBlock: blockNumber,
+      toBlock: blockNumber,
+    })
+    const cutoff = beforeLogIndex ?? Number.MAX_SAFE_INTEGER
+    hasLaterSameBlockSwap = sameBlock.some(
+      (log) => (log.logIndex ?? Number.MAX_SAFE_INTEGER) >= cutoff,
+    )
+    const prior = sameBlock
+      .filter((log) => (log.logIndex ?? Number.MAX_SAFE_INTEGER) < cutoff)
+      .sort((a, b) => (b.logIndex ?? 0) - (a.logIndex ?? 0))[0]
+    if (prior) {
+      const point = fromSwap(prior)
+      if (point) {
+        historicalPriceMem.set(key, point)
+        return point
+      }
+    }
+  } catch {
+    /* archive / 向前日志继续兜底 */
+  }
+
+  try {
+    const archiveBlock = hasLaterSameBlockSwap && blockNumber > 0n ? blockNumber - 1n : blockNumber
+    const slot0 = await publicClient.readContract({
+      address: row.poolAddress,
+      abi: v3PoolAbi,
+      functionName: 'slot0',
+      blockNumber: archiveBlock,
+    })
+    const sqrtPriceX96 = slot0[0]
+    const tick = Number(slot0[1])
+    const price = tickToPrice(tick, row.token0.decimals, row.token1.decimals)
+    if (sqrtPriceX96 > 0n && price > 0 && Number.isFinite(price)) {
+      const point = { price, sqrtPriceX96 }
+      historicalPriceMem.set(key, point)
+      return point
+    }
+  } catch {
+    /* 公共节点常不保留深历史状态 */
+  }
+
+  let to = blockNumber > 0n ? blockNumber - 1n : 0n
+  const span = 2_000n
+  for (let i = 0; i < 12 && to >= 0n; i += 1) {
+    const from = to >= span - 1n ? to - span + 1n : 0n
+    try {
+      const logs = await publicClient.getLogs({
+        address: row.poolAddress,
+        event: V3_SWAP_PRICE_EVENT,
+        fromBlock: from,
+        toBlock: to,
+      })
+      const last = logs.sort((a, b) => {
+        if (a.blockNumber !== b.blockNumber) return a.blockNumber < b.blockNumber ? 1 : -1
+        return (b.logIndex ?? 0) - (a.logIndex ?? 0)
+      })[0]
+      if (last) {
+        const point = fromSwap(last)
+        if (point) {
+          historicalPriceMem.set(key, point)
+          return point
+        }
+      }
+    } catch {
+      /* 下一段；失败最终会降级为现价估算 */
+    }
+    if (from === 0n) break
+    to = from - 1n
+  }
+
+  return null
+}
+
+async function historicalV4Price(
+  row: Pick<PositionRow, 'poolId' | 'token0' | 'token1'>,
+  blockNumber: bigint,
+  beforeLogIndex?: number,
+): Promise<HistoricalPricePoint | null> {
+  if (!row.poolId) return null
+  const key = historicalPriceKey('v4', row.poolId, blockNumber, beforeLogIndex)
+  if (historicalPriceMem.has(key)) return historicalPriceMem.get(key) ?? null
+  let hasLaterSameBlockSwap = false
+
+  const fromSwap = (log: {
+    args: { tick?: number; sqrtPriceX96?: bigint }
+  }): HistoricalPricePoint | null => {
+    const tick = Number(log.args.tick)
+    const sqrtPriceX96 = log.args.sqrtPriceX96 ?? 0n
+    const price = tickToPrice(tick, row.token0.decimals, row.token1.decimals)
+    return sqrtPriceX96 > 0n && price > 0 && Number.isFinite(price)
+      ? { price, sqrtPriceX96 }
+      : null
+  }
+
+  try {
+    const sameBlock = await publicClient.getLogs({
+      address: CONTRACTS.v4PoolManager,
+      event: V4_SWAP_PRICE_EVENT,
+      args: { id: row.poolId },
+      fromBlock: blockNumber,
+      toBlock: blockNumber,
+    })
+    const cutoff = beforeLogIndex ?? Number.MAX_SAFE_INTEGER
+    hasLaterSameBlockSwap = sameBlock.some(
+      (log) => (log.logIndex ?? Number.MAX_SAFE_INTEGER) >= cutoff,
+    )
+    const prior = sameBlock
+      .filter((log) => (log.logIndex ?? Number.MAX_SAFE_INTEGER) < cutoff)
+      .sort((a, b) => (b.logIndex ?? 0) - (a.logIndex ?? 0))[0]
+    if (prior) {
+      const point = fromSwap(prior)
+      if (point) {
+        historicalPriceMem.set(key, point)
+        return point
+      }
+    }
+  } catch {
+    /* archive / 向前日志继续兜底 */
+  }
+
+  try {
+    const archiveBlock = hasLaterSameBlockSwap && blockNumber > 0n ? blockNumber - 1n : blockNumber
+    const slot0 = await publicClient.readContract({
+      address: CONTRACTS.v4StateView,
+      abi: v4StateViewAbi,
+      functionName: 'getSlot0',
+      args: [row.poolId],
+      blockNumber: archiveBlock,
+    })
+    const sqrtPriceX96 = slot0[0]
+    const tick = Number(slot0[1])
+    const price = tickToPrice(tick, row.token0.decimals, row.token1.decimals)
+    if (sqrtPriceX96 > 0n && price > 0 && Number.isFinite(price)) {
+      const point = { price, sqrtPriceX96 }
+      historicalPriceMem.set(key, point)
+      return point
+    }
+  } catch {
+    /* 公共节点常不保留深历史状态 */
+  }
+
+  let to = blockNumber > 0n ? blockNumber - 1n : 0n
+  const span = 2_000n
+  for (let i = 0; i < 12 && to >= 0n; i += 1) {
+    const from = to >= span - 1n ? to - span + 1n : 0n
+    try {
+      const logs = await publicClient.getLogs({
+        address: CONTRACTS.v4PoolManager,
+        event: V4_SWAP_PRICE_EVENT,
+        args: { id: row.poolId },
+        fromBlock: from,
+        toBlock: to,
+      })
+      const last = logs.sort((a, b) => {
+        if (a.blockNumber !== b.blockNumber) return a.blockNumber < b.blockNumber ? 1 : -1
+        return (b.logIndex ?? 0) - (a.logIndex ?? 0)
+      })[0]
+      if (last) {
+        const point = fromSwap(last)
+        if (point) {
+          historicalPriceMem.set(key, point)
+          return point
+        }
+      }
+    } catch {
+      /* 下一段 */
+    }
+    if (from === 0n) break
+    to = from - 1n
+  }
+
+  return null
+}
+
+let wethUsdReferenceCache: { chainId: number; pool: PoolInfo | null } | null = null
+
+async function getWethUsdReferencePool(): Promise<PoolInfo | null> {
+  if (!chainHasWrappedNative()) return null
+  const chainId = getActiveChainId()
+  if (wethUsdReferenceCache?.chainId === chainId) return wethUsdReferenceCache.pool
+  const fees = [500, 2500, 3000, 100, 10000]
+  let dexes = getV3DexFactories()
+  if (chainId === 56) {
+    dexes = [...dexes].sort((a, b) => Number(b.key === 'pancake') - Number(a.key === 'pancake'))
+  }
+  for (const fee of fees) {
+    for (const dex of dexes) {
+      for (const stable of getUsdStableAddresses()) {
+        const poolAddress = await findV3Pool(CONTRACTS.weth, stable, fee, dex.factory).catch(() => null)
+        if (!poolAddress) continue
+        const pool = await loadV3Pool(poolAddress).catch(() => null)
+        if (pool?.price && pool.price > 0) {
+          wethUsdReferenceCache = { chainId, pool }
+          return pool
+        }
+      }
+    }
+  }
+  wethUsdReferenceCache = { chainId, pool: null }
+  return null
+}
+
+async function wethUsdAtEvent(
+  row: Pick<PositionRow, 'token0' | 'token1' | 'poolAddress' | 'poolId'>,
+  poolPrice: number,
+  blockNumber: bigint,
+  beforeLogIndex: number | undefined,
+  currentWethUsd: number,
+): Promise<{ usd: number; historical: boolean }> {
+  const eth0 = isEthLikeCurrency(row.token0.address)
+  const eth1 = isEthLikeCurrency(row.token1.address)
+  if (!eth0 && !eth1) return { usd: currentWethUsd, historical: true }
+  if (eth0 && isUsdStable(row.token1.address) && poolPrice > 0) {
+    return { usd: clampUsd(poolPrice), historical: true }
+  }
+  if (eth1 && isUsdStable(row.token0.address) && poolPrice > 0) {
+    return { usd: clampUsd(1 / poolPrice), historical: true }
+  }
+
+  const ref = await getWethUsdReferencePool()
+  if (ref) {
+    const point = await historicalV3Price(ref, blockNumber, beforeLogIndex)
+    if (point) {
+      const usd = ref.token0.address.toLowerCase() === CONTRACTS.weth.toLowerCase()
+        ? point.price
+        : 1 / point.price
+      if (usd >= 0.01 && usd <= 100_000 && Number.isFinite(usd)) {
+        return { usd, historical: true }
+      }
+    }
+  }
+  return { usd: currentWethUsd, historical: false }
+}
+
+async function valueFlowAtEvent(opts: {
+  row: PositionRow
+  amount0: bigint
+  amount1: bigint
+  blockNumber: bigint
+  logIndex?: number
+  currentWethUsd: number
+}): Promise<FlowValuation> {
+  const { row, amount0, amount1, blockNumber, logIndex, currentWethUsd } = opts
+  if (amount0 === 0n && amount1 === 0n) return { usd: 0, quality: 'historical' }
+  const point = row.version === 'v3'
+    ? await historicalV3Price(row, blockNumber, logIndex)
+    : await historicalV4Price(row, blockNumber, logIndex)
+  const price = point?.price ?? row.price
+  const weth = await wethUsdAtEvent(row, price, blockNumber, logIndex, currentWethUsd)
+  const usd = clampUsd(
+    tokenUsd(row.token0.address, amount0, row.token0.decimals, price, row.token0.address, row.token1.address, weth.usd)
+    + tokenUsd(row.token1.address, amount1, row.token1.decimals, price, row.token0.address, row.token1.address, weth.usd),
+  )
+  if (!(usd > 0)) return { usd: 0, quality: 'unavailable' }
+  return {
+    usd,
+    quality: point && weth.historical ? 'historical' : 'estimated',
+  }
+}
+
+function combineValuationQuality(
+  values: FlowValuation[],
+): 'historical' | 'estimated' | 'unavailable' {
+  if (values.some((v) => v.quality === 'unavailable')) return 'unavailable'
+  if (values.some((v) => v.quality === 'estimated')) return 'estimated'
+  return 'historical'
+}
+
 /**
  * 未领手续费：先模拟 decreaseLiquidity(0)+collect（最准），
  * 失败再回退 feeGrowth 计算。仅 tokensOwed 不会随交易增长。
@@ -1780,12 +2117,27 @@ async function computeV4Fees(opts: {
 }
 
 type Cashflow = {
+  /** 所有加仓数量（含复投）；复投必须与同笔 Collect 同时入账，不能只留一条腿。 */
   deposited0: bigint
   deposited1: bigint
+  /** Decrease 产生的本金债权；V3 中它尚未离开 NPM，不能直接当已收回。 */
   withdrawn0: bigint
   withdrawn1: bigint
+  /** 真正通过 Collect/结算离开仓位的全部数量（本金 + 手续费）。 */
+  collected0: bigint
+  collected1: bigint
+  /** 按事件顺序拆分后，仍混在当前可领取数量里的已减本金。 */
+  outstandingPrincipal0: bigint
+  outstandingPrincipal1: bigint
+  /** 已领取手续费数量（不含 Collect 取回的本金）。 */
   claimed0: bigint
   claimed1: bigint
+  /** 逐事件计价；没有可用历史价时为 undefined。 */
+  depositedUsd?: number
+  collectedUsd?: number
+  claimedFeesUsd?: number
+  valuation?: 'historical' | 'estimated' | 'unavailable'
+  valuationNote?: string
   /** 首次建仓所在区块，用于算持仓时长 / 手续费年化 */
   openedAtBlock?: bigint
   /**
@@ -1866,12 +2218,10 @@ export function computeFeeApr(opts: {
 }
 
 /**
- * 已领 / 已存入成本缓存。
- * v7：修复 RPC+浏览器日志重复计入导致「已存入」只增不减；复投 Increase 不再算存入。
- * v6：USD 增量锁定（已被重复日志污染的本地缓存需升级清掉）。
+ * 已领 / 现金流缓存。
+ * v8：改为「所有 Increase = 投入、所有 Collect = 收回」，并隔离 v7 的现价重锚定错误数据。
  */
-const FEE_CACHE_KEY = 'uniswap-lp-lifetime-fees-v7'
-const FEE_CACHE_KEY_LEGACY = 'uniswap-lp-lifetime-fees-v6'
+const FEE_CACHE_KEY = 'uniswap-lp-lifetime-fees-v8'
 
 type FeeCacheEntry = {
   claimed0: string
@@ -1883,7 +2233,10 @@ type FeeCacheEntry = {
   withdrawn0: string
   withdrawn1: string
   depositedUsd: number
+  /** 字段名沿用旧结构；v8 起表示 Collect/结算的累计收回 USD。 */
   withdrawnUsd: number
+  pnlQuality?: 'historical' | 'estimated' | 'unavailable'
+  pnlNote?: string
   lastFees0: string
   lastFees1: string
   awaitFeeClear?: boolean
@@ -1908,47 +2261,10 @@ function parseCacheBigint(s: string | undefined): bigint {
   }
 }
 
-function migrateLegacyFeeCache(): Record<string, FeeCacheEntry> {
-  try {
-    if (localStorage.getItem(FEE_CACHE_KEY)) return {}
-    const raw = localStorage.getItem(FEE_CACHE_KEY_LEGACY)
-    if (!raw) return {}
-    const parsed = JSON.parse(raw) as Record<string, Partial<FeeCacheEntry>>
-    if (!parsed || typeof parsed !== 'object') return {}
-    const out: Record<string, FeeCacheEntry> = {}
-    for (const [k, v] of Object.entries(parsed)) {
-      if (v?.claimed0 == null || v?.claimed1 == null) continue
-      out[k] = {
-        claimed0: v.claimed0,
-        claimed1: v.claimed1,
-        claimedUsd: typeof v.claimedUsd === 'number' ? v.claimedUsd : 0,
-        deposited0: '0',
-        deposited1: '0',
-        withdrawn0: '0',
-        withdrawn1: '0',
-        depositedUsd: 0,
-        withdrawnUsd: 0,
-        lastFees0: v.lastFees0 ?? '',
-        lastFees1: v.lastFees1 ?? '',
-        awaitFeeClear: Boolean(v.awaitFeeClear),
-        updatedAt: v.updatedAt ?? 0,
-      }
-    }
-    localStorage.setItem(FEE_CACHE_KEY, JSON.stringify(out))
-    return out
-  } catch {
-    return {}
-  }
-}
-
 function readFeeCache(): Record<string, FeeCacheEntry> {
   try {
     const raw = localStorage.getItem(FEE_CACHE_KEY)
-    if (!raw) {
-      const migrated = migrateLegacyFeeCache()
-      if (Object.keys(migrated).length) return migrated
-      return {}
-    }
+    if (!raw) return {}
     const parsed = JSON.parse(raw) as Record<string, Partial<FeeCacheEntry>>
     if (!parsed || typeof parsed !== 'object') return {}
     const out: Record<string, FeeCacheEntry> = {}
@@ -1964,6 +2280,8 @@ function readFeeCache(): Record<string, FeeCacheEntry> {
         withdrawn1: v.withdrawn1 ?? '0',
         depositedUsd: typeof v.depositedUsd === 'number' ? v.depositedUsd : 0,
         withdrawnUsd: typeof v.withdrawnUsd === 'number' ? v.withdrawnUsd : 0,
+        pnlQuality: v.pnlQuality,
+        pnlNote: typeof v.pnlNote === 'string' ? v.pnlNote : undefined,
         lastFees0: v.lastFees0 ?? '',
         lastFees1: v.lastFees1 ?? '',
         awaitFeeClear: Boolean(v.awaitFeeClear),
@@ -2097,17 +2415,16 @@ function mergeCachedLifetimeFees(
     allowDown,
   })
 
-  // 若缓存已有成本锁定，刷新时先带上，避免闪回 0 / 持仓市值
-  const cachedCost = cached
-    ? clampUsd((cached.depositedUsd ?? 0) - (cached.withdrawnUsd ?? 0))
-    : 0
-  const costBasisUsd = row.costBasisUsd > 0 ? row.costBasisUsd : cachedCost
+  // 首屏先复用 v8 的完整账本，后台扫完后再用链上事件校正。
+  const costBasisUsd = row.costBasisUsd > 0 ? row.costBasisUsd : clampUsd(cached?.depositedUsd ?? 0)
+  const cashOutUsd = row.cashOutUsd != null ? row.cashOutUsd : clampUsd(cached?.withdrawnUsd ?? 0)
   const principalUsd = clampUsd(row.amount0Usd + row.amount1Usd)
-  // 盈亏 = 现价本金 + 未领 + 已领 − 净存入（与 applyLockedCostBasis 同口径）
-  const pnlReady = costBasisUsd > 0 || Boolean(row.pnlReady)
+  // 已领手续费已包含在 Collect 现金流里，不能再单独加一次。
+  const pnlQuality = row.pnlQuality ?? cached?.pnlQuality ?? 'unavailable'
+  const pnlReady = pnlQuality !== 'unavailable' && (costBasisUsd > 0 || Boolean(row.pnlReady))
   const pnlUsd = pnlReady
     ? (() => {
-        const raw = principalUsd + unclaimedFeesUsd + claimedFeesUsd - costBasisUsd
+        const raw = computePositionPnlUsd(principalUsd + unclaimedFeesUsd, cashOutUsd, costBasisUsd)
         return Number.isFinite(raw) && Math.abs(raw) <= 1e11 ? raw : 0
       })()
     : 0
@@ -2119,8 +2436,11 @@ function mergeCachedLifetimeFees(
     claimedFeesUsd,
     totalFeesUsd: clampUsd(unclaimedFeesUsd + claimedFeesUsd),
     costBasisUsd,
+    cashOutUsd,
     pnlUsd,
     pnlReady,
+    pnlQuality,
+    pnlNote: row.pnlNote ?? cached?.pnlNote,
   }
 
   const prevLast0 = cached?.lastFees0 ?? ''
@@ -2146,13 +2466,72 @@ function mergeCachedLifetimeFees(
         ? '0'
         : row.fees1.toString(),
     awaitFeeClear: awaiting && !chainCleared,
+    pnlQuality: next.pnlQuality,
+    pnlNote: next.pnlNote,
     updatedAt: Date.now(),
   }, { allowDown })
 
   return next
 }
 
-/** 用现金流更新存入/取出锁定 USD，并重算 PnL */
+/**
+ * V3 positions().tokensOwed 同时装手续费和 Decrease 后尚未 Collect 的本金。
+ * 把仍欠着的减仓本金从「未领手续费」挪回本金，资产总额不变，但展示与年化不再虚高。
+ */
+function reclassifyV3OwedPrincipal(
+  row: PositionRow,
+  cf: Cashflow,
+  wethUsd: number,
+): PositionRow {
+  if (row.version !== 'v3' || !cf.trusted) return row
+  const moved0 = row.fees0 < cf.outstandingPrincipal0 ? row.fees0 : cf.outstandingPrincipal0
+  const moved1 = row.fees1 < cf.outstandingPrincipal1 ? row.fees1 : cf.outstandingPrincipal1
+  if (moved0 === 0n && moved1 === 0n) return row
+
+  const amount0 = row.amount0 + moved0
+  const amount1 = row.amount1 + moved1
+  const fees0 = row.fees0 - moved0
+  const fees1 = row.fees1 - moved1
+  const usd = (address: Address, amount: bigint, decimals: number) => tokenUsd(
+    address,
+    amount,
+    decimals,
+    row.price,
+    row.token0.address,
+    row.token1.address,
+    wethUsd,
+  )
+  const amount0Usd = usd(row.token0.address, amount0, row.token0.decimals)
+  const amount1Usd = usd(row.token1.address, amount1, row.token1.decimals)
+  const fees0Usd = usd(row.token0.address, fees0, row.token0.decimals)
+  const fees1Usd = usd(row.token1.address, fees1, row.token1.decimals)
+  const owedPrincipal0Usd = usd(row.token0.address, moved0, row.token0.decimals)
+  const owedPrincipal1Usd = usd(row.token1.address, moved1, row.token1.decimals)
+  const principalUsd = clampUsd(amount0Usd + amount1Usd)
+  const pct0 = principalUsd > 0 ? (amount0Usd / principalUsd) * 100 : 0
+  const pct1 = principalUsd > 0 ? (amount1Usd / principalUsd) * 100 : 0
+
+  return {
+    ...row,
+    amount0,
+    amount1,
+    fees0,
+    fees1,
+    owedPrincipal0: moved0,
+    owedPrincipal1: moved1,
+    amount0Usd,
+    amount1Usd,
+    fees0Usd,
+    fees1Usd,
+    owedPrincipal0Usd,
+    owedPrincipal1Usd,
+    totalUsd: clampUsd(amount0Usd + amount1Usd + fees0Usd + fees1Usd),
+    pct0,
+    pct1,
+  }
+}
+
+/** 用完整链上现金流更新累计投入/收回，并重算 PnL。 */
 function applyLockedCostBasis(
   row: PositionRow,
   cf: Cashflow,
@@ -2165,92 +2544,66 @@ function applyLockedCostBasis(
   const cached = readFeeCache()[key]
   const allowDown = Boolean(opts?.allowDown)
 
-  // 日志不完整时绝不上调存/取成本（RPC 缺页 + 浏览器补扫曾把同一笔加两次，越刷越大）
-  const prevDep0 = parseCacheBigint(cached?.deposited0)
-  const prevDep1 = parseCacheBigint(cached?.deposited1)
-  const prevWdw0 = parseCacheBigint(cached?.withdrawn0)
-  const prevWdw1 = parseCacheBigint(cached?.withdrawn1)
-  const depGrew = cf.deposited0 > prevDep0 || cf.deposited1 > prevDep1
-  const wdwGrew = cf.withdrawn0 > prevWdw0 || cf.withdrawn1 > prevWdw1
-  const useDep = allowDown || !depGrew || !cached ? cf : {
-    ...cf,
-    deposited0: prevDep0,
-    deposited1: prevDep1,
-  }
-  const useWdw = allowDown || !wdwGrew || !cached ? cf : {
-    ...cf,
-    withdrawn0: prevWdw0,
-    withdrawn1: prevWdw1,
+  const freshValuation = allowDown
+    && Boolean(cf.trusted)
+    && cf.valuation !== 'unavailable'
+    && cf.depositedUsd != null
+    && cf.collectedUsd != null
+
+  if (!freshValuation) {
+    const fallback = mergeCachedLifetimeFees(row, unclaimedFeesUsd, wethUsd)
+    return {
+      ...fallback,
+      pnlNote: fallback.pnlReady
+        ? fallback.pnlNote
+        : cf.valuationNote ?? '链上流水或历史价格不完整，暂不显示盈亏',
+    }
   }
 
-  // 可信完整扫描：按当前扫到的净存取代币一次性锚定 USD，清掉历史重复累加
-  const depositedUsd = allowDown
-    ? tokensUsdNow(row, useDep.deposited0, useDep.deposited1, wethUsd)
-    : lockUsdForTokenGrowth({
-      prev0: prevDep0,
-      prev1: prevDep1,
-      next0: useDep.deposited0,
-      next1: useDep.deposited1,
-      prevLockedUsd: cached?.depositedUsd ?? 0,
-      row,
-      wethUsd,
-      allowDown: false,
-    })
-  const withdrawnUsd = allowDown
-    ? tokensUsdNow(row, useWdw.withdrawn0, useWdw.withdrawn1, wethUsd)
-    : lockUsdForTokenGrowth({
-      prev0: prevWdw0,
-      prev1: prevWdw1,
-      next0: useWdw.withdrawn0,
-      next1: useWdw.withdrawn1,
-      prevLockedUsd: cached?.withdrawnUsd ?? 0,
-      row,
-      wethUsd,
-      allowDown: false,
-    })
+  const depositedUsd = clampUsd(cf.depositedUsd ?? 0)
+  const cashOutUsd = clampUsd(cf.collectedUsd ?? 0)
+  const claimedFeesUsd = clampUsd(cf.claimedFeesUsd ?? 0)
+  const pnlUsdRaw = computePositionPnlUsd(principalUsd + unclaimedFeesUsd, cashOutUsd, depositedUsd)
+  const pnlReady = depositedUsd > 0
+    && Number.isFinite(pnlUsdRaw)
+    && Math.abs(pnlUsdRaw) <= 1e11
+  const pnlUsd = pnlReady ? pnlUsdRaw : 0
+  const pnlQuality = cf.valuation ?? 'unavailable'
 
-  const withClaimTokens: PositionRow = {
+  const next: PositionRow = {
     ...row,
-    claimed0: cf.trusted ? cf.claimed0 : row.claimed0,
-    claimed1: cf.trusted ? cf.claimed1 : row.claimed1,
-  }
-  const merged = mergeCachedLifetimeFees(
-    withClaimTokens,
-    unclaimedFeesUsd,
-    wethUsd,
-    { allowClaimedDown: allowDown && Boolean(cf.trusted) },
-  )
-
-  const costBasisUsd = clampUsd(depositedUsd - withdrawnUsd)
-  const pnlUsdRaw =
-    principalUsd + unclaimedFeesUsd + merged.claimedFeesUsd + withdrawnUsd - depositedUsd
-  const pnlUsd = Number.isFinite(pnlUsdRaw) && Math.abs(pnlUsdRaw) <= 1e11 ? pnlUsdRaw : 0
-  // 有可信流水，或已扫到非零存取，才标就绪；否则别拿 0 成本骗用户
-  const pnlReady = Boolean(cf.trusted) || depositedUsd > 0 || withdrawnUsd > 0 || costBasisUsd > 0
-
-  writeFeeCacheEntry(key, {
-    claimed0: merged.claimed0.toString(),
-    claimed1: merged.claimed1.toString(),
-    claimedUsd: merged.claimedFeesUsd,
-    deposited0: useDep.deposited0.toString(),
-    deposited1: useDep.deposited1.toString(),
-    withdrawn0: useWdw.withdrawn0.toString(),
-    withdrawn1: useWdw.withdrawn1.toString(),
-    depositedUsd,
-    withdrawnUsd,
-    lastFees0: merged.fees0.toString(),
-    lastFees1: merged.fees1.toString(),
-    awaitFeeClear: readFeeCache()[key]?.awaitFeeClear,
-    updatedAt: Date.now(),
-  }, { allowDown })
-
-  return {
-    ...merged,
-    costBasisUsd,
+    claimed0: cf.claimed0,
+    claimed1: cf.claimed1,
+    claimedFeesUsd,
+    totalFeesUsd: clampUsd(unclaimedFeesUsd + claimedFeesUsd),
+    costBasisUsd: depositedUsd,
+    cashOutUsd,
     pnlUsd,
     pnlReady,
-    totalFeesUsd: clampUsd(unclaimedFeesUsd + merged.claimedFeesUsd),
+    pnlQuality,
+    pnlNote: cf.valuationNote,
   }
+
+  writeFeeCacheEntry(key, {
+    claimed0: next.claimed0.toString(),
+    claimed1: next.claimed1.toString(),
+    claimedUsd: next.claimedFeesUsd,
+    deposited0: cf.deposited0.toString(),
+    deposited1: cf.deposited1.toString(),
+    // v8 缓存字段沿用 withdrawn 命名，但内容是实际 Collect/结算现金流。
+    withdrawn0: cf.collected0.toString(),
+    withdrawn1: cf.collected1.toString(),
+    depositedUsd,
+    withdrawnUsd: cashOutUsd,
+    pnlQuality,
+    pnlNote: next.pnlNote,
+    lastFees0: next.fees0.toString(),
+    lastFees1: next.fees1.toString(),
+    awaitFeeClear: cached?.awaitFeeClear,
+    updatedAt: Date.now(),
+  }, { allowDown: true })
+
+  return next
 }
 
 function persistLifetimeFees(row: PositionRow, opts?: { allowDown?: boolean }) {
@@ -2265,6 +2618,8 @@ function persistLifetimeFees(row: PositionRow, opts?: { allowDown?: boolean }) {
     withdrawn1: prev?.withdrawn1 ?? '0',
     depositedUsd: prev?.depositedUsd ?? 0,
     withdrawnUsd: prev?.withdrawnUsd ?? 0,
+    pnlQuality: row.pnlQuality ?? prev?.pnlQuality,
+    pnlNote: row.pnlNote ?? prev?.pnlNote,
     lastFees0: row.fees0.toString(),
     lastFees1: row.fees1.toString(),
     awaitFeeClear: prev?.awaitFeeClear && !(row.fees0 === 0n && row.fees1 === 0n),
@@ -2279,27 +2634,67 @@ function persistLifetimeFees(row: PositionRow, opts?: { allowDown?: boolean }) {
 export function recordPositionClaim(
   row: PositionRow,
   wethUsd: number,
+  mode: 'collect' | 'compound' = 'collect',
 ): PositionRow {
   const key = feeCacheKey(row)
   const cached = readFeeCache()[key]
+  const owedPrincipal0 = row.owedPrincipal0 ?? 0n
+  const owedPrincipal1 = row.owedPrincipal1 ?? 0n
   const claimed0 = row.claimed0 + row.fees0
   const claimed1 = row.claimed1 + row.fees1
   // 优先用领取瞬间 UI 已算好的未领 USD；若为 0 再按现价估增量
-  let addUsd = clampUsd(row.fees0Usd + row.fees1Usd)
-  if (!(addUsd > 0) && (row.fees0 > 0n || row.fees1 > 0n)) {
-    addUsd = tokensUsdNow(row, row.fees0, row.fees1, wethUsd)
+  let feeAddUsd = clampUsd(row.fees0Usd + row.fees1Usd)
+  if (!(feeAddUsd > 0) && (row.fees0 > 0n || row.fees1 > 0n)) {
+    feeAddUsd = tokensUsdNow(row, row.fees0, row.fees1, wethUsd)
   }
-  const claimedFeesUsd = clampUsd((cached?.claimedUsd ?? row.claimedFeesUsd) + addUsd)
+  let owedPrincipalUsd = clampUsd((row.owedPrincipal0Usd ?? 0) + (row.owedPrincipal1Usd ?? 0))
+  if (!(owedPrincipalUsd > 0) && (owedPrincipal0 > 0n || owedPrincipal1 > 0n)) {
+    owedPrincipalUsd = tokensUsdNow(row, owedPrincipal0, owedPrincipal1, wethUsd)
+  }
+  const claimedFeesUsd = clampUsd((cached?.claimedUsd ?? row.claimedFeesUsd) + feeAddUsd)
+  const costBasisUsd = row.costBasisUsd > 0 ? row.costBasisUsd : clampUsd(cached?.depositedUsd ?? 0)
+  const cashOutUsd = clampUsd(
+    (row.cashOutUsd ?? cached?.withdrawnUsd ?? 0) + feeAddUsd + owedPrincipalUsd,
+  )
+  const pendingCompound = mode === 'compound'
+  const pnlQuality = pendingCompound ? 'unavailable' : (row.pnlQuality ?? cached?.pnlQuality ?? 'estimated')
+  const pnlReady = !pendingCompound && Boolean(row.pnlReady) && pnlQuality !== 'unavailable'
+  const amount0 = row.amount0 >= owedPrincipal0 ? row.amount0 - owedPrincipal0 : row.amount0
+  const amount1 = row.amount1 >= owedPrincipal1 ? row.amount1 - owedPrincipal1 : row.amount1
+  const amount0Usd = clampUsd(row.amount0Usd - (row.owedPrincipal0Usd ?? 0))
+  const amount1Usd = clampUsd(row.amount1Usd - (row.owedPrincipal1Usd ?? 0))
+  const currentAssetsUsd = clampUsd(amount0Usd + amount1Usd)
+  const pct0 = currentAssetsUsd > 0 ? (amount0Usd / currentAssetsUsd) * 100 : 0
+  const pct1 = currentAssetsUsd > 0 ? (amount1Usd / currentAssetsUsd) * 100 : 0
+  const pnlUsdRaw = computePositionPnlUsd(currentAssetsUsd, cashOutUsd, costBasisUsd)
   const next: PositionRow = {
     ...row,
+    amount0,
+    amount1,
+    amount0Usd,
+    amount1Usd,
+    pct0,
+    pct1,
     fees0: 0n,
     fees1: 0n,
+    owedPrincipal0: 0n,
+    owedPrincipal1: 0n,
     fees0Usd: 0,
     fees1Usd: 0,
+    owedPrincipal0Usd: 0,
+    owedPrincipal1Usd: 0,
     claimed0,
     claimed1,
     claimedFeesUsd,
     totalFeesUsd: claimedFeesUsd,
+    totalUsd: currentAssetsUsd,
+    cashOutUsd,
+    pnlUsd: pnlReady && Number.isFinite(pnlUsdRaw) ? pnlUsdRaw : row.pnlUsd,
+    pnlReady,
+    pnlQuality,
+    pnlNote: pendingCompound
+      ? '复投已提交，等待链上流水确认实际加回数量后重算'
+      : row.pnlNote,
   }
   writeFeeCacheEntry(key, {
     claimed0: next.claimed0.toString(),
@@ -2307,10 +2702,12 @@ export function recordPositionClaim(
     claimedUsd: next.claimedFeesUsd,
     deposited0: cached?.deposited0 ?? '0',
     deposited1: cached?.deposited1 ?? '0',
-    withdrawn0: cached?.withdrawn0 ?? '0',
-    withdrawn1: cached?.withdrawn1 ?? '0',
+    withdrawn0: (parseCacheBigint(cached?.withdrawn0) + row.fees0 + owedPrincipal0).toString(),
+    withdrawn1: (parseCacheBigint(cached?.withdrawn1) + row.fees1 + owedPrincipal1).toString(),
     depositedUsd: cached?.depositedUsd ?? 0,
-    withdrawnUsd: cached?.withdrawnUsd ?? 0,
+    withdrawnUsd: cashOutUsd,
+    pnlQuality: next.pnlQuality,
+    pnlNote: next.pnlNote,
     lastFees0: '0',
     lastFees1: '0',
     awaitFeeClear: true,
@@ -2319,7 +2716,7 @@ export function recordPositionClaim(
   return next
 }
 
-/** 分块拉日志，避免 fromBlock=0 一次扫挂死；默认 9k 兼容 Alchemy 等 10k 限制 */
+/** 分块拉日志，避免 fromBlock=0 一次扫挂死；BSC 公共节点使用更小窗口。 */
 async function getLogsChunked<T>(opts: {
   address: Address
   event: ReturnType<typeof parseAbiItem>
@@ -2328,7 +2725,7 @@ async function getLogsChunked<T>(opts: {
   toBlock: bigint
   span?: bigint
 }): Promise<{ logs: T[]; incomplete: boolean }> {
-  const span = opts.span ?? 9_000n
+  const span = opts.span ?? (getActiveChainId() === 56 ? 2_000n : 8_000n)
   const out: T[] = []
   let incomplete = false
   for (let from = opts.fromBlock; from <= opts.toBlock; from += span) {
@@ -2360,16 +2757,46 @@ async function getLogsChunked<T>(opts: {
 
 const V3_NFT_MINT = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)')
 
-async function v3MintBlock(tokenId: bigint): Promise<bigint | null> {
+async function v3MintBlock(
+  tokenId: bigint,
+  npm: Address = CONTRACTS.v3Npm,
+): Promise<bigint | null> {
   try {
     const logs = await publicClient.getLogs({
-      address: CONTRACTS.v3Npm,
+      address: npm,
       event: V3_NFT_MINT,
       args: { from: zeroAddress, tokenId },
       fromBlock: 0n,
       toBlock: 'latest',
     })
     return logs[0]?.blockNumber ?? null
+  } catch {
+    /* explorer fallback */
+  }
+  try {
+    const topics = encodeEventTopics({
+      abi: [V3_NFT_MINT],
+      eventName: 'Transfer',
+      args: { from: zeroAddress, tokenId },
+    })
+    const t0 = topics[0]
+    const t1 = topics[1]
+    const t3 = topics[3]
+    if (!t0 || !t1 || !t3) return null
+    const res = await fetch(
+      `${getExplorerApi()}/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest` +
+      `&address=${npm}&topic0=${t0}&topic1=${t1}&topic3=${t3}` +
+      '&topic0_1_opr=and&topic0_3_opr=and&topic1_3_opr=and',
+    )
+    if (!res.ok) return null
+    const json = await res.json() as {
+      status?: string
+      result?: Array<{ blockNumber?: string }>
+    }
+    const block = json.status === '1' && Array.isArray(json.result)
+      ? json.result[0]?.blockNumber
+      : undefined
+    return block != null ? BigInt(block) : null
   } catch {
     return null
   }
@@ -2378,6 +2805,7 @@ async function v3MintBlock(tokenId: bigint): Promise<bigint | null> {
 type NpmAmountLog = {
   args: { amount0?: bigint; amount1?: bigint; liquidity?: bigint }
   transactionHash: Hash
+  blockNumber: bigint
   logIndex?: number
 }
 
@@ -2406,7 +2834,10 @@ function dedupeNpmLogs(logs: NpmAmountLog[]): NpmAmountLog[] {
     const prev = byAmt.get(k)
     if (!prev || (prev.logIndex == null && l.logIndex != null)) byAmt.set(k, l)
   }
-  return [...byAmt.values()]
+  return [...byAmt.values()].sort((a, b) => {
+    if (a.blockNumber !== b.blockNumber) return a.blockNumber < b.blockNumber ? -1 : 1
+    return (a.logIndex ?? Number.MAX_SAFE_INTEGER) - (b.logIndex ?? Number.MAX_SAFE_INTEGER)
+  })
 }
 
 async function fetchNpmLogsBlockscout(
@@ -2415,7 +2846,7 @@ async function fetchNpmLogsBlockscout(
   tokenId: bigint,
   fromBlock: bigint,
   npm: Address = CONTRACTS.v3Npm,
-): Promise<NpmAmountLog[]> {
+): Promise<{ logs: NpmAmountLog[]; complete: boolean }> {
   try {
     const topics = encodeEventTopics({
       abi: [event as never],
@@ -2424,23 +2855,31 @@ async function fetchNpmLogsBlockscout(
     })
     const t0 = topics[0]
     const t1 = topics[1]
-    if (!t0 || !t1) return []
+    if (!t0 || !t1) return { logs: [], complete: false }
     const url =
       `${getExplorerApi()}/api?module=logs&action=getLogs` +
       `&fromBlock=${fromBlock}&toBlock=latest&address=${npm}` +
       `&topic0=${t0}&topic1=${t1}&topic0_1_opr=and`
     const res = await fetch(url)
-    if (!res.ok) return []
+    if (!res.ok) return { logs: [], complete: false }
     const json = (await res.json()) as {
       status?: string
+      message?: string
       result?: Array<{
         data: `0x${string}`
         topics: `0x${string}`[]
         transactionHash: Hash
+        blockNumber?: string
         logIndex?: string
-      }>
+      }> | string
     }
-    if (json.status !== '1' || !json.result?.length) return []
+    if (json.status === '0') {
+      const msg = `${json.message ?? ''} ${typeof json.result === 'string' ? json.result : ''}`
+      return { logs: [], complete: /no (logs|records)|not found/i.test(msg) }
+    }
+    if (json.status !== '1' || !Array.isArray(json.result)) {
+      return { logs: [], complete: false }
+    }
     const out: NpmAmountLog[] = []
     for (const log of json.result) {
       try {
@@ -2450,19 +2889,21 @@ async function fetchNpmLogsBlockscout(
           topics: log.topics,
         })
         const li = log.logIndex != null ? Number(log.logIndex) : undefined
+        const bn = log.blockNumber != null ? BigInt(log.blockNumber) : fromBlock
         out.push({
           args: decoded.args as { amount0?: bigint; amount1?: bigint; liquidity?: bigint },
           transactionHash: log.transactionHash,
+          blockNumber: bn,
           logIndex: Number.isFinite(li) ? li : undefined,
         })
       } catch {
         /* skip */
       }
     }
-    return out
+    return { logs: out, complete: true }
   } catch (e) {
     console.warn('Blockscout NPM logs failed', eventName, tokenId.toString(), e)
-    return []
+    return { logs: [], complete: false }
   }
 }
 
@@ -2474,6 +2915,13 @@ async function loadV3NpmLogs(
   toBlock: bigint,
   npm: Address = CONTRACTS.v3Npm,
 ): Promise<{ logs: NpmAmountLog[]; incomplete: boolean }> {
+  // BSC / Robinhood 的 Blockscout 对 indexed tokenId 查询远快于从铸造块逐段扫 RPC。
+  if (getActiveChainId() === 56 || getActiveChainId() === 4663) {
+    const explorer = await fetchNpmLogsBlockscout(event, eventName, tokenId, fromBlock, npm)
+    if (explorer.complete) {
+      return { logs: dedupeNpmLogs(explorer.logs), incomplete: false }
+    }
+  }
   const rpc = await getLogsChunked<NpmAmountLog>({
     address: npm,
     event,
@@ -2484,25 +2932,31 @@ async function loadV3NpmLogs(
   // RPC 完整扫完（含 0 条）直接用，避免 Blockscout 缺页把「无 Collect」误成有领取
   if (!rpc.incomplete) return { logs: dedupeNpmLogs(rpc.logs), incomplete: false }
   const bs = await fetchNpmLogsBlockscout(event, eventName, tokenId, fromBlock, npm)
-  if (bs.length === 0) return { logs: dedupeNpmLogs(rpc.logs), incomplete: true }
+  if (bs.logs.length === 0) return { logs: dedupeNpmLogs(rpc.logs), incomplete: true }
   // 合并后严格去重；缺 chunk 仍标 incomplete，成本腿禁止上调
-  return { logs: dedupeNpmLogs([...rpc.logs, ...bs]), incomplete: true }
+  return { logs: dedupeNpmLogs([...rpc.logs, ...bs.logs]), incomplete: true }
 }
 
 export async function loadPositionCashflow(
   tokenId: bigint,
   npm: Address = CONTRACTS.v3Npm,
+  row?: PositionRow,
+  currentWethUsd = 0,
 ): Promise<Cashflow> {
   const empty: Cashflow = {
     deposited0: 0n, deposited1: 0n,
     withdrawn0: 0n, withdrawn1: 0n,
+    collected0: 0n, collected1: 0n,
+    outstandingPrincipal0: 0n, outstandingPrincipal1: 0n,
     claimed0: 0n, claimed1: 0n,
     trusted: false,
     collectEvents: 0,
+    valuation: 'unavailable',
   }
   try {
     const latest = await publicClient.getBlockNumber()
-    const mintBlock = await v3MintBlock(tokenId)
+    const mintBlock = await v3MintBlock(tokenId, npm)
+    const mintKnown = mintBlock != null
     const fromBlock = mintBlock ?? (latest > 3_000_000n ? latest - 3_000_000n : 0n)
     const incEvent = parseAbiItem('event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)')
     const decEvent = parseAbiItem('event DecreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)')
@@ -2513,18 +2967,15 @@ export async function loadPositionCashflow(
       loadV3NpmLogs(decEvent, 'DecreaseLiquidity', tokenId, fromBlock, latest, npm),
       loadV3NpmLogs(colEvent, 'Collect', tokenId, fromBlock, latest, npm),
     ])
-    const incomplete = incRes.incomplete || decRes.incomplete || colRes.incomplete
     const inc = incRes.logs
     const dec = decRes.logs
     const col = colRes.logs
-
-    // 同笔 Collect 的 Increase = 复投加回，不算用户「新存入」（否则已存入会越刷越大）
-    const collectTx = new Set(col.map((l) => l.transactionHash.toLowerCase()))
+    // 有 NFT 却没有任何 Increase 基本等于日志源漏数，绝不能把 0 投入当完整账本。
+    const incomplete = incRes.incomplete || decRes.incomplete || colRes.incomplete || inc.length === 0
 
     let deposited0 = 0n
     let deposited1 = 0n
     for (const l of inc) {
-      if (collectTx.has(l.transactionHash.toLowerCase())) continue
       deposited0 += l.args.amount0 ?? 0n
       deposited1 += l.args.amount1 ?? 0n
     }
@@ -2536,26 +2987,95 @@ export async function loadPositionCashflow(
       withdrawn1 += l.args.amount1 ?? 0n
     }
 
-    /**
-     * 历史已领（含复投）= ΣCollect − ΣDecrease
-     * - 纯 Claim：无 Decrease，Collect 全算已领
-     * - 同笔/分笔撤出再 Collect：超出已撤本金的部分才是手续费
-     * - 复投：Collect 后 Increase，Collect 仍计入已领；Increase 已从 deposited 排除
-     * - 无任何 Collect → 已领必为 0（用户从未领取）
-     */
-    let collected0 = 0n
-    let collected1 = 0n
-    for (const l of col) {
-      collected0 += l.args.amount0 ?? 0n
-      collected1 += l.args.amount1 ?? 0n
+    const accounting = buildV3AccountingLedger<NpmAmountLog>([
+      ...dec.map((log) => ({
+        kind: 'decrease' as const,
+        amount0: log.args.amount0 ?? 0n,
+        amount1: log.args.amount1 ?? 0n,
+        blockNumber: log.blockNumber,
+        logIndex: log.logIndex,
+        source: log,
+      })),
+      ...col.map((log) => ({
+        kind: 'collect' as const,
+        amount0: log.args.amount0 ?? 0n,
+        amount1: log.args.amount1 ?? 0n,
+        blockNumber: log.blockNumber,
+        logIndex: log.logIndex,
+        source: log,
+      })),
+    ])
+    const {
+      collected0,
+      collected1,
+      outstandingPrincipal0,
+      outstandingPrincipal1,
+      claimedFees0: claimed0,
+      claimedFees1: claimed1,
+    } = accounting
+    const claimedEvents = accounting.collects.flatMap((event) => event.source
+      ? [{ ...event.source, fee0: event.fee0, fee1: event.fee1 }]
+      : [])
+
+    let depositedUsd: number | undefined
+    let collectedUsd: number | undefined
+    let claimedFeesUsd: number | undefined
+    let valuation: Cashflow['valuation'] = 'unavailable'
+    if (row) {
+      const [depositValues, collectValues, feeValues] = await Promise.all([
+        Promise.all(inc.map((l) => valueFlowAtEvent({
+          row,
+          amount0: l.args.amount0 ?? 0n,
+          amount1: l.args.amount1 ?? 0n,
+          blockNumber: l.blockNumber,
+          logIndex: l.logIndex,
+          currentWethUsd,
+        }))),
+        Promise.all(col.map((l) => valueFlowAtEvent({
+          row,
+          amount0: l.args.amount0 ?? 0n,
+          amount1: l.args.amount1 ?? 0n,
+          blockNumber: l.blockNumber,
+          logIndex: l.logIndex,
+          currentWethUsd,
+        }))),
+        Promise.all(claimedEvents.map((l) => valueFlowAtEvent({
+          row,
+          amount0: l.fee0,
+          amount1: l.fee1,
+          blockNumber: l.blockNumber,
+          logIndex: l.logIndex,
+          currentWethUsd,
+        }))),
+      ])
+      const allCashValues = [...depositValues, ...collectValues]
+      valuation = combineValuationQuality(allCashValues)
+      if (valuation !== 'unavailable') {
+        depositedUsd = clampUsd(depositValues.reduce((sum, v) => sum + v.usd, 0))
+        collectedUsd = clampUsd(collectValues.reduce((sum, v) => sum + v.usd, 0))
+      }
+      if (!feeValues.some((v) => v.quality === 'unavailable')) {
+        claimedFeesUsd = clampUsd(feeValues.reduce((sum, v) => sum + v.usd, 0))
+      }
     }
-    // 日志不完整时：有 Collect 无 Decrease 会把本金算进已领 → 不可信，claimed 置 0 交给缓存
-    const canTrustClaimed = !incomplete
-    const claimed0 = canTrustClaimed && collected0 > withdrawn0 ? collected0 - withdrawn0 : 0n
-    const claimed1 = canTrustClaimed && collected1 > withdrawn1 ? collected1 - withdrawn1 : 0n
+
+    const canTrustClaimed = mintKnown && !incomplete
 
     return {
-      deposited0, deposited1, withdrawn0, withdrawn1, claimed0, claimed1,
+      deposited0, deposited1, withdrawn0, withdrawn1,
+      collected0, collected1,
+      outstandingPrincipal0, outstandingPrincipal1,
+      claimed0: canTrustClaimed ? claimed0 : 0n,
+      claimed1: canTrustClaimed ? claimed1 : 0n,
+      depositedUsd,
+      collectedUsd,
+      claimedFeesUsd: canTrustClaimed ? claimedFeesUsd : undefined,
+      valuation,
+      valuationNote: valuation === 'historical'
+        ? '投入与收回均按链上事件附近的历史池价计价'
+        : valuation === 'estimated'
+          ? '部分历史状态不可用，已明确降级为现价估算'
+          : '缺少可验证的 USD 历史价格',
       openedAtBlock: mintBlock ?? undefined,
       trusted: canTrustClaimed,
       collectEvents: col.length,
@@ -2578,11 +3098,11 @@ export function enrichPnl(
   cf: Cashflow,
 ) {
   const depositedUsd = tokensUsdNow(pool, cf.deposited0, cf.deposited1, wethUsd)
-  const withdrawnUsd = tokensUsdNow(pool, cf.withdrawn0, cf.withdrawn1, wethUsd)
+  const cashOutUsd = tokensUsdNow(pool, cf.collected0, cf.collected1, wethUsd)
   const claimedFeesUsd = tokensUsdNow(pool, cf.claimed0, cf.claimed1, wethUsd)
-  const costBasisUsd = clampUsd(depositedUsd - withdrawnUsd)
+  const costBasisUsd = clampUsd(depositedUsd)
   const totalFeesUsd = clampUsd(unclaimedFeesUsd + claimedFeesUsd)
-  const pnlUsdRaw = principalUsd + unclaimedFeesUsd + claimedFeesUsd + withdrawnUsd - depositedUsd
+  const pnlUsdRaw = computePositionPnlUsd(principalUsd + unclaimedFeesUsd, cashOutUsd, depositedUsd)
   const pnlUsd = Number.isFinite(pnlUsdRaw) && Math.abs(pnlUsdRaw) <= 1e11 ? pnlUsdRaw : 0
   return {
     claimed0: cf.claimed0,
@@ -2590,6 +3110,7 @@ export function enrichPnl(
     claimedFeesUsd: clampUsd(claimedFeesUsd),
     totalFeesUsd,
     costBasisUsd,
+    cashOutUsd,
     pnlUsd,
   }
 }
@@ -3115,13 +3636,14 @@ async function collectV4ModifyLogs(opts: {
   poolId: `0x${string}`
   tokenId: bigint
   fromBlock: bigint
-}): Promise<Array<{
+}): Promise<{ logs: Array<{
   blockNumber: bigint
   transactionHash: Hash
+  logIndex?: number
   tickLower: number
   tickUpper: number
   liquidityDelta: bigint
-}>> {
+}>; incomplete: boolean }> {
   const { poolId, tokenId, fromBlock } = opts
   const salt = v4Salt(tokenId).toLowerCase()
   const latest = await publicClient.getBlockNumber()
@@ -3135,10 +3657,12 @@ async function collectV4ModifyLogs(opts: {
   const out: Array<{
     blockNumber: bigint
     transactionHash: Hash
+    logIndex?: number
     tickLower: number
     tickUpper: number
     liquidityDelta: bigint
   }> = []
+  let incomplete = false
   for (let from = fromBlock; from <= latest; from += span) {
     const to = from + span - 1n > latest ? latest : from + span - 1n
     try {
@@ -3154,6 +3678,7 @@ async function collectV4ModifyLogs(opts: {
         out.push({
           blockNumber: l.blockNumber ?? from,
           transactionHash: l.transactionHash,
+          logIndex: l.logIndex,
           tickLower: Number(l.args.tickLower),
           tickUpper: Number(l.args.tickUpper),
           liquidityDelta: l.args.liquidityDelta ?? 0n,
@@ -3161,9 +3686,14 @@ async function collectV4ModifyLogs(opts: {
       }
     } catch (e) {
       console.warn('V4 ModifyLiquidity chunk fail', from.toString(), e)
+      incomplete = true
     }
   }
-  return out
+  out.sort((a, b) => {
+    if (a.blockNumber !== b.blockNumber) return a.blockNumber < b.blockNumber ? -1 : 1
+    return (a.logIndex ?? Number.MAX_SAFE_INTEGER) - (b.logIndex ?? Number.MAX_SAFE_INTEGER)
+  })
+  return { logs: out, incomplete }
 }
 
 /** 从领取类交易收据里抽 token0/token1：进 owner / 进 PositionManager（复投常不经过钱包） */
@@ -3230,8 +3760,8 @@ async function transfersToOwnerInTx(
 }
 
 /**
- * V4 现金流：扫 PoolManager.ModifyLiquidity（salt=tokenId），
- * 用历史 slot0 把 liquidityDelta 还原成存/取币量；delta=0 的交易再扫 Transfer 作已领费。
+ * V4 现金流：ModifyLiquidity 事件不带 token amount，只能用事件时池价还原本金，
+ * 再用交易收据补 delta=0 / 撤仓时实际结算的手续费，因此明确标为 estimated。
  */
 export async function loadV4PositionCashflow(opts: {
   owner: Address
@@ -3241,22 +3771,32 @@ export async function loadV4PositionCashflow(opts: {
   tickUpper: number
   token0: Address
   token1: Address
+  position: PositionRow
+  currentWethUsd: number
 }): Promise<Cashflow> {
   const empty: Cashflow = {
     deposited0: 0n, deposited1: 0n,
     withdrawn0: 0n, withdrawn1: 0n,
+    collected0: 0n, collected1: 0n,
+    outstandingPrincipal0: 0n, outstandingPrincipal1: 0n,
     claimed0: 0n, claimed1: 0n,
     trusted: false,
     collectEvents: 0,
+    valuation: 'unavailable',
   }
-  const { owner, tokenId, poolId, tickLower, tickUpper, token0, token1 } = opts
+  const {
+    owner, tokenId, poolId, tickLower, tickUpper, token0, token1,
+    position, currentWethUsd,
+  } = opts
   try {
     let fromBlock = await v4MintBlock(tokenId)
+    const mintKnown = fromBlock != null
     if (fromBlock == null) {
       const latest = await publicClient.getBlockNumber()
       fromBlock = latest > 1_500_000n ? latest - 1_500_000n : 0n
     }
-    const mods = await collectV4ModifyLogs({ poolId, tokenId, fromBlock })
+    const modsResult = await collectV4ModifyLogs({ poolId, tokenId, fromBlock })
+    const mods = modsResult.logs
     if (!mods.length) {
       // 扫到区间但无 Modify：可能 lookback 不够，不能据此把已领校正为 0
       return { ...empty, trusted: false }
@@ -3266,64 +3806,136 @@ export async function loadV4PositionCashflow(opts: {
     let deposited1 = 0n
     let withdrawn0 = 0n
     let withdrawn1 = 0n
+    let collected0 = 0n
+    let collected1 = 0n
     let claimed0 = 0n
     let claimed1 = 0n
     let collectEvents = 0
     const claimedTx = new Set<string>()
+    const negativeTx = new Set(
+      mods.filter((m) => m.liquidityDelta < 0n).map((m) => m.transactionHash.toLowerCase()),
+    )
+    const depositValues: FlowValuation[] = []
+    const collectValues: FlowValuation[] = []
+    const feeValues: FlowValuation[] = []
 
     for (const m of mods) {
+      const txKey = m.transactionHash.toLowerCase()
       if (m.liquidityDelta === 0n) {
+        // 同笔还有负 delta 时，由负 delta 分支一次性用「本金 + 超额结算」入账。
+        if (negativeTx.has(txKey) || claimedTx.has(txKey)) continue
         // Claim / 复投收手续费：进钱包或先打进 PositionManager 再加仓
         const got = await feeTokenMovesInTx(m.transactionHash, owner, token0, token1)
         const a0 = got.toOwner0 > 0n ? got.toOwner0 : got.toPm0
         const a1 = got.toOwner1 > 0n ? got.toOwner1 : got.toPm1
+        collected0 += a0
+        collected1 += a1
         claimed0 += a0
         claimed1 += a1
-        if (a0 > 0n || a1 > 0n) collectEvents += 1
-        claimedTx.add(m.transactionHash)
+        if (a0 > 0n || a1 > 0n) {
+          collectEvents += 1
+          const value = await valueFlowAtEvent({
+            row: position,
+            amount0: a0,
+            amount1: a1,
+            blockNumber: m.blockNumber,
+            logIndex: m.logIndex,
+            currentWethUsd,
+          })
+          collectValues.push(value)
+          feeValues.push(value)
+        }
+        claimedTx.add(txKey)
         continue
       }
       const absLiq = m.liquidityDelta < 0n ? -m.liquidityDelta : m.liquidityDelta
-      let sqrt = 0n
-      try {
-        const slot0 = await publicClient.readContract({
-          address: CONTRACTS.v4StateView,
-          abi: v4StateViewAbi,
-          functionName: 'getSlot0',
-          args: [poolId],
-          blockNumber: m.blockNumber,
-        })
-        sqrt = slot0[0]
-      } catch {
-        continue
-      }
+      const historical = await historicalV4Price(position, m.blockNumber, m.logIndex)
+      const sqrt = historical?.sqrtPriceX96 ?? position.sqrtPriceX96
       if (sqrt === 0n) continue
-      const tl = m.tickLower || tickLower
-      const tu = m.tickUpper || tickUpper
+      const tl = Number.isFinite(m.tickLower) ? m.tickLower : tickLower
+      const tu = Number.isFinite(m.tickUpper) ? m.tickUpper : tickUpper
       const { amount0, amount1 } = getAmountsForPosition(sqrt, tl, tu, absLiq)
       if (m.liquidityDelta > 0n) {
         deposited0 += amount0
         deposited1 += amount1
-        // 加仓/Mint 不再把 Transfer→owner（常见是退款/找零）算进已领。
-        // 复投手续费应出现在同仓的 delta=0 ModifyLiquidity（领取）里。
+        depositValues.push(await valueFlowAtEvent({
+          row: position,
+          amount0,
+          amount1,
+          blockNumber: m.blockNumber,
+          logIndex: m.logIndex,
+          currentWethUsd,
+        }))
       } else {
         withdrawn0 += amount0
         withdrawn1 += amount1
-        if (!claimedTx.has(m.transactionHash)) {
+        let cash0 = amount0
+        let cash1 = amount1
+        let fee0 = 0n
+        let fee1 = 0n
+        if (!claimedTx.has(txKey)) {
           const got = await transfersToOwnerInTx(m.transactionHash, owner, token0, token1)
-          // 同笔撤出：进钱包超出本金估算的部分才是手续费；估算偏差时宁可少计
-          if (got.amount0 > amount0) claimed0 += got.amount0 - amount0
-          if (got.amount1 > amount1) claimed1 += got.amount1 - amount1
-          claimedTx.add(m.transactionHash)
+          // 同笔撤出：超出重建本金的部分才归手续费；本金至少按 delta 还原值记收回。
+          fee0 = got.amount0 > amount0 ? got.amount0 - amount0 : 0n
+          fee1 = got.amount1 > amount1 ? got.amount1 - amount1 : 0n
+          cash0 += fee0
+          cash1 += fee1
+          claimed0 += fee0
+          claimed1 += fee1
+          claimedTx.add(txKey)
+        }
+        collected0 += cash0
+        collected1 += cash1
+        collectEvents += 1
+        collectValues.push(await valueFlowAtEvent({
+          row: position,
+          amount0: cash0,
+          amount1: cash1,
+          blockNumber: m.blockNumber,
+          logIndex: m.logIndex,
+          currentWethUsd,
+        }))
+        if (fee0 > 0n || fee1 > 0n) {
+          feeValues.push(await valueFlowAtEvent({
+            row: position,
+            amount0: fee0,
+            amount1: fee1,
+            blockNumber: m.blockNumber,
+            logIndex: m.logIndex,
+            currentWethUsd,
+          }))
         }
       }
     }
 
+    const allCashValues = [...depositValues, ...collectValues]
+    const baseQuality = combineValuationQuality(allCashValues)
+    const valuation: Cashflow['valuation'] = baseQuality === 'unavailable' ? 'unavailable' : 'estimated'
+    const depositedUsd = valuation === 'unavailable'
+      ? undefined
+      : clampUsd(depositValues.reduce((sum, value) => sum + value.usd, 0))
+    const collectedUsd = valuation === 'unavailable'
+      ? undefined
+      : clampUsd(collectValues.reduce((sum, value) => sum + value.usd, 0))
+    const claimedFeesUsd = feeValues.some((value) => value.quality === 'unavailable')
+      ? undefined
+      : clampUsd(feeValues.reduce((sum, value) => sum + value.usd, 0))
+
     return {
-      deposited0, deposited1, withdrawn0, withdrawn1, claimed0, claimed1,
+      deposited0, deposited1, withdrawn0, withdrawn1,
+      collected0, collected1,
+      outstandingPrincipal0: 0n,
+      outstandingPrincipal1: 0n,
+      claimed0, claimed1,
+      depositedUsd,
+      collectedUsd,
+      claimedFeesUsd,
+      valuation,
+      valuationNote: valuation === 'estimated'
+        ? 'V4 事件不含 token amount；本金由 liquidityDelta 与历史池价重建，属于链上近似值'
+        : 'V4 历史价格或结算流水不完整',
       openedAtBlock: mods.length ? mods[0].blockNumber : undefined,
-      // 有完整 Modify 轨迹即可校正；无 delta=0 领取时 claimed 为 0
-      trusted: true,
+      trusted: mintKnown && !modsResult.incomplete,
       collectEvents,
     }
   } catch (e) {
@@ -3373,20 +3985,23 @@ export async function enrichPositionsLifetimeFees(
         const principalUsd = row.amount0Usd + row.amount1Usd
         if (row.version === 'v3') {
           const cf = await withTimeout(
-            loadPositionCashflow(row.tokenId, row.v3Npm ?? CONTRACTS.v3Npm),
+            loadPositionCashflow(row.tokenId, row.v3Npm ?? CONTRACTS.v3Npm, row, wethUsd),
             45_000,
             `V3 fees #${row.tokenId}`,
           )
           allowDown = Boolean(cf.trusted)
+          const accountedRow = reclassifyV3OwedPrincipal(row, cf, wethUsd)
+          const accountedPrincipalUsd = accountedRow.amount0Usd + accountedRow.amount1Usd
+          const accountedUnclaimedUsd = accountedRow.fees0Usd + accountedRow.fees1Usd
           const merged = applyLockedCostBasis(
-            row,
+            accountedRow,
             cf,
             wethUsd,
-            principalUsd,
-            unclaimedFeesUsd,
+            accountedPrincipalUsd,
+            accountedUnclaimedUsd,
             { allowDown },
           )
-          next = await withPositionAge(merged, cf, principalUsd)
+          next = await withPositionAge(merged, cf, accountedPrincipalUsd)
         } else if (row.version === 'v4' && row.poolId) {
           const cf = await withTimeout(
             loadV4PositionCashflow({
@@ -3397,6 +4012,8 @@ export async function enrichPositionsLifetimeFees(
               tickUpper: row.tickUpper,
               token0: row.token0.address,
               token1: row.token1.address,
+              position: row,
+              currentWethUsd: wethUsd,
             }),
             45_000,
             `V4 fees #${row.tokenId}`,
