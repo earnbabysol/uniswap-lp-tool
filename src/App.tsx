@@ -4213,6 +4213,11 @@ export default function App() {
                 <input type="checkbox" checked={seedOnCreate} onChange={(e) => setSeedOnCreate(e.target.checked)} />
                 同时注入初仓（与创建同笔发送）
               </label>
+              {mintProtocol === 'v4' && seedOnCreate && (
+                <p className="muted small" style={{ marginTop: -4, marginBottom: 8 }}>
+                  上方费率档是池手续费。注入时山寨币转账扣费会自动垫付；仍失败可先取消本勾选，只建空池再 Mint。
+                </p>
+              )}
 
               {seedOnCreate && (
                 <>
