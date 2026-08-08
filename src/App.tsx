@@ -2296,6 +2296,35 @@ export default function App() {
     )
     try {
       if (mintProtocol === 'v4') {
+        // 池费率（你要的 0.25%）≠ 币转账扣费。注入初仓时自动探测并垫付，无需手填。
+        let taxA = 0
+        let taxB = 0
+        if (seedOnCreate && (chainId === 56 || chainId === 1)) {
+          setStatus('注入前自动检测代币转账扣费（与池费率无关）…')
+          const probe = async (addr: Address) => {
+            if (isEthLikeCurrency(addr) || isHoneypotWhitelisted(chainId, addr)) return 0
+            const bps = await fetchTransferTaxBps(chainId, addr)
+            return bps != null && bps > 0 ? bps : 0
+          }
+          ;[taxA, taxB] = await Promise.all([probe(tokenA), probe(tokenB)])
+          // 手填优先取更大值（防动态税低估）
+          if (!isEthLikeCurrency(tokenA) && !isHoneypotWhitelisted(chainId, tokenA)) {
+            taxA = Math.max(taxA, transferTaxBps)
+          }
+          if (!isEthLikeCurrency(tokenB) && !isHoneypotWhitelisted(chainId, tokenB)) {
+            taxB = Math.max(taxB, transferTaxBps)
+          }
+          if (taxA > 0 || taxB > 0) {
+            const shown = Math.max(taxA, taxB)
+            setTransferTaxBps((prev) => (prev > 0 ? prev : shown))
+            setStatus(
+              `池费率 ${(useFee / 10000).toFixed(2)}% · 已自动按转账扣费约 ${(shown / 100).toFixed(2)}% 垫付注入…`,
+            )
+          }
+        } else {
+          taxA = isHoneypotWhitelisted(chainId, tokenA) || isEthLikeCurrency(tokenA) ? 0 : transferTaxBps
+          taxB = isHoneypotWhitelisted(chainId, tokenB) || isEthLikeCurrency(tokenB) ? 0 : transferTaxBps
+        }
         const { pool: info, hash, seeded } = await createV4PoolAndSeed({
           walletClient: wallet,
           owner: address,
@@ -2310,8 +2339,8 @@ export default function App() {
           tickUpper,
           useNativeEth,
           slippageBps,
-          transferTaxBpsA: isHoneypotWhitelisted(chainId, tokenA) || isEthLikeCurrency(tokenA) ? 0 : transferTaxBps,
-          transferTaxBpsB: isHoneypotWhitelisted(chainId, tokenB) || isEthLikeCurrency(tokenB) ? 0 : transferTaxBps,
+          transferTaxBpsA: taxA,
+          transferTaxBpsB: taxB,
           onStatus: setStatus,
         })
         setPool(info)

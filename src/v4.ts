@@ -1366,15 +1366,45 @@ export async function createV4PoolAndSeed(opts: {
   })
 
   onStatus?.(wantSeed ? '准备创建 V4 池并注入…' : '准备创建并初始化 V4 池…')
-  const gas = await estimateGasQuick({
-    account: owner,
-    to: CONTRACTS.v4PositionManager,
-    data,
-    value,
-    // init + mint 较重；估 gas 卡住时用此值尽快弹钱包
-    fallback: wantSeed ? 3_500_000n : 800_000n,
-    raceMs: 1500,
-  })
+  // 创建+注入必须先模拟成功再弹钱包，避免 Rabby「第三方合约执行失败」却看不出原因
+  let gas: bigint
+  try {
+    const estimated = await withTimeout(
+      publicClient.estimateGas({
+        account: owner,
+        to: CONTRACTS.v4PositionManager,
+        data,
+        value: value > 0n ? value : undefined,
+      }),
+      12_000,
+      '模拟创建 V4 池',
+    )
+    gas = (estimated * 130n) / 100n
+  } catch (e) {
+    const raw = e instanceof Error ? e.message : String(e)
+    if (/MaximumAmountExceeded/i.test(raw)) {
+      throw new Error('创建池模拟失败：滑点保护触发，请调大顶部滑点或减少注入数量后重试。')
+    }
+    if (wantSeed) {
+      if (/CurrencyNotSettled|not settled|STF|TRANSFER_FROM_FAILED|transfer amount exceeds/i.test(raw)) {
+        throw new Error(
+          `创建 ${((opts.fee ?? 0) / 10000).toFixed(2)}% 费率池时，注入模拟失败（代币到账不足，常见于转账扣费币）。可先取消「同时注入初仓」只建空池，建好后再 Mint；或提高转账税 bps 后重试。`,
+        )
+      }
+      throw new Error(
+        `创建池+注入模拟失败（池费率配置一般没问题）。可先取消「同时注入初仓」只创建空池。详情：${raw.slice(0, 160)}`,
+      )
+    }
+    // 仅初始化：RPC 抖时回退估 gas
+    gas = await estimateGasQuick({
+      account: owner,
+      to: CONTRACTS.v4PositionManager,
+      data,
+      value,
+      fallback: 800_000n,
+      raceMs: 1500,
+    })
+  }
 
   onStatus?.(wantSeed ? '请在钱包确认：创建 V4 池并注入流动性…' : '请在钱包确认：创建 V4 池…')
   const hash = await walletClient.writeContract({
