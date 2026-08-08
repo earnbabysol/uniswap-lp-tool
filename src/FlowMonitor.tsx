@@ -12,11 +12,28 @@ import {
   type FlowSide,
   type FlowVersion,
 } from './flowEvents'
-import { getActiveChainId, shortAddr } from './wallet'
+import { shortAddr } from './wallet'
 
 type ChainFilter = 'both' | FlowChainId
 type SideFilter = 'all' | FlowSide
 type VersionFilter = 'all' | FlowVersion
+type SortMode = 'apr' | 'net' | 'volume' | 'latest'
+
+type FlowPoolRow = {
+  key: string
+  latest: FlowEvent
+  eventCount: number
+  inflow: number
+  outflow: number
+  net: number
+  feeAprPct?: number
+  windowSwapUsd?: number
+  windowFeeUsd?: number
+  aprLiquidityUsd?: number
+  aprSwapCount?: number
+  effectiveFeePips?: number
+  aprBasis?: FlowEvent['aprBasis']
+}
 
 function formatUsd(n: number): string {
   if (!Number.isFinite(n)) return '—'
@@ -45,6 +62,42 @@ function formatTokenAmount(n: number): string {
   if (n >= 1) return n.toLocaleString('en-US', { maximumFractionDigits: 4 })
   if (n >= 0.0001) return n.toLocaleString('en-US', { maximumFractionDigits: 6 })
   return n.toExponential(3)
+}
+
+function formatApr(n: number | undefined): string {
+  if (n == null || !Number.isFinite(n) || n < 0) return '—'
+  if (n >= 100_000) return `${Math.round(n).toLocaleString('en-US')}%`
+  if (n >= 1_000) return `${n.toLocaleString('en-US', { maximumFractionDigits: 0 })}%`
+  if (n >= 100) return `${n.toFixed(1)}%`
+  return `${n.toFixed(2)}%`
+}
+
+function formatFee(event: FlowEvent, effectiveFeePips?: number): string {
+  const dynamic = event.version === 'v4' && (event.fee & 0x800000) !== 0
+  const pips = effectiveFeePips ?? (dynamic ? undefined : event.fee)
+  if (pips == null || !Number.isFinite(pips)) return dynamic ? '动态费率' : '费率 —'
+  const percent = pips / 10_000
+  const digits = percent < 0.01 ? 4 : percent < 0.1 ? 3 : 2
+  return `${dynamic ? '均费 ' : ''}${percent.toFixed(digits)}%`
+}
+
+function isReliableApr(row: FlowPoolRow): boolean {
+  const windowFeeYield = (row.windowFeeUsd ?? 0) / Math.max(1, row.aprLiquidityUsd ?? 0)
+  return row.feeAprPct != null
+    && (row.aprLiquidityUsd ?? 0) >= 1_000
+    && (row.aprSwapCount ?? 0) >= 2
+    && windowFeeYield <= 0.1
+}
+
+function aprSampleLabel(row: FlowPoolRow): string {
+  if (row.feeAprPct == null) return '缺少锚定基数'
+  if ((row.aprSwapCount ?? 0) === 0) return '窗口无成交'
+  if ((row.aprLiquidityUsd ?? 0) < 1_000) return '小基数 · 高波动'
+  if ((row.aprSwapCount ?? 0) < 2) return '单笔样本 · 高波动'
+  if ((row.windowFeeUsd ?? 0) / Math.max(1, row.aprLiquidityUsd ?? 0) > 0.1) {
+    return '异常费收 · 谨慎'
+  }
+  return `${FLOW_WINDOW_MINUTES}m 短窗估算`
 }
 
 async function copyText(text: string): Promise<boolean> {
@@ -100,12 +153,13 @@ export type FlowMonitorProps = {
 }
 
 export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
-  const [chainFilter, setChainFilter] = useState<ChainFilter>(() => {
-    const active = getActiveChainId()
-    return active === 56 || active === 4663 ? active : 'both'
-  })
+  const [chainFilter, setChainFilter] = useState<ChainFilter>('both')
   const [sideFilter, setSideFilter] = useState<SideFilter>('all')
   const [versionFilter, setVersionFilter] = useState<VersionFilter>('all')
+  const [sortMode, setSortMode] = useState<SortMode>('apr')
+  const [search, setSearch] = useState('')
+  const [minAprDraft, setMinAprDraft] = useState('0')
+  const [reliableOnly, setReliableOnly] = useState(false)
   const [minUsd, setMinUsd] = useState(100)
   const [minUsdDraft, setMinUsdDraft] = useState('100')
   const [filterHp, setFilterHp] = useState(true)
@@ -115,6 +169,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
   const [notices, setNotices] = useState<FlowNotice[]>([])
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const [elapsedMs, setElapsedMs] = useState<number | null>(null)
+  const eventsRef = useRef<FlowEvent[]>([])
   const genRef = useRef(0)
   const mountedRef = useRef(true)
   const runningRef = useRef(false)
@@ -149,13 +204,58 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
     const chainIds: FlowChainId[] =
       options.chainFilter === 'both' ? [56, 4663] : [options.chainFilter]
     try {
-      const { events: rows, notices: nextNotices } = await fetchFlowEvents({
-        chainIds,
-        minUsd: options.minUsd,
-        filterHoneypot: options.filterHp,
-        limit: 30,
-      })
+      let rows: FlowEvent[]
+      let nextNotices: FlowNotice[]
+      if (chainIds.length === 1) {
+        const result = await fetchFlowEvents({
+          chainIds,
+          minUsd: options.minUsd,
+          filterHoneypot: options.filterHp,
+          limit: 30,
+        })
+        rows = result.events
+        nextNotices = result.notices
+      } else {
+        // 双链首次扫描时 BSC 往往更慢；哪个链先完成就先把该链榜单展示出来，
+        // 不让用户盯着空白页等最慢的数据源。
+        const previousRows = eventsRef.current
+        const results = new Map<FlowChainId, { events: FlowEvent[]; notices: FlowNotice[] }>()
+        const publishPartial = () => {
+          if (!mountedRef.current || gen !== genRef.current) return
+          const combined = chainIds.flatMap((chainId) =>
+            results.get(chainId)?.events
+            ?? previousRows.filter((event) => event.chainId === chainId))
+          combined.sort((a, b) => b.timestamp - a.timestamp)
+          eventsRef.current = combined
+          setEvents(combined)
+          setNotices([...results.values()].flatMap((result) => result.notices))
+        }
+        await Promise.all(chainIds.map(async (chainId) => {
+          try {
+            const result = await fetchFlowEvents({
+              chainIds: [chainId],
+              minUsd: options.minUsd,
+              filterHoneypot: options.filterHp,
+              limit: 20,
+            })
+            results.set(chainId, result)
+          } catch (error) {
+            results.set(chainId, {
+              events: [],
+              notices: [{
+                level: 'error',
+                message: `${flowChainLabel(chainId)}：${error instanceof Error ? error.message : String(error)}`,
+              }],
+            })
+          }
+          publishPartial()
+        }))
+        rows = chainIds.flatMap((chainId) => results.get(chainId)?.events ?? [])
+        rows.sort((a, b) => b.timestamp - a.timestamp)
+        nextNotices = [...results.values()].flatMap((result) => result.notices)
+      }
       if (!mountedRef.current || gen !== genRef.current) return
+      eventsRef.current = rows
       setEvents(rows)
       setNotices(nextNotices)
       setUpdatedAt(Date.now())
@@ -207,22 +307,104 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
     return () => document.removeEventListener('visibilitychange', onVisible)
   }, [auto, load])
 
+  const pools = useMemo(() => {
+    const grouped = new Map<string, FlowPoolRow>()
+    for (const event of events) {
+      if (versionFilter !== 'all' && event.version !== versionFilter) continue
+      const poolRef = flowPoolRef(event)
+      const key = `${event.chainId}:${event.version}:${poolRef.toLowerCase()}`
+      const previous = grouped.get(key)
+      const inflow = event.side === 'in' ? event.amountUsd : 0
+      const outflow = event.side === 'out' ? event.amountUsd : 0
+      if (!previous) {
+        grouped.set(key, {
+          key,
+          latest: event,
+          eventCount: 1,
+          inflow,
+          outflow,
+          net: inflow - outflow,
+          feeAprPct: event.feeAprPct,
+          windowSwapUsd: event.windowSwapUsd,
+          windowFeeUsd: event.windowFeeUsd,
+          aprLiquidityUsd: event.aprLiquidityUsd,
+          aprSwapCount: event.aprSwapCount,
+          effectiveFeePips: event.effectiveFeePips,
+          aprBasis: event.aprBasis,
+        })
+        continue
+      }
+      previous.eventCount += 1
+      previous.inflow += inflow
+      previous.outflow += outflow
+      previous.net = previous.inflow - previous.outflow
+      if (event.timestamp > previous.latest.timestamp) previous.latest = event
+      if (previous.feeAprPct == null && event.feeAprPct != null) {
+        previous.feeAprPct = event.feeAprPct
+        previous.windowSwapUsd = event.windowSwapUsd
+        previous.windowFeeUsd = event.windowFeeUsd
+        previous.aprLiquidityUsd = event.aprLiquidityUsd
+        previous.aprSwapCount = event.aprSwapCount
+        previous.effectiveFeePips = event.effectiveFeePips
+        previous.aprBasis = event.aprBasis
+      }
+    }
+    return [...grouped.values()]
+  }, [events, versionFilter])
+
   const visible = useMemo(() => {
-    return events.filter((e) => {
-      if (sideFilter !== 'all' && e.side !== sideFilter) return false
-      if (versionFilter !== 'all' && e.version !== versionFilter) return false
+    const query = search.trim().toLowerCase()
+    const parsedMinApr = Number(minAprDraft.replace(/,/g, '').trim())
+    const minApr = Number.isFinite(parsedMinApr) ? Math.max(0, parsedMinApr) : 0
+    const rows = pools.filter((row) => {
+      if (sideFilter === 'in' && !(row.net > 0)) return false
+      if (sideFilter === 'out' && !(row.net < 0)) return false
+      if (minApr > 0 && !(row.feeAprPct != null && row.feeAprPct >= minApr)) return false
+      if (reliableOnly && !isReliableApr(row)) return false
+      if (query) {
+        const event = row.latest
+        const haystack = [
+          event.symbol0,
+          event.symbol1,
+          event.token0,
+          event.token1,
+          flowPoolRef(event),
+          flowChainLabel(event.chainId),
+          event.version,
+        ].join(' ').toLowerCase()
+        if (!haystack.includes(query)) return false
+      }
       return true
     })
-  }, [events, sideFilter, versionFilter])
+    rows.sort((a, b) => {
+      if (sortMode === 'apr') {
+        const aApr = a.feeAprPct
+        const bApr = b.feeAprPct
+        if (aApr == null && bApr != null) return 1
+        if (aApr != null && bApr == null) return -1
+        if (aApr != null && bApr != null && aApr !== bApr) return bApr - aApr
+      } else if (sortMode === 'net' && a.net !== b.net) {
+        return b.net - a.net
+      } else if (sortMode === 'volume') {
+        const delta = (b.windowSwapUsd ?? -1) - (a.windowSwapUsd ?? -1)
+        if (delta !== 0) return delta
+      }
+      if (a.latest.timestamp !== b.latest.timestamp) return b.latest.timestamp - a.latest.timestamp
+      return a.key.localeCompare(b.key)
+    })
+    return rows
+  }, [minAprDraft, pools, reliableOnly, search, sideFilter, sortMode])
 
   const summary = useMemo(() => {
     let inflow = 0
     let outflow = 0
-    for (const event of visible) {
-      if (event.side === 'in') inflow += event.amountUsd
-      else outflow += event.amountUsd
+    let withApr = 0
+    for (const row of visible) {
+      inflow += row.inflow
+      outflow += row.outflow
+      if (row.feeAprPct != null) withApr += 1
     }
-    return { inflow, outflow, net: inflow - outflow }
+    return { inflow, outflow, net: inflow - outflow, withApr }
   }, [visible])
 
   const applyMinUsd = () => {
@@ -244,7 +426,11 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
             最近 {FLOW_WINDOW_MINUTES} 分钟 · Uniswap V3 + V4 · BSC / Robinhood 开/加仓与撤出
           </p>
           <p className="flow-trust-note">
-            金额只统计稳定币与 WETH/WBNB 的实际进出，不采信新币自己的池价。
+            默认按手续费年化从高到低。年化 = 近 {FLOW_WINDOW_MINUTES} 分钟锚定 Swap 手续费 ÷ 流动性基数 × 365；
+            短窗口只用于发现，不代表未来收益。
+          </p>
+          <p className="flow-trust-note subtle">
+            V3 基数取池合约余额；V4 为 singleton，采用当前活跃流动性深度估算。两者都只信稳定币与 WETH/WBNB 锚点。
           </p>
         </div>
         <div className="pos-page-actions">
@@ -287,12 +473,25 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
           方向
           <select value={sideFilter} onChange={(e) => setSideFilter(e.target.value as SideFilter)}>
             <option value="all">全部</option>
-            <option value="in">仅流入</option>
-            <option value="out">仅流出</option>
+            <option value="in">净流入</option>
+            <option value="out">净流出</option>
+          </select>
+        </label>
+        <label className="inline-setting">
+          排序
+          <select
+            aria-label="排序方式"
+            value={sortMode}
+            onChange={(e) => setSortMode(e.target.value as SortMode)}
+          >
+            <option value="apr">手续费年化：高到低</option>
+            <option value="net">净流入：高到低</option>
+            <option value="volume">Swap 成交额：高到低</option>
+            <option value="latest">最近动向</option>
           </select>
         </label>
         <div className="inline-setting flow-min-setting">
-          <span>最低锚定 USD</span>
+          <span>单笔动向 ≥ USD</span>
           <input
             className="flow-min-input"
             type="number"
@@ -317,6 +516,29 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
             应用
           </button>
         </div>
+        <label className="inline-setting flow-apr-min-setting">
+          最低年化 %
+          <input
+            className="flow-min-input"
+            type="number"
+            min={0}
+            step={10}
+            value={minAprDraft}
+            aria-label="最低手续费年化百分比"
+            onChange={(e) => setMinAprDraft(e.target.value)}
+          />
+        </label>
+        <label
+          className="inline-setting check"
+          title="至少 2 笔可锚定 Swap、年化基数不低于 1,000 美元，且窗口手续费不超过基数的 10%"
+        >
+          <input
+            type="checkbox"
+            checked={reliableOnly}
+            onChange={(e) => setReliableOnly(e.target.checked)}
+          />
+          仅看有效样本
+        </label>
         <label className="inline-setting check" title="仅过滤风险接口明确判定的 BSC 貔貅；未知代币不会误杀，Robinhood 暂无对应检测服务">
           <input type="checkbox" checked={filterHp} onChange={(e) => setFilterHp(e.target.checked)} />
           过滤已确认貔貅
@@ -334,6 +556,17 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         )}
       </div>
 
+      <div className="flow-discovery-bar">
+        <input
+          type="search"
+          value={search}
+          aria-label="搜索动向池"
+          placeholder="搜索币种 / CA / 池地址"
+          onChange={(e) => setSearch(e.target.value)}
+        />
+        <span className="muted">共 {pools.length} 个池 · 当前显示 {visible.length} 个</span>
+      </div>
+
       {warningMessages.length > 0 && (
         <p className="flow-banner warn">
           {warningMessages.map((notice) => notice.message).join(' · ')}
@@ -348,8 +581,12 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
       {(updatedAt || visible.length > 0) && (
         <div className="flow-summary" aria-label="当前筛选汇总">
           <div className="flow-summary-item">
-            <span className="muted">记录</span>
+            <span className="muted">池子</span>
             <strong>{visible.length}</strong>
+          </div>
+          <div className="flow-summary-item apr">
+            <span className="muted">可计算年化</span>
+            <strong>{summary.withApr}</strong>
           </div>
           <div className="flow-summary-item in">
             <span className="muted">流入</span>
@@ -366,36 +603,57 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         </div>
       )}
 
-      {busy && visible.length === 0 ? (
+      {busy && events.length === 0 ? (
         <p className="muted flow-empty">
-          正在扫描最近 {FLOW_WINDOW_MINUTES} 分钟链上日志，首次可能需要 10–30 秒…
+          正在扫描最近 {FLOW_WINDOW_MINUTES} 分钟链上日志并计算池级年化，首次可能需要 10–30 秒…
         </p>
       ) : visible.length === 0 ? (
         <p className="muted flow-empty">
           {errorMessages.length > 0
             ? '当前数据源暂不可用，请检查上方错误或在设置中更换 RPC 后重试'
-            : '最近窗口暂无符合条件的锚定资金记录（可调低金额或关闭貔貅过滤重试）'}
+            : pools.length > 0
+              ? '没有池子符合当前年化、方向或搜索条件，请放宽筛选后重试'
+              : '最近窗口暂无符合条件的锚定资金记录（可调低金额或关闭貔貅过滤重试）'}
         </p>
       ) : (
         <div className="flow-list">
-          {visible.map((e) => {
+          {visible.map((row, index) => {
+            const e = row.latest
             const poolRef = flowPoolRef(e)
+            const direction: FlowSide = row.net >= 0 ? 'in' : 'out'
+            const reliable = isReliableApr(row)
+            const basisLabel = row.aprBasis === 'active-liquidity'
+              ? 'V4 当前活跃流动性深度（估算）'
+              : 'V3 当前池合约余额（锚定侧估值）'
             return (
-              <article key={e.id} className={`flow-card ${e.side}`}>
+              <article
+                key={row.key}
+                className={`flow-card ${direction}`}
+                data-testid="flow-pool-card"
+                data-apr={row.feeAprPct == null ? '' : String(row.feeAprPct)}
+              >
                 <div className="flow-card-top">
-                  <span className={`flow-side ${e.side}`}>{e.side === 'in' ? '流入' : '流出'}</span>
+                  <span className="flow-rank" aria-label={`列表第 ${index + 1} 名`}>#{index + 1}</span>
+                  <span className={`flow-side ${direction}`}>
+                    {row.net > 0 ? '净流入' : row.net < 0 ? '净流出' : '持平'}
+                  </span>
                   <span className={`flow-ver ${e.version}`}>{e.version.toUpperCase()}</span>
                   <span className="flow-chain">{flowChainLabel(e.chainId)}</span>
                   <span className="flow-source">{e.source === 'subgraph' ? 'Graph' : '链上'}</span>
-                  <span className="muted mono">{formatTime(e.timestamp)}</span>
-                  <span className="flow-usd" title="稳定币与 WETH/WBNB 的锚定资金">
-                    {e.amountEstimated ? '≈' : ''}{formatUsd(e.amountUsd)}
-                  </span>
+                  <span className="muted mono">最近 {formatTime(e.timestamp)}</span>
+                  <div
+                    className={`flow-apr-box ${reliable ? 'reliable' : 'volatile'}`}
+                    title={`近 ${FLOW_WINDOW_MINUTES} 分钟手续费 ÷ ${basisLabel} × 365，简单年化、不复利`}
+                  >
+                    <span>手续费年化估算</span>
+                    <strong data-testid="flow-apr-value">{formatApr(row.feeAprPct)}</strong>
+                    <em>{aprSampleLabel(row)}</em>
+                  </div>
                 </div>
                 <div className="flow-pair">
                   <span className="flow-pair-name">
                     {e.symbol0} / {e.symbol1}
-                    <span className="muted"> · {(e.fee / 10000).toFixed(2)}%</span>
+                    <span className="muted"> · {formatFee(e, row.effectiveFeePips)}</span>
                   </span>
                   <span className="flow-copy-group">
                     <CopyBtn label={`CA ${e.symbol0}`} value={e.token0} title={`复制 ${e.symbol0}：${e.token0}`} />
@@ -407,9 +665,36 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
                     />
                   </span>
                 </div>
+                <div className="flow-pool-stats">
+                  <div>
+                    <span className="muted">{FLOW_WINDOW_MINUTES}m Swap</span>
+                    <strong>{row.windowSwapUsd == null ? '—' : formatUsd(row.windowSwapUsd)}</strong>
+                  </div>
+                  <div>
+                    <span className="muted">{FLOW_WINDOW_MINUTES}m 手续费</span>
+                    <strong>{row.windowFeeUsd == null ? '—' : formatUsd(row.windowFeeUsd)}</strong>
+                  </div>
+                  <div title={basisLabel}>
+                    <span className="muted">年化基数 {e.version === 'v4' ? '≈' : ''}</span>
+                    <strong>{row.aprLiquidityUsd == null ? '—' : formatUsd(row.aprLiquidityUsd)}</strong>
+                  </div>
+                  <div>
+                    <span className="muted">锚定 Swap</span>
+                    <strong>{row.aprSwapCount == null ? '—' : `${row.aprSwapCount} 笔`}</strong>
+                  </div>
+                  <div className={row.net >= 0 ? 'positive' : 'negative'}>
+                    <span className="muted">净流</span>
+                    <strong>{row.net > 0 ? '+' : ''}{formatUsd(row.net)}</strong>
+                  </div>
+                  <div>
+                    <span className="muted">大额动向</span>
+                    <strong>{row.eventCount} 笔</strong>
+                  </div>
+                </div>
                 {e.amount0 != null && e.amount1 != null && (
-                  <div className="flow-token-amounts">
-                    <span className="muted">{e.amountEstimated ? '按当前池状态估算数量' : '事件数量'}</span>
+                  <div className="flow-token-amounts flow-latest-action">
+                    <span className="muted">最近一笔 {e.side === 'in' ? '流入' : '流出'} {e.amountEstimated ? '（数量估算）' : ''}</span>
+                    <strong>{e.amountEstimated ? '≈' : ''}{formatUsd(e.amountUsd)}</strong>
                     <strong>{formatTokenAmount(e.amount0)} {e.symbol0}</strong>
                     <span className="muted">+</span>
                     <strong>{formatTokenAmount(e.amount1)} {e.symbol1}</strong>
@@ -419,18 +704,13 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
                   <code className="mono muted" title={poolRef}>
                     {e.version === 'v4' ? 'poolId' : '池'} {shortAddr(poolRef as Address)}
                   </code>
-                  {e.tokenId && (
-                    <span className="mono muted flow-token-id" title={`NFT #${e.tokenId}`}>
-                      NFT #{e.tokenId.length > 10 ? `${e.tokenId.slice(0, 6)}…${e.tokenId.slice(-4)}` : e.tokenId}
-                    </span>
-                  )}
                   <a
                     className="btn ghost tight"
                     href={flowExplorerTx(e.chainId, e.txHash)}
                     target="_blank"
                     rel="noreferrer"
                   >
-                    交易 ↗
+                    最近交易 ↗
                   </a>
                   <button
                     type="button"

@@ -27,7 +27,7 @@ import {
 import { CHAIN_CONFIGS, type SupportedChainId } from './chain'
 import { loadGraphApiKey } from './graphSettings'
 import { checkPoolTokensSafe, isHoneypotWhitelisted } from './honeypot'
-import { getAmountsForPosition, rawToNumber, tickToPrice } from './math'
+import { Q96, getAmountsForPosition, rawToNumber, tickToPrice } from './math'
 import { loadCustomRpcUrl } from './rpcSettings'
 
 /** 动向支持的链 */
@@ -64,6 +64,20 @@ export type FlowEvent = {
   owner?: Address
   tokenId?: string
   source: 'subgraph' | 'logs'
+  /** 最近窗口内、仅按稳定币或 WETH/WBNB 锚定的 Swap 成交额。 */
+  windowSwapUsd?: number
+  /** 最近窗口内按每笔实际费率估算的 LP 手续费。 */
+  windowFeeUsd?: number
+  /** 用于年化计算的流动性 USD 基数。 */
+  aprLiquidityUsd?: number
+  /** 简单年化（APR），不是复利 APY。 */
+  feeAprPct?: number
+  /** 窗口内可锚定的 Swap 笔数。 */
+  aprSwapCount?: number
+  /** 成交额加权后的实际费率，单位为 1e-6。 */
+  effectiveFeePips?: number
+  /** V3 用池合约余额；V4 singleton 无法直接拆分余额，使用当前活跃流动性深度。 */
+  aprBasis?: 'pool-balance' | 'active-liquidity'
 }
 
 /** 复制 / 开仓用的池引用 */
@@ -105,10 +119,18 @@ const V3_POOL_BURN = parseAbiItem(
 const V4_MODIFY = parseAbiItem(
   'event ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)',
 )
+const V3_SWAP = parseAbiItem(
+  'event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)',
+)
+const V4_SWAP = parseAbiItem(
+  'event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)',
+)
 
 export const FLOW_WINDOW_MINUTES = 45
 const EVENT_TTL_MS = FLOW_WINDOW_MINUTES * 60_000
 const WETH_USD_TTL_MS = 5 * 60_000
+const APR_TTL_MS = 60_000
+const APR_WINDOWS_PER_YEAR = (365 * 24 * 60) / FLOW_WINDOW_MINUTES
 
 /**
  * 约 45 分钟的初次窗口。两条链当前都不是传统的 2~3 秒块：实测 BSC 约
@@ -117,6 +139,13 @@ const WETH_USD_TTL_MS = 5 * 60_000
 const LOG_SCAN: Record<FlowChainId, { lookback: bigint; span: bigint; reorg: bigint }> = {
   56: { lookback: 7_000n, span: 5_000n, reorg: 24n },
   4663: { lookback: 30_000n, span: 30_000n, reorg: 120n },
+}
+
+// Swap 比 NPM/ModifyLiquidity 密集几个数量级，不能沿用普通动向日志的大跨度；
+// 否则公共 RPC 会把“结果过多”也当成 429。小块串行更稳定。
+const APR_LOG_SPAN: Record<FlowChainId, bigint> = {
+  56: 1_500n,
+  4663: 5_000n,
 }
 
 type PosRow = {
@@ -203,6 +232,34 @@ const v4Caches: Record<FlowChainId, V4Cache> = {
   4663: { tip: 0n, events: [], pools: new Map() },
 }
 
+type FlowAprMetric = {
+  windowSwapUsd: number
+  windowFeeUsd: number
+  aprLiquidityUsd?: number
+  feeAprPct?: number
+  aprSwapCount: number
+  effectiveFeePips?: number
+  aprBasis: 'pool-balance' | 'active-liquidity'
+}
+
+type FlowAprCacheEntry = {
+  at: number
+  metric: FlowAprMetric
+}
+
+const flowAprCache = new Map<string, FlowAprCacheEntry>()
+
+function flowAprKey(chainId: FlowChainId, version: FlowVersion, poolRef: string): string {
+  return `${chainId}:${version}:${poolRef.toLowerCase()}`
+}
+
+function clearFlowAprCache(chainId: FlowChainId): void {
+  const prefix = `${chainId}:`
+  for (const key of flowAprCache.keys()) {
+    if (key.startsWith(prefix)) flowAprCache.delete(key)
+  }
+}
+
 function asErc20(chainId: FlowChainId, currency: Address): Address {
   if (currency === zeroAddress || currency.toLowerCase() === zeroAddress) {
     return CHAIN_CONFIGS[chainId].contracts.weth
@@ -250,6 +307,7 @@ function getClient(chainId: FlowChainId): PublicClient {
   if (!c.client || c.clientKey !== clientKey) {
     c.client = makeClient(chainId)
     c.clientKey = clientKey
+    clearFlowAprCache(chainId)
   }
   return c.client
 }
@@ -359,6 +417,26 @@ function isRecentTimestamp(timestamp: number, now = Date.now()): boolean {
 function errorText(error: unknown): string {
   if (error instanceof Error) return error.message
   return String(error)
+}
+
+function isRateLimitError(error: unknown): boolean {
+  const lower = errorText(error).toLowerCase()
+  return lower.includes('429') || lower.includes('rate limit')
+}
+
+async function retryRateLimited<T>(run: () => Promise<T>): Promise<T> {
+  const delays = [1_200]
+  let lastError: unknown
+  for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+    try {
+      return await run()
+    } catch (error) {
+      lastError = error
+      if (!isRateLimitError(error) || attempt >= delays.length) throw error
+      await new Promise<void>((resolve) => window.setTimeout(resolve, delays[attempt]))
+    }
+  }
+  throw lastError
 }
 
 function friendlyErrorText(error: unknown): string {
@@ -1860,6 +1938,489 @@ async function filterHoneypotFast(events: FlowEvent[]): Promise<FlowEvent[]> {
   })
 }
 
+function absBigint(value: bigint): bigint {
+  return value < 0n ? -value : value
+}
+
+function anchorUnitUsd(
+  token: Address,
+  weth: Address,
+  stableSet: Set<string>,
+  wethUsd: number,
+): number {
+  const address = token.toLowerCase()
+  if (stableSet.has(address)) return 1
+  if (address === weth.toLowerCase() && wethUsd > 0) return wethUsd
+  return 0
+}
+
+/**
+ * Swap 的正数侧是池子收到的输入；优先用输入侧作为成交额。若输入不是锚定
+ * 资产，则用输出侧近似成交额。两边都可锚定时只取一边，避免翻倍。
+ */
+function anchoredSwapNotionalUsd(opts: {
+  amount0: bigint
+  amount1: bigint
+  decimals0: number
+  decimals1: number
+  token0: Address
+  token1: Address
+  weth: Address
+  stableSet: Set<string>
+  wethUsd: number
+}): number {
+  const unit0 = anchorUnitUsd(opts.token0, opts.weth, opts.stableSet, opts.wethUsd)
+  const unit1 = anchorUnitUsd(opts.token1, opts.weth, opts.stableSet, opts.wethUsd)
+  const usd0 = unit0 > 0 ? rawToNumber(absBigint(opts.amount0), opts.decimals0) * unit0 : 0
+  const usd1 = unit1 > 0 ? rawToNumber(absBigint(opts.amount1), opts.decimals1) * unit1 : 0
+  const input0 = opts.amount0 > 0n ? usd0 : 0
+  const input1 = opts.amount1 > 0n ? usd1 : 0
+  const input = Math.max(input0, input1)
+  return clampUsd(input > 0 ? input : Math.max(usd0, usd1))
+}
+
+/**
+ * 只用可验证的锚定侧估值。若仅一侧可锚定，以该侧 x2 近似双边价值；这不会
+ * 采信新币自己的池价，并会在 UI 明确标为估算基数。
+ */
+function anchoredLiquidityUsd(opts: {
+  amount0: bigint
+  amount1: bigint
+  decimals0: number
+  decimals1: number
+  token0: Address
+  token1: Address
+  weth: Address
+  stableSet: Set<string>
+  wethUsd: number
+}): number {
+  const unit0 = anchorUnitUsd(opts.token0, opts.weth, opts.stableSet, opts.wethUsd)
+  const unit1 = anchorUnitUsd(opts.token1, opts.weth, opts.stableSet, opts.wethUsd)
+  const usd0 = unit0 > 0 ? rawToNumber(absBigint(opts.amount0), opts.decimals0) * unit0 : 0
+  const usd1 = unit1 > 0 ? rawToNumber(absBigint(opts.amount1), opts.decimals1) * unit1 : 0
+  if (unit0 > 0 && unit1 > 0) return clampUsd(usd0 + usd1)
+  if (unit0 > 0) return clampUsd(usd0 * 2)
+  if (unit1 > 0) return clampUsd(usd1 * 2)
+  return 0
+}
+
+function annualizedFeePct(windowFeeUsd: number, liquidityUsd: number): number | undefined {
+  if (!(windowFeeUsd >= 0) || !(liquidityUsd > 0)) return undefined
+  const apr = (windowFeeUsd / liquidityUsd) * APR_WINDOWS_PER_YEAR * 100
+  if (!Number.isFinite(apr) || apr < 0) return undefined
+  // 防止极端小池把 Infinity/指数级数字带进排序与布局；仍保留足够高的风险信号。
+  return Math.min(apr, 1_000_000_000)
+}
+
+function blockRanges(head: ScanHead, span: bigint): Array<{ from: bigint; to: bigint }> {
+  const ranges: Array<{ from: bigint; to: bigint }> = []
+  for (let from = head.windowStart; from <= head.latest; from += span) {
+    const to = from + span - 1n > head.latest ? head.latest : from + span - 1n
+    ranges.push({ from, to })
+  }
+  return ranges
+}
+
+type V3AprSwap = {
+  pool: Address
+  amount0: bigint
+  amount1: bigint
+  blockNumber: bigint
+}
+
+async function fetchV3AprSwaps(
+  client: PublicClient,
+  chainId: FlowChainId,
+  pools: Address[],
+  head: ScanHead,
+): Promise<V3AprSwap[]> {
+  if (pools.length === 0) return []
+  const addressChunks: Address[][] = []
+  for (let i = 0; i < pools.length; i += 6) addressChunks.push(pools.slice(i, i + 6))
+  const jobs = addressChunks.flatMap((addresses) =>
+    blockRanges(head, APR_LOG_SPAN[chainId]).map((range) => ({ addresses, ...range })))
+  const nested = await mapPool(jobs, 2, async (job) => {
+    const address = job.addresses.length === 1 ? job.addresses[0]! : job.addresses
+    try {
+      const logs = await retryRateLimited(() => client.getLogs({
+        address,
+        event: V3_SWAP,
+        fromBlock: job.from,
+        toBlock: job.to,
+      }))
+      return logs.map((log) => ({
+        pool: log.address,
+        amount0: log.args.amount0 ?? 0n,
+        amount1: log.args.amount1 ?? 0n,
+        blockNumber: log.blockNumber ?? 0n,
+      }))
+    } catch (error) {
+      // 少数 RPC 不接受 address 数组，退回逐池查询；仍保持块范围受控。
+      if (job.addresses.length === 1 || isRateLimitError(error)) throw error
+      const fallbackLogs = await mapPool(job.addresses, 3, async (pool) => (
+        retryRateLimited(() => client.getLogs({
+          address: pool,
+          event: V3_SWAP,
+          fromBlock: job.from,
+          toBlock: job.to,
+        }))
+      ))
+      return fallbackLogs.flat().map((log) => ({
+        pool: log.address,
+        amount0: log.args.amount0 ?? 0n,
+        amount1: log.args.amount1 ?? 0n,
+        blockNumber: log.blockNumber ?? 0n,
+      }))
+    }
+  })
+  return nested.flat().filter((log) =>
+    isRecentTimestamp(estimatedBlockTimestamp(head, log.blockNumber)))
+}
+
+type V4AprSwap = {
+  poolId: `0x${string}`
+  amount0: bigint
+  amount1: bigint
+  feePips: number
+  blockNumber: bigint
+}
+
+async function fetchV4AprSwaps(
+  client: PublicClient,
+  chainId: FlowChainId,
+  poolIds: `0x${string}`[],
+  head: ScanHead,
+): Promise<V4AprSwap[]> {
+  if (poolIds.length === 0) return []
+  const cfg = CHAIN_CONFIGS[chainId]
+  const idChunks: Array<`0x${string}`[]> = []
+  for (let i = 0; i < poolIds.length; i += 10) idChunks.push(poolIds.slice(i, i + 10))
+  const jobs = idChunks.flatMap((ids) =>
+    blockRanges(head, APR_LOG_SPAN[chainId]).map((range) => ({ ids, ...range })))
+  const nested = await mapPool(jobs, 2, async (job) => {
+    const id = job.ids.length === 1 ? job.ids[0]! : job.ids
+    try {
+      const logs = await retryRateLimited(() => client.getLogs({
+        address: cfg.contracts.v4PoolManager,
+        event: V4_SWAP,
+        args: { id },
+        fromBlock: job.from,
+        toBlock: job.to,
+      }))
+      return logs.map((log) => ({
+        poolId: log.args.id as `0x${string}`,
+        amount0: log.args.amount0 ?? 0n,
+        amount1: log.args.amount1 ?? 0n,
+        feePips: Number(log.args.fee ?? 0),
+        blockNumber: log.blockNumber ?? 0n,
+      }))
+    } catch (error) {
+      if (job.ids.length === 1 || isRateLimitError(error)) throw error
+      const fallbackLogs = await mapPool(job.ids, 3, async (poolId) => (
+        retryRateLimited(() => client.getLogs({
+          address: cfg.contracts.v4PoolManager,
+          event: V4_SWAP,
+          args: { id: poolId },
+          fromBlock: job.from,
+          toBlock: job.to,
+        }))
+      ))
+      return fallbackLogs.flat().map((log) => ({
+        poolId: log.args.id as `0x${string}`,
+        amount0: log.args.amount0 ?? 0n,
+        amount1: log.args.amount1 ?? 0n,
+        feePips: Number(log.args.fee ?? 0),
+        blockNumber: log.blockNumber ?? 0n,
+      }))
+    }
+  })
+  return nested.flat().filter((log) =>
+    isRecentTimestamp(estimatedBlockTimestamp(head, log.blockNumber)))
+}
+
+async function fetchV3AprMetrics(
+  chainId: FlowChainId,
+  events: FlowEvent[],
+): Promise<Map<string, FlowAprMetric>> {
+  const client = getClient(chainId)
+  const refs = [...new Map(events.map((event) => [
+    event.poolAddress.toLowerCase(),
+    event.poolAddress,
+  ])).values()]
+  let head: ScanHead
+  let wethUsd: number
+  let poolRows: Map<string, PosRow | null>
+  try {
+    head = await retryRateLimited(() => getScanHead(client, chainId))
+  } catch (error) {
+    throw new Error(`链头：${friendlyErrorText(error)}`)
+  }
+  try {
+    wethUsd = await retryRateLimited(() => wethUsdOnChain(client, chainId))
+  } catch (error) {
+    throw new Error(`锚定价格：${friendlyErrorText(error)}`)
+  }
+  try {
+    poolRows = await retryRateLimited(() => resolveV3PoolsBatch(client, chainId, refs))
+  } catch (error) {
+    throw new Error(`池元数据：${friendlyErrorText(error)}`)
+  }
+  const candidates = refs.flatMap((pool) => {
+    const row = poolRows.get(pool.toLowerCase())
+    return row ? [{ pool, row }] : []
+  })
+  // Robinhood 公共 RPC 对并发 eth_getLogs + eth_call 很容易 429；两步串行只多
+  // 一个 RTT，却能让 V3 年化稳定落地。
+  let swaps: V3AprSwap[]
+  try {
+    swaps = await fetchV3AprSwaps(client, chainId, candidates.map(({ pool }) => pool), head)
+  } catch (error) {
+    throw new Error(`Swap 日志：${friendlyErrorText(error)}`)
+  }
+  let balanceResults: UnknownCallResult[]
+  try {
+    balanceResults = await retryRateLimited(() =>
+      readBatch(client, candidates.flatMap(({ pool, row }) => [
+        { address: row.token0, abi: erc20Abi, functionName: 'balanceOf', args: [pool] },
+        { address: row.token1, abi: erc20Abi, functionName: 'balanceOf', args: [pool] },
+      ])))
+  } catch (error) {
+    throw new Error(`池余额：${friendlyErrorText(error)}`)
+  }
+  const swapsByPool = new Map<string, V3AprSwap[]>()
+  for (const swap of swaps) {
+    const key = swap.pool.toLowerCase()
+    const rows = swapsByPool.get(key) ?? []
+    rows.push(swap)
+    swapsByPool.set(key, rows)
+  }
+
+  const cfg = CHAIN_CONFIGS[chainId]
+  const stableSet = new Set([cfg.contracts.stable, ...(cfg.usdStables ?? [])].map((x) => x.toLowerCase()))
+  const out = new Map<string, FlowAprMetric>()
+  for (let i = 0; i < candidates.length; i += 1) {
+    const { pool, row } = candidates[i]!
+    let windowSwapUsd = 0
+    let windowFeeUsd = 0
+    let aprSwapCount = 0
+    for (const swap of swapsByPool.get(pool.toLowerCase()) ?? []) {
+      const notional = anchoredSwapNotionalUsd({
+        amount0: swap.amount0,
+        amount1: swap.amount1,
+        decimals0: row.decimals0,
+        decimals1: row.decimals1,
+        token0: row.token0,
+        token1: row.token1,
+        weth: cfg.contracts.weth,
+        stableSet,
+        wethUsd,
+      })
+      if (!(notional > 0)) continue
+      windowSwapUsd += notional
+      windowFeeUsd += notional * Math.min(1_000_000, Math.max(0, row.fee)) / 1_000_000
+      aprSwapCount += 1
+    }
+    const balance0Result = balanceResults[i * 2]
+    const balance1Result = balanceResults[i * 2 + 1]
+    const balance0 = balance0Result?.status === 'success' ? BigInt(balance0Result.result as bigint) : 0n
+    const balance1 = balance1Result?.status === 'success' ? BigInt(balance1Result.result as bigint) : 0n
+    const aprLiquidityUsd = anchoredLiquidityUsd({
+      amount0: balance0,
+      amount1: balance1,
+      decimals0: row.decimals0,
+      decimals1: row.decimals1,
+      token0: row.token0,
+      token1: row.token1,
+      weth: cfg.contracts.weth,
+      stableSet,
+      wethUsd,
+    })
+    out.set(flowAprKey(chainId, 'v3', pool), {
+      windowSwapUsd: clampUsd(windowSwapUsd),
+      windowFeeUsd: clampUsd(windowFeeUsd),
+      aprLiquidityUsd: aprLiquidityUsd > 0 ? aprLiquidityUsd : undefined,
+      feeAprPct: annualizedFeePct(windowFeeUsd, aprLiquidityUsd),
+      aprSwapCount,
+      effectiveFeePips: row.fee,
+      aprBasis: 'pool-balance',
+    })
+  }
+  return out
+}
+
+async function fetchV4AprMetrics(
+  chainId: FlowChainId,
+  events: FlowEvent[],
+): Promise<Map<string, FlowAprMetric>> {
+  const client = getClient(chainId)
+  const poolIds = [...new Map(events.flatMap((event) => event.poolId
+    ? [[event.poolId.toLowerCase(), event.poolId] as const]
+    : [])).values()]
+  const [head, wethUsd, poolRows] = await Promise.all([
+    retryRateLimited(() => getScanHead(client, chainId)),
+    retryRateLimited(() => wethUsdOnChain(client, chainId)),
+    retryRateLimited(() => resolveV4PoolsBatch(client, chainId, poolIds)),
+  ])
+  const candidates = poolIds.flatMap((poolId) => {
+    const row = poolRows.get(poolId.toLowerCase())
+    return row ? [{ poolId, row }] : []
+  })
+  const cfg = CHAIN_CONFIGS[chainId]
+  const swaps = await fetchV4AprSwaps(client, chainId, candidates.map(({ poolId }) => poolId), head)
+  const stateResults = await retryRateLimited(() =>
+    readBatch(client, candidates.flatMap(({ poolId }) => [
+      {
+        address: cfg.contracts.v4StateView,
+        abi: v4StateViewAbi,
+        functionName: 'getSlot0',
+        args: [poolId],
+      },
+      {
+        address: cfg.contracts.v4StateView,
+        abi: v4StateViewAbi,
+        functionName: 'getLiquidity',
+        args: [poolId],
+      },
+    ])))
+  const swapsByPool = new Map<string, V4AprSwap[]>()
+  for (const swap of swaps) {
+    const key = swap.poolId.toLowerCase()
+    const rows = swapsByPool.get(key) ?? []
+    rows.push(swap)
+    swapsByPool.set(key, rows)
+  }
+  const stableSet = new Set([cfg.contracts.stable, ...(cfg.usdStables ?? [])].map((x) => x.toLowerCase()))
+  const out = new Map<string, FlowAprMetric>()
+  for (let i = 0; i < candidates.length; i += 1) {
+    const { poolId, row } = candidates[i]!
+    let windowSwapUsd = 0
+    let windowFeeUsd = 0
+    let aprSwapCount = 0
+    for (const swap of swapsByPool.get(poolId.toLowerCase()) ?? []) {
+      const notional = anchoredSwapNotionalUsd({
+        amount0: swap.amount0,
+        amount1: swap.amount1,
+        decimals0: row.decimals0,
+        decimals1: row.decimals1,
+        token0: row.token0,
+        token1: row.token1,
+        weth: cfg.contracts.weth,
+        stableSet,
+        wethUsd,
+      })
+      if (!(notional > 0)) continue
+      const feePips = Math.min(1_000_000, Math.max(0, swap.feePips))
+      windowSwapUsd += notional
+      windowFeeUsd += notional * feePips / 1_000_000
+      aprSwapCount += 1
+    }
+
+    const slotResult = stateResults[i * 2]
+    const liquidityResult = stateResults[i * 2 + 1]
+    const slot0 = slotResult?.status === 'success'
+      ? slotResult.result as readonly unknown[]
+      : undefined
+    const sqrtPriceX96 = slot0?.[0] as bigint | undefined
+    const liquidity = liquidityResult?.status === 'success'
+      ? BigInt(liquidityResult.result as bigint)
+      : 0n
+    if (sqrtPriceX96 && sqrtPriceX96 > 0n) {
+      row.sqrtPriceX96 = sqrtPriceX96
+    }
+    const amount0 = sqrtPriceX96 && sqrtPriceX96 > 0n
+      ? (liquidity * Q96) / sqrtPriceX96
+      : 0n
+    const amount1 = sqrtPriceX96 && sqrtPriceX96 > 0n
+      ? (liquidity * sqrtPriceX96) / Q96
+      : 0n
+    const aprLiquidityUsd = anchoredLiquidityUsd({
+      amount0,
+      amount1,
+      decimals0: row.decimals0,
+      decimals1: row.decimals1,
+      token0: row.token0,
+      token1: row.token1,
+      weth: cfg.contracts.weth,
+      stableSet,
+      wethUsd,
+    })
+    out.set(flowAprKey(chainId, 'v4', poolId), {
+      windowSwapUsd: clampUsd(windowSwapUsd),
+      windowFeeUsd: clampUsd(windowFeeUsd),
+      aprLiquidityUsd: aprLiquidityUsd > 0 ? aprLiquidityUsd : undefined,
+      feeAprPct: annualizedFeePct(windowFeeUsd, aprLiquidityUsd),
+      aprSwapCount,
+      effectiveFeePips: windowSwapUsd > 0 ? (windowFeeUsd / windowSwapUsd) * 1_000_000 : undefined,
+      aprBasis: 'active-liquidity',
+    })
+  }
+  return out
+}
+
+async function enrichFlowApr(events: FlowEvent[]): Promise<{
+  events: FlowEvent[]
+  notices: FlowNotice[]
+}> {
+  const now = Date.now()
+  const metrics = new Map<string, FlowAprMetric>()
+  const pending = new Map<string, FlowEvent[]>()
+  for (const event of events) {
+    const key = flowAprKey(event.chainId, event.version, flowPoolRef(event))
+    const hit = flowAprCache.get(key)
+    if (hit && now - hit.at < APR_TTL_MS) {
+      metrics.set(key, hit.metric)
+      continue
+    }
+    const groupKey = `${event.chainId}:${event.version}`
+    const rows = pending.get(groupKey) ?? []
+    rows.push(event)
+    pending.set(groupKey, rows)
+  }
+
+  const notices: FlowNotice[] = []
+  const pendingByChain = new Map<FlowChainId, Array<{ version: FlowVersion; rows: FlowEvent[] }>>()
+  for (const [groupKey, rows] of pending) {
+    const [rawChainId, version] = groupKey.split(':') as [string, FlowVersion]
+    const chainId = Number(rawChainId) as FlowChainId
+    const groups = pendingByChain.get(chainId) ?? []
+    groups.push({ version, rows })
+    pendingByChain.set(chainId, groups)
+  }
+  // 不同链可并行；同一条链的 V3/V4 串行，避免把公共 RPC 瞬间打到 429。
+  await Promise.all([...pendingByChain.entries()].map(async ([chainId, groups]) => {
+    groups.sort((a, b) => a.version.localeCompare(b.version))
+    for (const { version, rows } of groups) {
+      try {
+        const next = version === 'v3'
+          ? await timedSource(`${flowChainLabel(chainId)} V3 APR`, fetchV3AprMetrics(chainId, rows))
+          : await timedSource(`${flowChainLabel(chainId)} V4 APR`, fetchV4AprMetrics(chainId, rows))
+        for (const [key, metric] of next) {
+          metrics.set(key, metric)
+          flowAprCache.set(key, { at: Date.now(), metric })
+        }
+      } catch (error) {
+        notices.push({
+          level: 'warning',
+          message: `${flowChainLabel(chainId)} ${version.toUpperCase()} 年化暂不可用：${friendlyErrorText(error)}`,
+        })
+      }
+    }
+  }))
+
+  if (flowAprCache.size > 600) {
+    for (const [key, entry] of flowAprCache) {
+      if (now - entry.at >= APR_TTL_MS * 3) flowAprCache.delete(key)
+    }
+  }
+  return {
+    events: events.map((event) => {
+      const metric = metrics.get(flowAprKey(event.chainId, event.version, flowPoolRef(event)))
+      return metric ? { ...event, ...metric } : event
+    }),
+    notices,
+  }
+}
+
 function takeBalancedChains(
   events: FlowEvent[],
   chainIds: FlowChainId[],
@@ -1945,12 +2506,15 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
   }
 
   events.sort((a, b) => b.timestamp - a.timestamp)
+  const balanced = takeBalancedChains(events, opts.chainIds, limit * 2)
+  const apr = await enrichFlowApr(balanced)
+  notices.push(...apr.notices)
   const uniqueNotices = [...new Map(notices.map((notice) => [
     `${notice.level}:${notice.message}`,
     notice,
   ])).values()]
   return {
-    events: takeBalancedChains(events, opts.chainIds, limit * 2),
+    events: apr.events,
     notices: uniqueNotices,
   }
 }
