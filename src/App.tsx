@@ -140,6 +140,7 @@ import {
   loadGraphApiKey,
   saveGraphApiKey,
 } from './graphSettings'
+import { fetchTransferTaxBps, isHoneypotWhitelisted } from './honeypot'
 import './App.css'
 import './signer.css'
 
@@ -371,6 +372,8 @@ export default function App() {
   const [percentUp, setPercentUp] = useState(5)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [slippageBps, setSlippageBps] = usePersistentState('slippageBps', 300)
+  /** V4 山寨币转账税（bps）。0.25%=25；GoPlus 对 MEOW 类约 1% 会自动填 ~100 */
+  const [transferTaxBps, setTransferTaxBps] = useState(0)
   const [sortKey, setSortKey] = usePersistentState<SortKey>('sortKey', 'value')
   const [sortAsc, setSortAsc] = usePersistentState('sortAsc', false)
   const [filterKey, setFilterKey] = usePersistentState<FilterKey>('filterKey', 'all')
@@ -2307,6 +2310,8 @@ export default function App() {
           tickUpper,
           useNativeEth,
           slippageBps,
+          transferTaxBpsA: isHoneypotWhitelisted(chainId, tokenA) || isEthLikeCurrency(tokenA) ? 0 : transferTaxBps,
+          transferTaxBpsB: isHoneypotWhitelisted(chainId, tokenB) || isEthLikeCurrency(tokenB) ? 0 : transferTaxBps,
           onStatus: setStatus,
         })
         setPool(info)
@@ -2523,6 +2528,62 @@ export default function App() {
 
   const poolUsesWeth = pool ? pairHasWeth(pool.token0.address, pool.token1.address) : false
   const mintUseEth = useNativeEth && poolUsesWeth
+
+  /** 把 UI 的「山寨币税」映射到 pool.token0/1；稳定币/WETH/原生为 0 */
+  const mintTransferTax = useMemo(() => {
+    if (!pool || transferTaxBps <= 0) return { tax0: 0, tax1: 0 }
+    const taxSide = (addr: Address) => {
+      if (isEthLikeCurrency(addr) || isNativeCurrency(addr)) return 0
+      if (isHoneypotWhitelisted(chainId, addr)) return 0
+      return transferTaxBps
+    }
+    return { tax0: taxSide(pool.token0.address), tax1: taxSide(pool.token1.address) }
+  }, [pool, transferTaxBps, chainId])
+
+  // 换池 / 换仓时清空转账税，再由 GoPlus 探测（按当前 Tab 选源）
+  const taxProbeKey =
+    tab === 'mint' && pool?.version === 'v4'
+      ? `pool:${pool.poolId ?? pool.poolAddress ?? ''}`
+      : tab === 'positions' && selected?.version === 'v4'
+        ? `pos:${selected.tokenId}:${selected.token0.address}:${selected.token1.address}`
+        : pool?.version === 'v4'
+          ? `pool:${pool.poolId ?? pool.poolAddress ?? ''}`
+          : selected?.version === 'v4'
+            ? `pos:${selected.tokenId}:${selected.token0.address}:${selected.token1.address}`
+            : ''
+  useEffect(() => {
+    setTransferTaxBps(0)
+  }, [taxProbeKey, chainId])
+
+  // V4 自动探测转账税（BSC/ETH GoPlus）
+  useEffect(() => {
+    if (chainId !== 56 && chainId !== 1 || !taxProbeKey) return
+    const tokens: Address[] | null = taxProbeKey.startsWith('pool:') && pool?.version === 'v4'
+      ? [pool.token0.address, pool.token1.address]
+      : taxProbeKey.startsWith('pos:') && selected?.version === 'v4'
+        ? [selected.token0.address, selected.token1.address]
+        : null
+    if (!tokens) return
+    let cancelled = false
+    const run = async () => {
+      const candidates = tokens.filter(
+        (a) => !isEthLikeCurrency(a) && !isNativeCurrency(a) && !isHoneypotWhitelisted(chainId, a),
+      )
+      let best = 0
+      for (const addr of candidates) {
+        const bps = await fetchTransferTaxBps(chainId, addr)
+        if (bps != null && bps > best) best = bps
+      }
+      if (!cancelled && best > 0) {
+        setTransferTaxBps((prev) => (prev > 0 ? prev : best))
+        setStatus(`检测到代币转账税约 ${(best / 100).toFixed(2)}%，已填入 V4 垫付（可改）`)
+      }
+    }
+    void run()
+    return () => {
+      cancelled = true
+    }
+  }, [taxProbeKey, chainId, pool, selected])
   const mintNeedSide = pool && mintTicks
     ? neededMintSide(pool.tick, mintTicks.tickLower, mintTicks.tickUpper)
     : 'both'
@@ -3581,6 +3642,22 @@ export default function App() {
                     ? '填一边即可，另一边按当前区间配平。'
                     : `当前仓位在区间外，加仓只需 ${addNeedSide === 0 ? addLabel0 : addLabel1}。`}
                 </p>
+                {selected.version === 'v4' && (
+                  <label className="inline-setting" style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+                    转账税
+                    <input
+                      type="number"
+                      min={0}
+                      max={5000}
+                      step={1}
+                      value={transferTaxBps}
+                      onChange={(e) => setTransferTaxBps(Math.max(0, Math.min(5000, Math.floor(Number(e.target.value) || 0))))}
+                      style={{ width: 88 }}
+                      title="单位 bps：25=0.25%，100=1%"
+                    />
+                    <span className="muted small">bps（{(transferTaxBps / 100).toFixed(2)}%）· 税币 V4 加仓必填</span>
+                  </label>
+                )}
                 <div className="mint-fill">
                   <span className="muted small">按余额填</span>
                   <div className="seg" role="group" aria-label="按余额比例加仓">
@@ -3612,6 +3689,18 @@ export default function App() {
                           amount1: parseAmount(add1 || '0', selected.token1.decimals),
                           useNativeEth: addUseEth,
                           slippageBps,
+                          transferTaxBps0:
+                            isEthLikeCurrency(selected.token0.address)
+                            || isNativeCurrency(selected.token0.address)
+                            || isHoneypotWhitelisted(chainId, selected.token0.address)
+                              ? 0
+                              : transferTaxBps,
+                          transferTaxBps1:
+                            isEthLikeCurrency(selected.token1.address)
+                            || isNativeCurrency(selected.token1.address)
+                            || isHoneypotWhitelisted(chainId, selected.token1.address)
+                              ? 0
+                              : transferTaxBps,
                           onStatus: setStatus,
                         })
                         : increaseV3Liquidity({
@@ -4921,6 +5010,26 @@ export default function App() {
                     ? `当前是单边区间，只需要 ${pool.tick < rangePreview.tickLower ? label0 : label1}，另一侧留空即可。`
                     : '调整区间或刷新币价后数量会自动重算。用原生 ETH 建仓时记得留一点付 gas。'}
                 </p>
+
+                {(pool.version === 'v4' || mintProtocol === 'v4') && (
+                  <label className="inline-setting" style={{ marginTop: 10, display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+                    转账税
+                    <input
+                      type="number"
+                      min={0}
+                      max={5000}
+                      step={1}
+                      value={transferTaxBps}
+                      onChange={(e) => setTransferTaxBps(Math.max(0, Math.min(5000, Math.floor(Number(e.target.value) || 0))))}
+                      style={{ width: 88 }}
+                      title="单位 bps：25=0.25%，100=1%。池费率 0.25% 不是转账税"
+                    />
+                    <span className="muted small">
+                      bps（{(transferTaxBps / 100).toFixed(2)}%）· 山寨币进 V4 必填；≠ 池 Fee
+                    </span>
+                    <InfoHint text="带转账税的币 transfer 到 PoolManager 会少到账，V4 的 SETTLE_PAIR 会直接 revert。这里按 bps 垫付 settle。0.25% 税填 25；MEOW 类 GoPlus 常见约 1%（~100）。上方「Fee 0.25%」是池手续费，不是转账税。" />
+                  </label>
+                )}
               </div>
               <div className="btn-row">
                 <button
@@ -5015,6 +5124,8 @@ export default function App() {
                           tickUpper: useUpper,
                           useNativeEth: mintUseEth,
                           slippageBps,
+                          transferTaxBps0: mintTransferTax.tax0,
+                          transferTaxBps1: mintTransferTax.tax1,
                           onStatus: setStatus,
                         })
                       }

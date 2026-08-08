@@ -52,6 +52,45 @@ export function isHoneypotWhitelisted(chainId: SupportedChainId, token: Address)
 }
 
 /**
+ * 查询转账税（bps）。GoPlus 的 buy_tax/sell_tax 是小数（0.01=1%）。
+ * 失败返回 null；稳定币/白名单应跳过调用。
+ */
+export async function fetchTransferTaxBps(
+  chainId: number,
+  token: Address,
+): Promise<number | null> {
+  if (chainId !== 56 && chainId !== 1) return null
+  if (isHoneypotWhitelisted(chainId as SupportedChainId, token)) return 0
+  const url =
+    `https://api.gopluslabs.io/api/v1/token_security/${chainId}?contract_addresses=${token.toLowerCase()}`
+  try {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 8_000)
+    const res = await fetch(url, { signal: ctrl.signal })
+    clearTimeout(timer)
+    if (!res.ok) return null
+    const json = (await res.json()) as {
+      code?: number
+      result?: Record<string, { buy_tax?: string; sell_tax?: string }>
+    }
+    if (json.code !== 1 || !json.result) return null
+    const row = json.result[token.toLowerCase()]
+    if (!row) return null
+    const buy = Number(row.buy_tax ?? 0)
+    const sell = Number(row.sell_tax ?? 0)
+    const frac = Math.max(
+      Number.isFinite(buy) ? buy : 0,
+      Number.isFinite(sell) ? sell : 0,
+    )
+    if (!(frac > 0)) return 0
+    // 转成 bps，再加 5bps 缓冲（舍入 / 动态税）
+    return Math.min(5_000, Math.ceil(frac * 10_000) + 5)
+  } catch {
+    return null
+  }
+}
+
+/**
  * GoPlus token_security。返回 true = 可通过（非貔貅）。
  * 网络失败时返回 null（调用方决定是否放行）。
  */

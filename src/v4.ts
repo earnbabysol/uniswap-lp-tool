@@ -31,10 +31,15 @@ export const V4_ACTIONS = {
   DECREASE_LIQUIDITY: 0x01,
   MINT_POSITION: 0x02,
   BURN_POSITION: 0x03,
+  SETTLE: 0x0b,
   SETTLE_PAIR: 0x0d,
+  TAKE: 0x0e,
   TAKE_PAIR: 0x11,
   SWEEP: 0x14,
 } as const
+
+/** PositionManager：amount=0 表示用全部 open delta */
+const OPEN_DELTA = 0n
 
 const FEE_SPACINGS: Record<number, number[]> = {
   100: [1],
@@ -207,11 +212,110 @@ function encodeSettlePair(c0: Address, c1: Address): `0x${string}` {
   return encodeAbiParameters([{ type: 'address' }, { type: 'address' }], [c0, c1])
 }
 
+/** SETTLE：payerIsUser=true 时从用户钱包经 Permit2 转入 PoolManager */
+function encodeSettle(currency: Address, amount: bigint, payerIsUser: boolean): `0x${string}` {
+  return encodeAbiParameters(
+    [{ type: 'address' }, { type: 'uint256' }, { type: 'bool' }],
+    [currency, amount, payerIsUser],
+  )
+}
+
+function encodeTake(currency: Address, recipient: Address, amount: bigint): `0x${string}` {
+  return encodeAbiParameters(
+    [{ type: 'address' }, { type: 'address' }, { type: 'uint256' }],
+    [currency, recipient, amount],
+  )
+}
+
 function encodeTakePair(c0: Address, c1: Address, recipient: Address): `0x${string}` {
   return encodeAbiParameters(
     [{ type: 'address' }, { type: 'address' }, { type: 'address' }],
     [c0, c1, recipient],
   )
+}
+
+/**
+ * 转账税垫付：PoolManager.settle 按「实际到账」冲债务。
+ * 税币 transfer(X) 只到账 X*(1-t)，必须多转 ceil(debt/(1-t))。
+ */
+export function grossUpForTransferTax(amount: bigint, taxBps: number): bigint {
+  if (amount <= 0n) return 0n
+  const bps = Math.min(5_000, Math.max(0, Math.floor(taxBps) || 0))
+  if (bps <= 0) return amount
+  const keep = 10_000n - BigInt(bps)
+  // ceil(amount * 10000 / keep)；不再 +1wei，避免 Max 满余额时差 1 失败
+  return (amount * 10_000n + keep - 1n) / keep
+}
+
+/** 从「钱包愿付」扣税，得到可用于算流动性的净到账量 */
+export function netAfterTransferTax(amount: bigint, taxBps: number): bigint {
+  if (amount <= 0n) return 0n
+  const bps = Math.min(5_000, Math.max(0, Math.floor(taxBps) || 0))
+  if (bps <= 0) return amount
+  return (amount * (10_000n - BigInt(bps))) / 10_000n
+}
+
+/**
+ * 组装 settle：无税走 SETTLE_PAIR；有税则逐币 SETTLE 垫付，并 TAKE 退回多到账的 credit。
+ * PoolManager.settle() 按「实际到账」冲债务，税币必须多转。
+ * 返回还需 Permit2 的额度（含税垫付）。
+ */
+function buildMintSettlePlan(opts: {
+  currency0: Address
+  currency1: Address
+  /** mint 侧 amountMax（债务上限） */
+  amount0Max: bigint
+  amount1Max: bigint
+  taxBps0: number
+  taxBps1: number
+  recipient: Address
+  /** 税币侧钱包实付（用户填的数量）；优先于对 amountMax 做 grossUp */
+  pay0?: bigint
+  pay1?: bigint
+}): {
+  actions: number[]
+  params: `0x${string}`[]
+  permit0: bigint
+  permit1: bigint
+} {
+  const tax0 = isNativeCurrency(opts.currency0) ? 0 : Math.max(0, Math.floor(opts.taxBps0) || 0)
+  const tax1 = isNativeCurrency(opts.currency1) ? 0 : Math.max(0, Math.floor(opts.taxBps1) || 0)
+  if (tax0 <= 0 && tax1 <= 0) {
+    return {
+      actions: [V4_ACTIONS.SETTLE_PAIR],
+      params: [encodeSettlePair(opts.currency0, opts.currency1)],
+      permit0: opts.amount0Max,
+      permit1: opts.amount1Max,
+    }
+  }
+  const pay0 =
+    tax0 > 0
+      ? (opts.pay0 != null && opts.pay0 > 0n
+        ? opts.pay0
+        : grossUpForTransferTax(opts.amount0Max, tax0))
+      : OPEN_DELTA
+  const pay1 =
+    tax1 > 0
+      ? (opts.pay1 != null && opts.pay1 > 0n
+        ? opts.pay1
+        : grossUpForTransferTax(opts.amount1Max, tax1))
+      : OPEN_DELTA
+  return {
+    actions: [
+      V4_ACTIONS.SETTLE,
+      V4_ACTIONS.SETTLE,
+      V4_ACTIONS.TAKE,
+      V4_ACTIONS.TAKE,
+    ],
+    params: [
+      encodeSettle(opts.currency0, pay0, true),
+      encodeSettle(opts.currency1, pay1, true),
+      encodeTake(opts.currency0, opts.recipient, OPEN_DELTA),
+      encodeTake(opts.currency1, opts.recipient, OPEN_DELTA),
+    ],
+    permit0: tax0 > 0 ? pay0 : opts.amount0Max,
+    permit1: tax1 > 0 ? pay1 : opts.amount1Max,
+  }
 }
 
 function encodeSweep(currency: Address, to: Address): `0x${string}` {
@@ -674,6 +778,11 @@ async function writeModifyLiquidities(opts: {
         `${action} 失败：滑点保护触发（MaximumAmountExceeded）。把顶部滑点调大一点，两边数量按现价重新配平后再试。`,
       )
     }
+    if (/STF|transfer|TRANSFER|delta|CurrencyNotSettled|not settled/i.test(raw)) {
+      throw new Error(
+        `${action} 失败：疑似带转账税/到账不足。请在新建仓填写「转账税 bps」（0.25%=25，约 1%=100）后重试。原始：${raw.slice(0, 160)}`,
+      )
+    }
     throw new Error(`${action} 失败：${raw.slice(0, 220)}`)
   }
   onStatus?.(`请在钱包确认 ${action}…`)
@@ -847,6 +956,12 @@ export async function mintV4Position(opts: {
   percent?: number
   useNativeEth?: boolean
   slippageBps?: number
+  /**
+   * 代币转账税（bps）。对非原生侧生效。
+   * 例：25 = 0.25%，99 ≈ 0.99%。带税币必须垫付 settle，否则 PoolManager 到账不足会 revert。
+   */
+  transferTaxBps0?: number
+  transferTaxBps1?: number
   onStatus?: (msg: string) => void
 }) {
   const { walletClient, owner, onStatus } = opts
@@ -884,16 +999,33 @@ export async function mintV4Position(opts: {
     opts.amount0,
     opts.amount1,
   )
+  const taxFor = (currency: Address): number => {
+    if (isNativeCurrency(currency) || isEthLikeCurrency(currency)) return 0
+    const c = currency.toLowerCase()
+    if (c === srcPool.token0.address.toLowerCase()) return Math.max(0, opts.transferTaxBps0 ?? 0)
+    if (c === srcPool.token1.address.toLowerCase()) return Math.max(0, opts.transferTaxBps1 ?? 0)
+    if (c === live.token0.address.toLowerCase()) return Math.max(0, opts.transferTaxBps0 ?? 0)
+    if (c === live.token1.address.toLowerCase()) return Math.max(0, opts.transferTaxBps1 ?? 0)
+    return 0
+  }
+  const taxBps0 = taxFor(live.token0.address)
+  const taxBps1 = taxFor(live.token1.address)
+  // 用户填的是钱包愿付；扣税后净额才是能进池的量
+  const user0 = aligned.amount0
+  const user1 = aligned.amount1
+  const net0 = netAfterTransferTax(user0, taxBps0)
+  const net1 = netAfterTransferTax(user1, taxBps1)
+
   const paired = resolvePairedMintAmounts({
     sqrtPriceX96: live.sqrtPriceX96,
     tickLower,
     tickUpper,
-    amount0: aligned.amount0,
-    amount1: aligned.amount1,
+    amount0: net0,
+    amount1: net1,
   })
   let amount0 = paired.amount0
   let amount1 = paired.amount1
-  if (amount0 <= 0n && amount1 <= 0n) throw new Error('数量必须 > 0')
+  if (amount0 <= 0n && amount1 <= 0n) throw new Error('数量必须 > 0（若填了转账税，请加大数量）')
 
   const key = poolKeyFromPool(live)
   const nativeIs0 = isNativeCurrency(key.currency0)
@@ -917,22 +1049,49 @@ export async function mintV4Position(opts: {
   const liquidity = getLiquidityForAmounts(live.sqrtPriceX96, tickLower, tickUpper, amount0, amount1)
   if (liquidity <= 0n) throw new Error('算出的流动性为 0，请检查数量与区间')
 
-  const { amount0: need0, amount1: need1, amount0Max, amount1Max } = maxAmountsForLiquidity({
+  const maxed = maxAmountsForLiquidity({
     sqrtPriceX96: live.sqrtPriceX96,
     tickLower,
     tickUpper,
     liquidity,
     slippageBps,
   })
+  // 税币：债务上限不能超过「用户支付能到账的净额」，settle 按用户实付
+  let amount0Max = maxed.amount0Max
+  let amount1Max = maxed.amount1Max
+  if (taxBps0 > 0 && !nativeIs0 && amount0Max > net0) amount0Max = net0
+  if (taxBps1 > 0 && !nativeIs1 && amount1Max > net1) amount1Max = net1
+  if (maxed.amount0 > amount0Max || maxed.amount1 > amount1Max) {
+    throw new Error('转账税占用后不足以覆盖滑点缓冲，请减少约 3–5% 数量后重试')
+  }
+  const need0 = maxed.amount0
+  const need1 = maxed.amount1
 
-  // 原生 ETH 侧不走 Permit2
-  await ensurePermit2(walletClient, key.currency0, owner, nativeIs0 ? 0n : amount0Max, onStatus)
-  await ensurePermit2(walletClient, key.currency1, owner, nativeIs1 ? 0n : amount1Max, onStatus)
+  const settle = buildMintSettlePlan({
+    currency0: key.currency0,
+    currency1: key.currency1,
+    amount0Max,
+    amount1Max,
+    taxBps0: nativeIs0 ? 0 : taxBps0,
+    taxBps1: nativeIs1 ? 0 : taxBps1,
+    recipient: owner,
+    pay0: taxBps0 > 0 && !nativeIs0 ? user0 : undefined,
+    pay1: taxBps1 > 0 && !nativeIs1 ? user1 : undefined,
+  })
+  if (taxBps0 > 0 || taxBps1 > 0) {
+    onStatus?.(
+      `已按转账税垫付 settle（${taxBps0 || taxBps1} bps），否则带税币 V4 会因到账不足失败…`,
+    )
+  }
 
-  const actions: number[] = [V4_ACTIONS.MINT_POSITION, V4_ACTIONS.SETTLE_PAIR]
+  // 原生 ETH 侧不走 Permit2；税币侧按垫付额度授权
+  await ensurePermit2(walletClient, key.currency0, owner, nativeIs0 ? 0n : settle.permit0, onStatus)
+  await ensurePermit2(walletClient, key.currency1, owner, nativeIs1 ? 0n : settle.permit1, onStatus)
+
+  const actions: number[] = [V4_ACTIONS.MINT_POSITION, ...settle.actions]
   const params: `0x${string}`[] = [
     encodeMintParams(key, tickLower, tickUpper, liquidity, amount0Max, amount1Max, owner),
-    encodeSettlePair(key.currency0, key.currency1),
+    ...settle.params,
   ]
 
   let value = 0n
@@ -981,6 +1140,9 @@ export async function createV4PoolAndSeed(opts: {
   useNativeEth?: boolean
   hooks?: Address
   slippageBps?: number
+  /** 与 tokenA / tokenB 对齐的转账税 bps */
+  transferTaxBpsA?: number
+  transferTaxBpsB?: number
   onStatus?: (msg: string) => void
 }): Promise<{ pool: PoolInfo; hash: `0x${string}`; seeded: boolean }> {
   const {
@@ -992,6 +1154,8 @@ export async function createV4PoolAndSeed(opts: {
     onStatus,
   } = opts
   const slippageBps = opts.slippageBps ?? 300
+  const taxA = Math.max(0, opts.transferTaxBpsA ?? 0)
+  const taxB = Math.max(0, opts.transferTaxBpsB ?? 0)
   if (!(fee > 0) || fee > 1_000_000) throw new Error('V4 费率无效（单位：百分之一 bp，如 3000=0.30%）')
   if (!(tickSpacing > 0) || tickSpacing > 16384) throw new Error('tickSpacing 无效')
   if (!(initialPriceBPerA > 0)) throw new Error('初始价格必须 > 0')
@@ -1012,6 +1176,9 @@ export async function createV4PoolAndSeed(opts: {
     if (currency0.toLowerCase() === rawA.toLowerCase()) return { amount0: amtA, amount1: amtB }
     return { amount0: amtB, amount1: amtA }
   }
+  const tax01 = mapAbTo01(BigInt(taxA), BigInt(taxB))
+  const taxBps0 = Number(tax01.amount0)
+  const taxBps1 = Number(tax01.amount1)
   const key: V4PoolKey = {
     currency0,
     currency1,
@@ -1062,6 +1229,8 @@ export async function createV4PoolAndSeed(opts: {
       tickUpper: opts.tickUpper,
       useNativeEth: useNative,
       slippageBps,
+      transferTaxBps0: taxBps0,
+      transferTaxBps1: taxBps1,
       onStatus,
     })
     return { pool: await loadV4Pool(key), hash, seeded: true }
@@ -1076,6 +1245,7 @@ export async function createV4PoolAndSeed(opts: {
   let amount0Max = 0n
   let amount1Max = 0n
   let value = 0n
+  let settlePlan: ReturnType<typeof buildMintSettlePlan> | null = null
 
   if (wantSeed) {
     if (tickLower == null || tickUpper == null) {
@@ -1087,12 +1257,16 @@ export async function createV4PoolAndSeed(opts: {
     tickUpper = nearestUsableTick(tickUpper, tickSpacing)
     if (tickLower >= tickUpper) throw new Error('区间无效')
 
+    const user0 = amount0
+    const user1 = amount1
+    const net0 = netAfterTransferTax(user0, taxBps0)
+    const net1 = netAfterTransferTax(user1, taxBps1)
     const paired = resolvePairedMintAmounts({
       sqrtPriceX96,
       tickLower,
       tickUpper,
-      amount0,
-      amount1,
+      amount0: net0,
+      amount1: net1,
     })
     amount0 = paired.amount0
     amount1 = paired.amount1
@@ -1121,23 +1295,42 @@ export async function createV4PoolAndSeed(opts: {
     })
     amount0Max = maxed.amount0Max
     amount1Max = maxed.amount1Max
+    const seedTax0 = isNativeCurrency(currency0) ? 0 : taxBps0
+    const seedTax1 = isNativeCurrency(currency1) ? 0 : taxBps1
+    if (seedTax0 > 0 && amount0Max > net0) amount0Max = net0
+    if (seedTax1 > 0 && amount1Max > net1) amount1Max = net1
+    if (maxed.amount0 > amount0Max || maxed.amount1 > amount1Max) {
+      throw new Error('转账税占用后不足以覆盖滑点缓冲，请减少约 3–5% 数量后重试')
+    }
     if (isNativeCurrency(currency0)) value = bumpAmountMax(maxed.amount0, slippageBps)
     if (isNativeCurrency(currency1)) value = bumpAmountMax(maxed.amount1, slippageBps)
 
-    // 弹钱包前预检：余额 / Permit2
+    settlePlan = buildMintSettlePlan({
+      currency0,
+      currency1,
+      amount0Max,
+      amount1Max,
+      taxBps0: seedTax0,
+      taxBps1: seedTax1,
+      recipient: owner,
+      pay0: seedTax0 > 0 ? user0 : undefined,
+      pay1: seedTax1 > 0 ? user1 : undefined,
+    })
+
+    // 弹钱包前预检：余额 / Permit2（税币按垫付额度）
     await assertV4SeedBalances({
       owner,
       currency0,
       currency1,
-      need0: maxed.amount0,
-      need1: maxed.amount1,
+      need0: settlePlan.permit0 > amount0Max ? settlePlan.permit0 : maxed.amount0,
+      need1: settlePlan.permit1 > amount1Max ? settlePlan.permit1 : maxed.amount1,
       value,
     })
 
-    await ensurePermit2(walletClient, currency0, owner, amount0Max, onStatus)
-    await ensurePermit2(walletClient, currency1, owner, amount1Max, onStatus)
-    await assertPermit2Ready(owner, currency0, amount0Max)
-    await assertPermit2Ready(owner, currency1, amount1Max)
+    await ensurePermit2(walletClient, currency0, owner, settlePlan.permit0, onStatus)
+    await ensurePermit2(walletClient, currency1, owner, settlePlan.permit1, onStatus)
+    await assertPermit2Ready(owner, currency0, settlePlan.permit0)
+    await assertPermit2Ready(owner, currency1, settlePlan.permit1)
   }
 
   const initData = encodeFunctionData({
@@ -1147,11 +1340,11 @@ export async function createV4PoolAndSeed(opts: {
   })
 
   let calls: `0x${string}`[] = [initData]
-  if (wantSeed && tickLower != null && tickUpper != null) {
-    const actions: number[] = [V4_ACTIONS.MINT_POSITION, V4_ACTIONS.SETTLE_PAIR]
+  if (wantSeed && tickLower != null && tickUpper != null && settlePlan) {
+    const actions: number[] = [V4_ACTIONS.MINT_POSITION, ...settlePlan.actions]
     const params: `0x${string}`[] = [
       encodeMintParams(key, tickLower, tickUpper, liquidity, amount0Max, amount1Max, owner),
-      encodeSettlePair(currency0, currency1),
+      ...settlePlan.params,
     ]
     if (isNativeCurrency(currency0) || isNativeCurrency(currency1)) {
       actions.push(V4_ACTIONS.SWEEP)
@@ -1234,6 +1427,8 @@ export async function increaseV4Liquidity(opts: {
   amount1: bigint
   useNativeEth?: boolean
   slippageBps?: number
+  transferTaxBps0?: number
+  transferTaxBps1?: number
   /**
    * 手续费复投：两边数量都是上限，不再按单边配平放大另一侧，
    * 且 amountMax 不超过提供量，避免 SETTLE 从钱包多扣本金。
@@ -1246,19 +1441,28 @@ export async function increaseV4Liquidity(opts: {
   if (position.version !== 'v4') throw new Error('需要 V4 仓位')
   const key = poolKeyFromPosition(position)
   const live = await loadV4Pool(key)
+  const taxBps0 = isNativeCurrency(key.currency0) ? 0 : Math.max(0, opts.transferTaxBps0 ?? 0)
+  const taxBps1 = isNativeCurrency(key.currency1) ? 0 : Math.max(0, opts.transferTaxBps1 ?? 0)
+  const user0 = opts.amount0
+  const user1 = opts.amount1
+  const net0 = netAfterTransferTax(user0, taxBps0)
+  const net1 = netAfterTransferTax(user1, taxBps1)
 
-  let amount0 = opts.amount0
-  let amount1 = opts.amount1
+  let amount0 = user0
+  let amount1 = user1
   if (!opts.capToProvided) {
     const paired = resolvePairedMintAmounts({
       sqrtPriceX96: live.sqrtPriceX96,
       tickLower: position.tickLower,
       tickUpper: position.tickUpper,
-      amount0: opts.amount0,
-      amount1: opts.amount1,
+      amount0: net0,
+      amount1: net1,
     })
     amount0 = paired.amount0
     amount1 = paired.amount1
+  } else {
+    amount0 = net0
+    amount1 = net1
   }
   if (amount0 <= 0n && amount1 <= 0n) throw new Error('数量必须 > 0')
 
@@ -1310,15 +1514,32 @@ export async function increaseV4Liquidity(opts: {
     need1 = maxed.amount1
     amount0Max = maxed.amount0Max
     amount1Max = maxed.amount1Max
+    if (taxBps0 > 0 && amount0Max > net0) amount0Max = net0
+    if (taxBps1 > 0 && amount1Max > net1) amount1Max = net1
+    if (need0 > amount0Max || need1 > amount1Max) {
+      throw new Error('转账税占用后不足以覆盖滑点缓冲，请减少约 3–5% 数量后重试')
+    }
   }
 
-  await ensurePermit2(walletClient, key.currency0, owner, nativeIs0 ? 0n : amount0Max, onStatus)
-  await ensurePermit2(walletClient, key.currency1, owner, nativeIs1 ? 0n : amount1Max, onStatus)
+  const settle = buildMintSettlePlan({
+    currency0: key.currency0,
+    currency1: key.currency1,
+    amount0Max,
+    amount1Max,
+    taxBps0,
+    taxBps1,
+    recipient: owner,
+    pay0: taxBps0 > 0 ? user0 : undefined,
+    pay1: taxBps1 > 0 ? user1 : undefined,
+  })
 
-  const actions: number[] = [V4_ACTIONS.INCREASE_LIQUIDITY, V4_ACTIONS.SETTLE_PAIR]
+  await ensurePermit2(walletClient, key.currency0, owner, nativeIs0 ? 0n : settle.permit0, onStatus)
+  await ensurePermit2(walletClient, key.currency1, owner, nativeIs1 ? 0n : settle.permit1, onStatus)
+
+  const actions: number[] = [V4_ACTIONS.INCREASE_LIQUIDITY, ...settle.actions]
   const params: `0x${string}`[] = [
     encodeModifyLiqParams(position.tokenId, liquidity, amount0Max, amount1Max),
-    encodeSettlePair(key.currency0, key.currency1),
+    ...settle.params,
   ]
   let value = 0n
   if (nativeIs0) value = opts.capToProvided ? amount0 : bumpAmountMax(need0, slippageBps)
