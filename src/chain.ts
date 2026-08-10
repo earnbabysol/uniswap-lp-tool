@@ -431,8 +431,8 @@ export const CHAIN_CONFIGS: Record<SupportedChainId, AppChainConfig> = {
       { wrappedSymbol: 'WBNB' },
     ),
     v3PoolInitCodeHash: '0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54',
-    defaultTokenA: BSC_CONTRACTS.stable,
-    defaultTokenB: BSC_CONTRACTS.weth,
+    defaultTokenA: BSC_USDT,
+    defaultTokenB: BSC_CONTRACTS.stable,
     hasWrappedNative: true,
     usdStables: [BSC_USDT],
     altV3Factories: [

@@ -846,29 +846,16 @@ type LoadV4PoolFn = (key: {
   hooks: Address
 }) => Promise<PoolInfo>
 
-type WrapEthFn = (opts: {
-  walletClient: WalletClient
-  owner: Address
-  amount: bigint
-}) => Promise<`0x${string}`>
-
 let _loadV4Pool: LoadV4PoolFn | null = null
-let _wrapEth: WrapEthFn | null = null
 
-/** Avoid circular import: lp.ts registers these after defining them. */
-export function registerV4Deps(deps: { loadV4Pool: LoadV4PoolFn; wrapEth: WrapEthFn }) {
+/** Avoid circular import: lp.ts registers loadV4Pool after defining it. */
+export function registerV4Deps(deps: { loadV4Pool: LoadV4PoolFn; wrapEth?: unknown }) {
   _loadV4Pool = deps.loadV4Pool
-  _wrapEth = deps.wrapEth
 }
 
 function loadV4Pool(key: Parameters<LoadV4PoolFn>[0]) {
   if (!_loadV4Pool) throw new Error('V4 deps not registered')
   return _loadV4Pool(key)
-}
-
-async function wrapEth(opts: Parameters<WrapEthFn>[0]) {
-  if (!_wrapEth) throw new Error('V4 deps not registered')
-  return _wrapEth(opts)
 }
 
 export async function findV4Pool(
@@ -919,6 +906,10 @@ export async function scanV4Pools(
   return out
 }
 
+/**
+ * 检查 WETH 余额。不再自动弹 Wrap——用户没说要用原生币组仓时不该被打断去换 WETH。
+ * 余额不足直接报错，让用户自己决定：取消「付原生币」、去工具页 Wrap、或改用原生 ETH 池。
+ */
 async function ensureWethBalance(opts: {
   walletClient: WalletClient
   owner: Address
@@ -928,7 +919,7 @@ async function ensureWethBalance(opts: {
   amount1: bigint
   useNativeEth: boolean
 }) {
-  const { walletClient, owner, currency0, currency1, amount0, amount1, useNativeEth } = opts
+  const { owner, currency0, currency1, amount0, amount1, useNativeEth } = opts
   if (!useNativeEth || !chainHasWrappedNative()) return
   let need = 0n
   if (currency0.toLowerCase() === CONTRACTS.weth.toLowerCase()) need = amount0
@@ -941,8 +932,11 @@ async function ensureWethBalance(opts: {
     args: [owner],
   })
   if (bal >= need) return
-  const hash = await wrapEth({ walletClient, owner, amount: need - bal })
-  await waitTxReceipt(hash, 'Wrap ETH 确认')
+  throw new Error(
+    `当前是 WETH 池且链上没有对应的原生 ETH 池，需要约 ${(Number(need - bal) / 1e18).toPrecision(6)} WETH。` +
+      `本工具不会自动帮你 Wrap。请到「工具」页自行 Wrap，或取消「直接付原生币」后用已有 WETH Mint；` +
+      `若你根本不是组 ETH 池，请确认代币对不是 */WETH。`,
+  )
 }
 
 export async function mintV4Position(opts: {
@@ -1272,7 +1266,14 @@ export async function createV4PoolAndSeed(opts: {
     amount1 = paired.amount1
     if (amount0 <= 0n && amount1 <= 0n) throw new Error('注入数量必须 > 0')
 
-    if (chainHasWrappedNative() && !isNativeCurrency(currency0) && !isNativeCurrency(currency1)) {
+    // 仅当注入侧真有 WETH 时才检查余额；MEOW/USDT 等非 ETH 对绝不碰 Wrap
+    if (
+      useNative
+      && (
+        currency0.toLowerCase() === CONTRACTS.weth.toLowerCase()
+        || currency1.toLowerCase() === CONTRACTS.weth.toLowerCase()
+      )
+    ) {
       await ensureWethBalance({
         walletClient,
         owner,
@@ -1280,7 +1281,7 @@ export async function createV4PoolAndSeed(opts: {
         currency1,
         amount0,
         amount1,
-        useNativeEth: useNative,
+        useNativeEth: true,
       })
     }
 

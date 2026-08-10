@@ -428,7 +428,8 @@ export default function App() {
   const [poolDepth, setPoolDepth] = useState<PoolDepth | null>(null)
   const [depthLoading, setDepthLoading] = useState(false)
   const [depthError, setDepthError] = useState<string | null>(null)
-  const [useNativeEth, setUseNativeEth] = useState(true)
+  /** 仅当当前池/创建对含 ETH·WETH 时才有意义；非 ETH 对组仓不会触发 Wrap */
+  const [useNativeEth, setUseNativeEth] = useState(false)
   const [mintProtocol, setMintProtocol] = usePersistentState<'v3' | 'v4'>('mintProtocol', 'v3')
   /**
    * 「初始价」输入框是 U 本位：用户填 USD per 币。
@@ -446,8 +447,8 @@ export default function App() {
   const [seedAmtB, setSeedAmtB] = useState('')
   const [createSeedBalA, setCreateSeedBalA] = useState<bigint>(0n)
   const [createSeedBalB, setCreateSeedBalB] = useState<bigint>(0n)
-  /** 创建时初仓区间预设；custom = U 本位手填上下限 */
-  const [createRangePreset, setCreateRangePreset] = useState<'onesided-eth' | 'full' | 'custom' | number>('onesided-eth')
+  /** 创建时初仓区间预设；默认双边 ±10%，勿默认单边 ETH（山寨/U 池会被带偏） */
+  const [createRangePreset, setCreateRangePreset] = useState<'onesided-eth' | 'full' | 'custom' | number>(10)
   /** 自定义区间：USD per 币（与初始价同一本位） */
   const [createUsdLo, setCreateUsdLo] = useState('')
   const [createUsdHi, setCreateUsdHi] = useState('')
@@ -2337,7 +2338,8 @@ export default function App() {
           amountB: seedOnCreate ? amountB : undefined,
           tickLower,
           tickUpper,
-          useNativeEth,
+          // 非 ETH 对绝不走原生/Wrap 路径（避免误弹换 WETH）
+          useNativeEth: useNativeEth && (ethA || ethB),
           slippageBps,
           transferTaxBpsA: taxA,
           transferTaxBpsB: taxB,
@@ -2370,7 +2372,7 @@ export default function App() {
           amount1: seedOnCreate ? amount1 : undefined,
           tickLower,
           tickUpper,
-          useNativeEth,
+          useNativeEth: useNativeEth && (ethA || ethB),
           slippageBps,
           onStatus: setStatus,
         })
@@ -4162,10 +4164,12 @@ export default function App() {
                       onChange={(e) => setV4TickSpacing(Math.max(1, Number(e.target.value) || 1))}
                     />
                   </label>
-                  <label className="inline-setting check" style={{ alignSelf: 'end', marginBottom: 8 }}>
-                    <input type="checkbox" checked={useNativeEth} onChange={(e) => setUseNativeEth(e.target.checked)} />
-                    ETH 用原生币（非 WETH）
-                  </label>
+                  {(isEthLikeCurrency(tokenA) || isEthLikeCurrency(tokenB)) && (
+                    <label className="inline-setting check" style={{ alignSelf: 'end', marginBottom: 8 }}>
+                      <input type="checkbox" checked={useNativeEth} onChange={(e) => setUseNativeEth(e.target.checked)} />
+                      {getNativeSymbol()} 用原生币（非 {getWrappedNativeSymbol()}）
+                    </label>
+                  )}
                 </div>
               )}
 
@@ -5219,7 +5223,9 @@ export default function App() {
         <div className="tools-grid">
           <section className="panel tool-card">
             <h2>{getNativeSymbol()} ↔ {getWrappedNativeSymbol()}</h2>
-            <p className="muted">做 LP 前把 {getNativeSymbol()} wrap 成 {getWrappedNativeSymbol()}。</p>
+            <p className="muted">
+              仅组 {getWrappedNativeSymbol()} 池、且不走原生币支付时才需要。山寨/稳定币池不用 Wrap。
+            </p>
             {/*
              * 余额从正文里拨出来做成两个读数。原来是「余额：0 ETH / 0 WETH」缩在说明句尾，
              * 和「做 LP 前可把…」同字号同颜色 —— 这是下面填数量时唯一要看的数，
