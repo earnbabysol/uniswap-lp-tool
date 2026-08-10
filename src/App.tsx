@@ -2560,6 +2560,12 @@ export default function App() {
   const poolUsesWeth = pool ? pairHasWeth(pool.token0.address, pool.token1.address) : false
   const mintUseEth = useNativeEth && poolUsesWeth
 
+  // WETH 池默认勾选「直接付 ETH」（无原生兄弟池时会自动 Wrap）；非 ETH 对关掉，避免误伤
+  useEffect(() => {
+    if (!pool) return
+    setUseNativeEth(pairHasWeth(pool.token0.address, pool.token1.address))
+  }, [pool?.poolId, pool?.poolAddress, pool?.token0.address, pool?.token1.address])
+
   /** 把 UI 的「山寨币税」映射到 pool.token0/1；稳定币/WETH/原生为 0 */
   const mintTransferTax = useMemo(() => {
     if (!pool || transferTaxBps <= 0) return { tax0: 0, tax1: 0 }
@@ -4920,8 +4926,8 @@ export default function App() {
                 <label className="inline-setting check" style={{ marginBottom: 10 }}>
                   <input type="checkbox" checked={useNativeEth} onChange={(e) => setUseNativeEth(e.target.checked)} />
                   {mintProtocol === 'v4' || pool?.version === 'v4'
-                    ? '直接付 ETH 铸造（原生 ETH 池 · 一笔 value，不经 WETH）'
-                    : '直接付 ETH 铸造（Uniswap 会自动 Wrap 成 WETH）'}
+                    ? `直接付 ${getNativeSymbol()}（有原生池用 value；否则自动 Wrap 成 ${getWrappedNativeSymbol()}，不必先去工具页）`
+                    : `直接付 ${getNativeSymbol()}（Uniswap 自动 Wrap 成 ${getWrappedNativeSymbol()}）`}
                 </label>
               )}
 
