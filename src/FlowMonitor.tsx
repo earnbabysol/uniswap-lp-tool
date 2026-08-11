@@ -17,7 +17,7 @@ import { shortAddr } from './wallet'
 type ChainFilter = 'both' | FlowChainId
 type SideFilter = 'all' | FlowSide
 type VersionFilter = 'all' | FlowVersion
-type SortMode = 'apr' | 'net' | 'volume' | 'latest'
+type SortMode = 'apr' | 'inflow' | 'net' | 'volume' | 'latest'
 
 type FlowPoolRow = {
   key: string
@@ -167,6 +167,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
   const [busy, setBusy] = useState(false)
   const [events, setEvents] = useState<FlowEvent[]>([])
   const [notices, setNotices] = useState<FlowNotice[]>([])
+  const [expandedKey, setExpandedKey] = useState<string | null>(null)
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const [elapsedMs, setElapsedMs] = useState<number | null>(null)
   const eventsRef = useRef<FlowEvent[]>([])
@@ -383,6 +384,8 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         if (aApr == null && bApr != null) return 1
         if (aApr != null && bApr == null) return -1
         if (aApr != null && bApr != null && aApr !== bApr) return bApr - aApr
+      } else if (sortMode === 'inflow' && a.inflow !== b.inflow) {
+        return b.inflow - a.inflow
       } else if (sortMode === 'net' && a.net !== b.net) {
         return b.net - a.net
       } else if (sortMode === 'volume') {
@@ -428,9 +431,9 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
           <p className="flow-trust-note">
             默认按手续费年化从高到低。年化 = 近 {FLOW_WINDOW_MINUTES} 分钟锚定 Swap 手续费 ÷ 流动性基数 × 365；
             短窗口只用于发现，不代表未来收益。
-          </p>
-          <p className="flow-trust-note subtle">
-            V3 基数取池合约余额；V4 为 singleton，采用当前活跃流动性深度估算。两者都只信稳定币与 WETH/WBNB 锚点。
+            <span className="flow-trust-note-extra">
+              V3 取池合约余额；V4 按当前活跃流动性深度估算，仅采用稳定币与 WETH/WBNB 锚点。
+            </span>
           </p>
         </div>
         <div className="pos-page-actions">
@@ -485,68 +488,74 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
             onChange={(e) => setSortMode(e.target.value as SortMode)}
           >
             <option value="apr">手续费年化：高到低</option>
+            <option value="inflow">流入资金：高到低</option>
             <option value="net">净流入：高到低</option>
             <option value="volume">Swap 成交额：高到低</option>
             <option value="latest">最近动向</option>
           </select>
         </label>
-        <div className="inline-setting flow-min-setting">
-          <span>单笔动向 ≥ USD</span>
-          <input
-            className="flow-min-input"
-            type="number"
-            min={0}
-            step={50}
-            value={minUsdDraft}
-            aria-label="最低锚定 USD 金额"
-            onChange={(e) => setMinUsdDraft(e.target.value)}
-            onBlur={applyMinUsd}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') applyMinUsd()
-              if (e.key === 'Escape') setMinUsdDraft(String(minUsd))
-            }}
-          />
-          <button
-            type="button"
-            className="btn ghost tight flow-min-apply"
-            disabled={minUsdDraft === String(minUsd)}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={applyMinUsd}
-          >
-            应用
-          </button>
-        </div>
-        <label className="inline-setting flow-apr-min-setting">
-          最低年化 %
-          <input
-            className="flow-min-input"
-            type="number"
-            min={0}
-            step={10}
-            value={minAprDraft}
-            aria-label="最低手续费年化百分比"
-            onChange={(e) => setMinAprDraft(e.target.value)}
-          />
-        </label>
-        <label
-          className="inline-setting check"
-          title="至少 2 笔可锚定 Swap、年化基数不低于 1,000 美元，且窗口手续费不超过基数的 10%"
-        >
-          <input
-            type="checkbox"
-            checked={reliableOnly}
-            onChange={(e) => setReliableOnly(e.target.checked)}
-          />
-          仅看有效样本
-        </label>
-        <label className="inline-setting check" title="仅过滤风险接口明确判定的 BSC 貔貅；未知代币不会误杀，Robinhood 暂无对应检测服务">
-          <input type="checkbox" checked={filterHp} onChange={(e) => setFilterHp(e.target.checked)} />
-          过滤已确认貔貅
-        </label>
-        <label className="inline-setting check">
-          <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
-          自动刷新 20s
-        </label>
+        <details className="flow-more-filters">
+          <summary className="btn ghost tight">金额与样本筛选</summary>
+          <div className="flow-more-panel">
+            <div className="inline-setting flow-min-setting">
+              <span>单笔动向 ≥ USD</span>
+              <input
+                className="flow-min-input"
+                type="number"
+                min={0}
+                step={50}
+                value={minUsdDraft}
+                aria-label="最低锚定 USD 金额"
+                onChange={(e) => setMinUsdDraft(e.target.value)}
+                onBlur={applyMinUsd}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') applyMinUsd()
+                  if (e.key === 'Escape') setMinUsdDraft(String(minUsd))
+                }}
+              />
+              <button
+                type="button"
+                className="btn ghost tight flow-min-apply"
+                disabled={minUsdDraft === String(minUsd)}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={applyMinUsd}
+              >
+                应用
+              </button>
+            </div>
+            <label className="inline-setting flow-apr-min-setting">
+              最低年化 %
+              <input
+                className="flow-min-input"
+                type="number"
+                min={0}
+                step={10}
+                value={minAprDraft}
+                aria-label="最低手续费年化百分比"
+                onChange={(e) => setMinAprDraft(e.target.value)}
+              />
+            </label>
+            <label
+              className="inline-setting check"
+              title="至少 2 笔可锚定 Swap、年化基数不低于 1,000 美元，且窗口手续费不超过基数的 10%"
+            >
+              <input
+                type="checkbox"
+                checked={reliableOnly}
+                onChange={(e) => setReliableOnly(e.target.checked)}
+              />
+              仅看有效样本
+            </label>
+            <label className="inline-setting check" title="仅过滤风险接口明确判定的 BSC 貔貅；未知代币不会误杀，Robinhood 暂无对应检测服务">
+              <input type="checkbox" checked={filterHp} onChange={(e) => setFilterHp(e.target.checked)} />
+              过滤已确认貔貅
+            </label>
+            <label className="inline-setting check">
+              <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
+              自动刷新 20s
+            </label>
+          </div>
+        </details>
         {updatedAt && (
           <span className="muted flow-updated">
             更新于 {new Date(updatedAt).toLocaleTimeString()}
@@ -554,17 +563,6 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
             {busy ? ' · 增量中…' : ''}
           </span>
         )}
-      </div>
-
-      <div className="flow-discovery-bar">
-        <input
-          type="search"
-          value={search}
-          aria-label="搜索动向池"
-          placeholder="搜索币种 / CA / 池地址"
-          onChange={(e) => setSearch(e.target.value)}
-        />
-        <span className="muted">共 {pools.length} 个池 · 当前显示 {visible.length} 个</span>
       </div>
 
       {warningMessages.length > 0 && (
@@ -578,30 +576,43 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         </p>
       )}
 
-      {(updatedAt || visible.length > 0) && (
-        <div className="flow-summary" aria-label="当前筛选汇总">
-          <div className="flow-summary-item">
-            <span className="muted">池子</span>
-            <strong>{visible.length}</strong>
-          </div>
-          <div className="flow-summary-item apr">
-            <span className="muted">可计算年化</span>
-            <strong>{summary.withApr}</strong>
-          </div>
-          <div className="flow-summary-item in">
-            <span className="muted">流入</span>
-            <strong>{formatUsd(summary.inflow)}</strong>
-          </div>
-          <div className="flow-summary-item out">
-            <span className="muted">流出</span>
-            <strong>{formatUsd(summary.outflow)}</strong>
-          </div>
-          <div className={`flow-summary-item ${summary.net >= 0 ? 'in' : 'out'}`}>
-            <span className="muted">净流</span>
-            <strong>{summary.net > 0 ? '+' : ''}{formatUsd(summary.net)}</strong>
-          </div>
+      <div className="flow-overview">
+        <div className="flow-discovery-bar">
+          <input
+            type="search"
+            value={search}
+            aria-label="搜索动向池"
+            placeholder="搜索币种 / CA / 池地址"
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <span className="muted">显示 {visible.length} / {pools.length} 个池</span>
         </div>
-      )}
+
+        {(updatedAt || visible.length > 0) && (
+          <div className="flow-summary" aria-label="当前筛选汇总">
+            <div className="flow-summary-item">
+              <span className="muted">池子</span>
+              <strong>{visible.length}</strong>
+            </div>
+            <div className="flow-summary-item apr">
+              <span className="muted">可算年化</span>
+              <strong>{summary.withApr}</strong>
+            </div>
+            <div className="flow-summary-item in">
+              <span className="muted">流入</span>
+              <strong>{formatUsd(summary.inflow)}</strong>
+            </div>
+            <div className="flow-summary-item out">
+              <span className="muted">流出</span>
+              <strong>{formatUsd(summary.outflow)}</strong>
+            </div>
+            <div className={`flow-summary-item ${summary.net >= 0 ? 'in' : 'out'}`}>
+              <span className="muted">净流</span>
+              <strong>{summary.net > 0 ? '+' : ''}{formatUsd(summary.net)}</strong>
+            </div>
+          </div>
+        )}
+      </div>
 
       {busy && events.length === 0 ? (
         <p className="muted flow-empty">
@@ -616,120 +627,176 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
               : '最近窗口暂无符合条件的锚定资金记录（可调低金额或关闭貔貅过滤重试）'}
         </p>
       ) : (
-        <div className="flow-list">
-          {visible.map((row, index) => {
-            const e = row.latest
-            const poolRef = flowPoolRef(e)
-            const direction: FlowSide = row.net >= 0 ? 'in' : 'out'
-            const reliable = isReliableApr(row)
-            const basisLabel = row.aprBasis === 'active-liquidity'
-              ? 'V4 当前活跃流动性深度（估算）'
-              : 'V3 当前池合约余额（锚定侧估值）'
-            return (
-              <article
-                key={row.key}
-                className={`flow-card ${direction}`}
-                data-testid="flow-pool-card"
-                data-apr={row.feeAprPct == null ? '' : String(row.feeAprPct)}
-              >
-                <div className="flow-card-top">
-                  <span className="flow-rank" aria-label={`列表第 ${index + 1} 名`}>#{index + 1}</span>
-                  <span className={`flow-side ${direction}`}>
-                    {row.net > 0 ? '净流入' : row.net < 0 ? '净流出' : '持平'}
-                  </span>
-                  <span className={`flow-ver ${e.version}`}>{e.version.toUpperCase()}</span>
-                  <span className="flow-chain">{flowChainLabel(e.chainId)}</span>
-                  <span className="flow-source">{e.source === 'subgraph' ? 'Graph' : '链上'}</span>
-                  <span className="muted mono">最近 {formatTime(e.timestamp)}</span>
-                  <div
-                    className={`flow-apr-box ${reliable ? 'reliable' : 'volatile'}`}
-                    title={`近 ${FLOW_WINDOW_MINUTES} 分钟手续费 ÷ ${basisLabel} × 365，简单年化、不复利`}
-                  >
-                    <span>手续费年化估算</span>
-                    <strong data-testid="flow-apr-value">{formatApr(row.feeAprPct)}</strong>
-                    <em>{aprSampleLabel(row)}</em>
+        <div className="flow-table">
+          <div className="flow-table-head" aria-hidden="true">
+            <span>池子 / 网络</span>
+            <span>手续费年化</span>
+            <span>流入资金</span>
+            <span>流出资金</span>
+            <span>净流</span>
+            <span>{FLOW_WINDOW_MINUTES}m Swap</span>
+            <span>最近动向 / 操作</span>
+          </div>
+          <div className="flow-list">
+            {visible.map((row, index) => {
+              const e = row.latest
+              const poolRef = flowPoolRef(e)
+              const direction: FlowSide = row.net >= 0 ? 'in' : 'out'
+              const reliable = isReliableApr(row)
+              const expanded = expandedKey === row.key
+              const detailId = `flow-pool-detail-${index}`
+              const pairLabel = `${e.symbol0} / ${e.symbol1}`
+              const basisLabel = row.aprBasis === 'active-liquidity'
+                ? 'V4 当前活跃流动性深度（估算）'
+                : 'V3 当前池合约余额（锚定侧估值）'
+              return (
+                <article
+                  key={row.key}
+                  className={`flow-card ${direction} ${expanded ? 'expanded' : ''}`}
+                  data-testid="flow-pool-card"
+                  data-apr={row.feeAprPct == null ? '' : String(row.feeAprPct)}
+                  data-inflow={String(row.inflow)}
+                >
+                  <div className="flow-row">
+                    <div className="flow-pool-cell">
+                      <div className="flow-pair-line">
+                        <span className="flow-rank" aria-label={`列表第 ${index + 1} 名`}>#{index + 1}</span>
+                        <strong className="flow-pair-name" title={pairLabel}>{pairLabel}</strong>
+                      </div>
+                      <div className="flow-pool-meta">
+                        <span className={`flow-side ${direction}`}>
+                          {row.net > 0 ? '净流入' : row.net < 0 ? '净流出' : '持平'}
+                        </span>
+                        <span className={`flow-ver ${e.version}`}>{e.version.toUpperCase()}</span>
+                        <span className="flow-chain">{flowChainLabel(e.chainId)}</span>
+                        <span className="muted">{formatFee(e, row.effectiveFeePips)}</span>
+                      </div>
+                    </div>
+
+                    <div
+                      className={`flow-row-metric flow-row-apr ${reliable ? 'reliable' : 'volatile'}`}
+                      title={`近 ${FLOW_WINDOW_MINUTES} 分钟手续费 ÷ ${basisLabel} × 365，简单年化、不复利`}
+                    >
+                      <span className="flow-mobile-label">手续费年化</span>
+                      <strong data-testid="flow-apr-value">{formatApr(row.feeAprPct)}</strong>
+                      <em>{aprSampleLabel(row)}</em>
+                    </div>
+                    <div className="flow-row-metric flow-row-inflow">
+                      <span className="flow-mobile-label">流入</span>
+                      <strong>{formatUsd(row.inflow)}</strong>
+                    </div>
+                    <div className="flow-row-metric flow-row-outflow">
+                      <span className="flow-mobile-label">流出</span>
+                      <strong>{formatUsd(row.outflow)}</strong>
+                    </div>
+                    <div className={`flow-row-metric flow-row-net ${row.net >= 0 ? 'positive' : 'negative'}`}>
+                      <span className="flow-mobile-label">净流</span>
+                      <strong>{row.net > 0 ? '+' : ''}{formatUsd(row.net)}</strong>
+                    </div>
+                    <div className="flow-row-metric flow-row-volume">
+                      <span className="flow-mobile-label">{FLOW_WINDOW_MINUTES}m Swap</span>
+                      <strong>{row.windowSwapUsd == null ? '—' : formatUsd(row.windowSwapUsd)}</strong>
+                    </div>
+                    <div className="flow-row-actions">
+                      <div className="flow-row-time">
+                        <strong>{formatTime(e.timestamp)}</strong>
+                        <span>{row.eventCount} 笔动向</span>
+                      </div>
+                      <div className="flow-row-buttons">
+                        <button
+                          type="button"
+                          className="btn ghost tight"
+                          aria-expanded={expanded}
+                          aria-controls={detailId}
+                          aria-label={`${expanded ? '收起' : '查看'} ${pairLabel} 详情`}
+                          onClick={() => setExpandedKey(expanded ? null : row.key)}
+                        >
+                          {expanded ? '收起' : '详情'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn primary tight"
+                          title={`用 ${pairLabel} 池开仓`}
+                          aria-label={`用 ${pairLabel} 池开仓`}
+                          onClick={() =>
+                            onOpenPool({
+                              chainId: e.chainId,
+                              version: e.version,
+                              poolAddress: e.version === 'v3' ? e.poolAddress : undefined,
+                              poolId: e.poolId,
+                            })
+                          }
+                        >
+                          开仓
+                        </button>
+                      </div>
+                    </div>
                   </div>
-                </div>
-                <div className="flow-pair">
-                  <span className="flow-pair-name">
-                    {e.symbol0} / {e.symbol1}
-                    <span className="muted"> · {formatFee(e, row.effectiveFeePips)}</span>
-                  </span>
-                  <span className="flow-copy-group">
-                    <CopyBtn label={`CA ${e.symbol0}`} value={e.token0} title={`复制 ${e.symbol0}：${e.token0}`} />
-                    <CopyBtn label={`CA ${e.symbol1}`} value={e.token1} title={`复制 ${e.symbol1}：${e.token1}`} />
-                    <CopyBtn
-                      label={e.version === 'v4' ? '复制 poolId' : '复制池'}
-                      value={poolRef}
-                      title={e.version === 'v4' ? `复制 V4 poolId：${poolRef}` : `复制池地址：${poolRef}`}
-                    />
-                  </span>
-                </div>
-                <div className="flow-pool-stats">
-                  <div>
-                    <span className="muted">{FLOW_WINDOW_MINUTES}m Swap</span>
-                    <strong>{row.windowSwapUsd == null ? '—' : formatUsd(row.windowSwapUsd)}</strong>
-                  </div>
-                  <div>
-                    <span className="muted">{FLOW_WINDOW_MINUTES}m 手续费</span>
-                    <strong>{row.windowFeeUsd == null ? '—' : formatUsd(row.windowFeeUsd)}</strong>
-                  </div>
-                  <div title={basisLabel}>
-                    <span className="muted">年化基数 {e.version === 'v4' ? '≈' : ''}</span>
-                    <strong>{row.aprLiquidityUsd == null ? '—' : formatUsd(row.aprLiquidityUsd)}</strong>
-                  </div>
-                  <div>
-                    <span className="muted">锚定 Swap</span>
-                    <strong>{row.aprSwapCount == null ? '—' : `${row.aprSwapCount} 笔`}</strong>
-                  </div>
-                  <div className={row.net >= 0 ? 'positive' : 'negative'}>
-                    <span className="muted">净流</span>
-                    <strong>{row.net > 0 ? '+' : ''}{formatUsd(row.net)}</strong>
-                  </div>
-                  <div>
-                    <span className="muted">大额动向</span>
-                    <strong>{row.eventCount} 笔</strong>
-                  </div>
-                </div>
-                {e.amount0 != null && e.amount1 != null && (
-                  <div className="flow-token-amounts flow-latest-action">
-                    <span className="muted">最近一笔 {e.side === 'in' ? '流入' : '流出'} {e.amountEstimated ? '（数量估算）' : ''}</span>
-                    <strong>{e.amountEstimated ? '≈' : ''}{formatUsd(e.amountUsd)}</strong>
-                    <strong>{formatTokenAmount(e.amount0)} {e.symbol0}</strong>
-                    <span className="muted">+</span>
-                    <strong>{formatTokenAmount(e.amount1)} {e.symbol1}</strong>
-                  </div>
-                )}
-                <div className="flow-card-foot">
-                  <code className="mono muted" title={poolRef}>
-                    {e.version === 'v4' ? 'poolId' : '池'} {shortAddr(poolRef as Address)}
-                  </code>
-                  <a
-                    className="btn ghost tight"
-                    href={flowExplorerTx(e.chainId, e.txHash)}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    最近交易 ↗
-                  </a>
-                  <button
-                    type="button"
-                    className="btn primary tight"
-                    onClick={() =>
-                      onOpenPool({
-                        chainId: e.chainId,
-                        version: e.version,
-                        poolAddress: e.version === 'v3' ? e.poolAddress : undefined,
-                        poolId: e.poolId,
-                      })
-                    }
-                  >
-                    用此池开仓
-                  </button>
-                </div>
-              </article>
-            )
-          })}
+
+                  {expanded && (
+                    <div className="flow-card-detail" id={detailId}>
+                      <div className="flow-detail-stats">
+                        <div>
+                          <span className="muted">{FLOW_WINDOW_MINUTES}m Swap</span>
+                          <strong>{row.windowSwapUsd == null ? '—' : formatUsd(row.windowSwapUsd)}</strong>
+                        </div>
+                        <div>
+                          <span className="muted">{FLOW_WINDOW_MINUTES}m 手续费</span>
+                          <strong>{row.windowFeeUsd == null ? '—' : formatUsd(row.windowFeeUsd)}</strong>
+                        </div>
+                        <div title={basisLabel}>
+                          <span className="muted">年化基数 {e.version === 'v4' ? '≈' : ''}</span>
+                          <strong>{row.aprLiquidityUsd == null ? '—' : formatUsd(row.aprLiquidityUsd)}</strong>
+                        </div>
+                        <div>
+                          <span className="muted">锚定 Swap</span>
+                          <strong>{row.aprSwapCount == null ? '—' : `${row.aprSwapCount} 笔`}</strong>
+                        </div>
+                        <div>
+                          <span className="muted">最近一笔 {e.side === 'in' ? '流入' : '流出'}</span>
+                          <strong>{e.amountEstimated ? '≈' : ''}{formatUsd(e.amountUsd)}</strong>
+                        </div>
+                        <div>
+                          <span className="muted">数据 / 大额动向</span>
+                          <strong>{e.source === 'subgraph' ? 'Graph' : '链上'} · {row.eventCount} 笔</strong>
+                        </div>
+                      </div>
+                      {e.amount0 != null && e.amount1 != null && (
+                        <div className="flow-token-amounts flow-latest-action">
+                          <span className="muted">最近数量 {e.amountEstimated ? '（估算）' : ''}</span>
+                          <strong>{formatTokenAmount(e.amount0)} {e.symbol0}</strong>
+                          <span className="muted">+</span>
+                          <strong>{formatTokenAmount(e.amount1)} {e.symbol1}</strong>
+                        </div>
+                      )}
+                      <div className="flow-detail-foot">
+                        <code className="mono muted" title={poolRef}>
+                          {e.version === 'v4' ? 'poolId' : '池'} {shortAddr(poolRef as Address)}
+                        </code>
+                        <span className="flow-copy-group">
+                          <CopyBtn label={`CA ${e.symbol0}`} value={e.token0} title={`复制 ${e.symbol0}：${e.token0}`} />
+                          <CopyBtn label={`CA ${e.symbol1}`} value={e.token1} title={`复制 ${e.symbol1}：${e.token1}`} />
+                          <CopyBtn
+                            label={e.version === 'v4' ? '复制 poolId' : '复制池'}
+                            value={poolRef}
+                            title={e.version === 'v4' ? `复制 V4 poolId：${poolRef}` : `复制池地址：${poolRef}`}
+                          />
+                        </span>
+                        <a
+                          className="btn ghost tight"
+                          href={flowExplorerTx(e.chainId, e.txHash)}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          最近交易 ↗
+                        </a>
+                      </div>
+                    </div>
+                  )}
+                </article>
+              )
+            })}
+          </div>
         </div>
       )}
     </section>
