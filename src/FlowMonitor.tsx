@@ -191,7 +191,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         rerunRef.current = true
       } else if (genRef.current !== runningGenRef.current) {
         // React StrictMode 的挂载自检会作废首个 generation；只在这种情况下
-        // 补跑同条件请求。普通 20s 定时器撞上在途请求时直接跳过。
+        // 补跑同条件请求。普通 45s 定时器撞上在途请求时直接跳过。
         rerunRef.current = true
       }
       return
@@ -295,7 +295,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
     const t = window.setInterval(() => {
       if (document.visibilityState === 'hidden') return
       void load()
-    }, 20_000)
+    }, 45_000)
     return () => window.clearInterval(t)
   }, [auto, load])
 
@@ -552,7 +552,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
             </label>
             <label className="inline-setting check">
               <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
-              自动刷新 20s
+              自动刷新 45s
             </label>
           </div>
         </details>

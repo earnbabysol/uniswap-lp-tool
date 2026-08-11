@@ -129,8 +129,19 @@ const V4_SWAP = parseAbiItem(
 export const FLOW_WINDOW_MINUTES = 45
 const EVENT_TTL_MS = FLOW_WINDOW_MINUTES * 60_000
 const WETH_USD_TTL_MS = 5 * 60_000
-const APR_TTL_MS = 60_000
+/** 年化依赖 Swap getLogs，TTL 拉长减轻公共 RPC / 主线程压力 */
+const APR_TTL_MS = 180_000
+/**
+ * 每次刷新最多新算多少个「池」的年化（按事件金额取 Top-N）。
+ * 其余池复用缓存；无缓存则先不显示 APR，下一轮再轮换。
+ */
+const APR_POOL_LIMIT = 8
 const APR_WINDOWS_PER_YEAR = (365 * 24 * 60) / FLOW_WINDOW_MINUTES
+/** 模块级 Map 上限，防止长挂动向页缓涨内存 */
+const POS_CACHE_CAP = 800
+const POOL_CACHE_CAP = 600
+const META_CACHE_CAP = 1_200
+const V4_POOL_CACHE_CAP = 600
 
 /**
  * 约 45 分钟的初次窗口。两条链当前都不是传统的 2~3 秒块：实测 BSC 约
@@ -258,6 +269,26 @@ function clearFlowAprCache(chainId: FlowChainId): void {
   for (const key of flowAprCache.keys()) {
     if (key.startsWith(prefix)) flowAprCache.delete(key)
   }
+}
+
+/** Map 过大时删最早插入的一批（JS Map 保插入序） */
+function pruneMapSize<K, V>(map: Map<K, V>, cap: number): void {
+  if (map.size <= cap) return
+  const keep = Math.floor(cap * 0.75)
+  const drop = map.size - keep
+  let i = 0
+  for (const key of map.keys()) {
+    map.delete(key)
+    if (++i >= drop) break
+  }
+}
+
+function pruneChainCaches(chainId: FlowChainId): void {
+  const c = logCaches[chainId]
+  pruneMapSize(c.pos, POS_CACHE_CAP)
+  pruneMapSize(c.pools, POOL_CACHE_CAP)
+  pruneMapSize(c.meta, META_CACHE_CAP)
+  pruneMapSize(v4Caches[chainId].pools, V4_POOL_CACHE_CAP)
 }
 
 function asErc20(chainId: FlowChainId, currency: Address): Address {
@@ -1486,6 +1517,7 @@ async function fetchNpmFlowLogs(
 
     cache.events = merged.slice(0, 5_000)
     cache.tip = latest
+    pruneChainCaches(chainId)
     return {
       events: cache.events
         .filter((e) => e.amountUsd >= opts.minUsd)
@@ -1849,6 +1881,7 @@ async function fetchV4FlowLogs(
       .sort((a, b) => b.timestamp - a.timestamp)
     cache.events = merged.slice(0, 5_000)
     cache.tip = latest
+    pruneChainCaches(chainId)
     return {
       events: cache.events
         .filter((e) => e.amountUsd >= opts.minUsd)
@@ -2363,7 +2396,9 @@ async function enrichFlowApr(events: FlowEvent[]): Promise<{
 }> {
   const now = Date.now()
   const metrics = new Map<string, FlowAprMetric>()
-  const pending = new Map<string, FlowEvent[]>()
+  /** 待新算的池：key → 代表事件（取金额最大的一条） */
+  const pendingPools = new Map<string, FlowEvent>()
+
   for (const event of events) {
     const key = flowAprKey(event.chainId, event.version, flowPoolRef(event))
     const hit = flowAprCache.get(key)
@@ -2371,10 +2406,23 @@ async function enrichFlowApr(events: FlowEvent[]): Promise<{
       metrics.set(key, hit.metric)
       continue
     }
-    const groupKey = `${event.chainId}:${event.version}`
+    const prev = pendingPools.get(key)
+    if (!prev || event.amountUsd > prev.amountUsd) pendingPools.set(key, event)
+  }
+
+  // 只对新池里金额 Top-N 扫 Swap；其余跳过本轮（有旧缓存仍可用）
+  const ranked = [...pendingPools.entries()]
+    .sort((a, b) => b[1].amountUsd - a[1].amountUsd)
+    .slice(0, APR_POOL_LIMIT)
+  const pending = new Map<string, FlowEvent[]>()
+  for (const [key, sample] of ranked) {
+    const groupKey = `${sample.chainId}:${sample.version}`
     const rows = pending.get(groupKey) ?? []
-    rows.push(event)
+    rows.push(sample)
     pending.set(groupKey, rows)
+    // stale 缓存：新算前先挂上，避免榜单闪空
+    const stale = flowAprCache.get(key)
+    if (stale) metrics.set(key, stale.metric)
   }
 
   const notices: FlowNotice[] = []
@@ -2405,6 +2453,7 @@ async function enrichFlowApr(events: FlowEvent[]): Promise<{
         })
       }
     }
+    pruneChainCaches(chainId)
   }))
 
   if (flowAprCache.size > 600) {
