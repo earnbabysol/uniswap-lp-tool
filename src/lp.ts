@@ -5325,16 +5325,28 @@ export function ticksFromPrices(
   if (!(priceLower > 0) || !(priceUpper > 0) || priceLower >= priceUpper) {
     throw new Error('请输入有效的价格下限 < 上限')
   }
+  const spacing = Math.max(1, Math.floor(Number(pool.tickSpacing) || 1))
   let tickLower = nearestUsableTick(
     priceToClosestTick(priceLower, pool.token0.decimals, pool.token1.decimals),
-    pool.tickSpacing,
+    spacing,
   )
   let tickUpper = nearestUsableTick(
     priceToClosestTick(priceUpper, pool.token0.decimals, pool.token1.decimals),
-    pool.tickSpacing,
+    spacing,
   )
+  // 大 tickSpacing（如 3000）时 ±5% 会塌成同一 tick；必须围着现价撑开一格，
+  // 否则 [T, T+spacing] 可能把现价甩到区间外，Mint 变成「只付一边」或直接失败。
   if (tickLower >= tickUpper) {
-    tickUpper = tickLower + pool.tickSpacing
+    tickLower = Math.floor(pool.tick / spacing) * spacing
+    tickUpper = tickLower + spacing
+    if (pool.tick < tickLower) {
+      tickLower -= spacing
+      tickUpper -= spacing
+    }
+    if (pool.tick >= tickUpper) {
+      tickLower += spacing
+      tickUpper += spacing
+    }
   }
   return {
     tickLower,

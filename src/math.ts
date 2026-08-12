@@ -121,7 +121,17 @@ export function rangeFromPercent(
   let tickLower = nearestUsableTick(currentTick + Math.floor(lowerTicks), tickSpacing)
   let tickUpper = nearestUsableTick(currentTick + Math.ceil(upperTicks), tickSpacing)
   if (tickLower >= tickUpper) {
-    tickUpper = tickLower + tickSpacing
+    const spacing = Math.max(1, Math.floor(Number(tickSpacing) || 1))
+    tickLower = Math.floor(currentTick / spacing) * spacing
+    tickUpper = tickLower + spacing
+    if (currentTick < tickLower) {
+      tickLower -= spacing
+      tickUpper -= spacing
+    }
+    if (currentTick >= tickUpper) {
+      tickLower += spacing
+      tickUpper += spacing
+    }
   }
   return { tickLower, tickUpper }
 }

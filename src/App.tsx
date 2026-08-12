@@ -1576,18 +1576,34 @@ export default function App() {
       const info = await loadPoolFromInput(poolInput)
       setDiscovered(null)
       setPool(info)
+      if (info.version === 'v4') setMintProtocol('v4')
+      else setMintProtocol('v3')
       {
         const q = getCoinQuote(info)
         setTokenA(q.coin.address)
         setTokenB(q.quote.address)
       }
       setFee(info.fee)
-      applyDefaultCoinRange(info, setPriceLo, setPriceHi)
+      if (info.tickSpacing) setV4TickSpacing(info.tickSpacing)
+      // 超大 tickSpacing（如 3000）时默认 ±5% 会塌格；自动切全区间更稳
+      if (info.tickSpacing >= 500) {
+        setRangeMode('full')
+      } else {
+        applyDefaultCoinRange(info, setPriceLo, setPriceHi)
+      }
       const q = getCoinQuote(info)
       const tag = info.version === 'v4'
         ? `V4 · poolId ${info.poolId ? shortAddr(info.poolId) : ''}`
         : `V3 · ${info.poolAddress ? shortAddr(info.poolAddress) : ''}`
-      setStatus(`已加载 ${tag} · ${q.coin.symbol}/${q.quote.symbol} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`)
+      const feePct = (info.fee / 10_000).toFixed(2)
+      const spacingNote = info.tickSpacing >= 500
+        ? ` · spacing ${info.tickSpacing} 很大，已切全区间`
+        : info.tickSpacing
+          ? ` · spacing ${info.tickSpacing}`
+          : ''
+      setStatus(
+        `已加载 ${tag} · ${q.coin.symbol}/${q.quote.symbol} · Fee ${feePct}%${spacingNote} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`,
+      )
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e))
     } finally {
