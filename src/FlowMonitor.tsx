@@ -33,6 +33,9 @@ type FlowPoolRow = {
   aprSwapCount?: number
   effectiveFeePips?: number
   aprBasis?: FlowEvent['aprBasis']
+  marketCapUsd?: number
+  tokenCreatedAt?: number
+  coinSymbol?: string
 }
 
 function formatUsd(n: number): string {
@@ -70,6 +73,30 @@ function formatApr(n: number | undefined): string {
   if (n >= 1_000) return `${n.toLocaleString('en-US', { maximumFractionDigits: 0 })}%`
   if (n >= 100) return `${n.toFixed(1)}%`
   return `${n.toFixed(2)}%`
+}
+
+function formatMarketCap(n: number | undefined): string {
+  if (n == null || !Number.isFinite(n) || n <= 0) return '—'
+  if (n >= 1_000_000_000) return `$${(n / 1_000_000_000).toFixed(2)}B`
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}K`
+  return `$${Math.round(n)}`
+}
+
+/** 代币/交易对开盘：相对年龄 + 本地日期 */
+function formatTokenDate(ts: number | undefined): string {
+  if (ts == null || !Number.isFinite(ts) || ts <= 0) return '—'
+  const ms = ts > 1e12 ? ts : ts * 1000
+  const d = new Date(ms)
+  if (!Number.isFinite(d.getTime())) return '—'
+  const ageMs = Math.max(0, Date.now() - d.getTime())
+  let age: string
+  if (ageMs < 3_600_000) age = `${Math.max(1, Math.floor(ageMs / 60_000))}m`
+  else if (ageMs < 86_400_000) age = `${Math.floor(ageMs / 3_600_000)}h`
+  else if (ageMs < 30 * 86_400_000) age = `${Math.floor(ageMs / 86_400_000)}d`
+  else age = `${Math.floor(ageMs / (30 * 86_400_000))}mo`
+  const date = d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
+  return `${age} · ${date}`
 }
 
 function formatFee(event: FlowEvent, effectiveFeePips?: number): string {
@@ -332,6 +359,9 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
           aprSwapCount: event.aprSwapCount,
           effectiveFeePips: event.effectiveFeePips,
           aprBasis: event.aprBasis,
+          marketCapUsd: event.marketCapUsd,
+          tokenCreatedAt: event.tokenCreatedAt,
+          coinSymbol: event.coinSymbol,
         })
         continue
       }
@@ -348,6 +378,14 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         previous.aprSwapCount = event.aprSwapCount
         previous.effectiveFeePips = event.effectiveFeePips
         previous.aprBasis = event.aprBasis
+      }
+      if (previous.marketCapUsd == null && event.marketCapUsd != null) {
+        previous.marketCapUsd = event.marketCapUsd
+        previous.tokenCreatedAt = event.tokenCreatedAt
+        previous.coinSymbol = event.coinSymbol
+      } else if (previous.tokenCreatedAt == null && event.tokenCreatedAt != null) {
+        previous.tokenCreatedAt = event.tokenCreatedAt
+        previous.coinSymbol = event.coinSymbol ?? previous.coinSymbol
       }
     }
     return [...grouped.values()]
@@ -670,6 +708,18 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
                         <span className={`flow-ver ${e.version}`}>{e.version.toUpperCase()}</span>
                         <span className="flow-chain">{flowChainLabel(e.chainId)}</span>
                         <span className="muted">{formatFee(e, row.effectiveFeePips)}</span>
+                        <span
+                          className="flow-mcap"
+                          title={row.coinSymbol ? `${row.coinSymbol} 市值（DexScreener）` : '市值（DexScreener）'}
+                        >
+                          市值 {formatMarketCap(row.marketCapUsd)}
+                        </span>
+                        <span
+                          className="flow-age"
+                          title={row.coinSymbol ? `${row.coinSymbol} 开盘/配对日期` : '开盘/配对日期'}
+                        >
+                          {formatTokenDate(row.tokenCreatedAt)}
+                        </span>
                       </div>
                     </div>
 
@@ -736,6 +786,14 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
                   {expanded && (
                     <div className="flow-card-detail" id={detailId}>
                       <div className="flow-detail-stats">
+                        <div>
+                          <span className="muted">市值 {row.coinSymbol ? `· ${row.coinSymbol}` : ''}</span>
+                          <strong>{formatMarketCap(row.marketCapUsd)}</strong>
+                        </div>
+                        <div>
+                          <span className="muted">代币日期</span>
+                          <strong>{formatTokenDate(row.tokenCreatedAt)}</strong>
+                        </div>
                         <div>
                           <span className="muted">{FLOW_WINDOW_MINUTES}m Swap</span>
                           <strong>{row.windowSwapUsd == null ? '—' : formatUsd(row.windowSwapUsd)}</strong>

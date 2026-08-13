@@ -4257,6 +4257,17 @@ input:focus-visible, select:focus-visible, select:focus {
   font-size: 10.5px;
   text-overflow: ellipsis;
 }
+.flow-pool-meta .flow-mcap,
+.flow-pool-meta .flow-age {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.flow-pool-meta .flow-mcap {
+  font-weight: 650;
+}
+.flow-pool-meta .flow-age {
+  color: var(--muted);
+}
 .flow-row-metric {
   display: flex;
   flex-direction: column;
@@ -4336,12 +4347,17 @@ input:focus-visible, select:focus-visible, select:focus {
 }
 .flow-detail-stats {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   overflow: hidden;
   border: 1px solid var(--line-soft, var(--line));
   border-radius: 8px;
   background: color-mix(in srgb, var(--card) 74%, transparent);
   font-variant-numeric: tabular-nums;
+}
+@media (min-width: 960px) {
+  .flow-detail-stats {
+    grid-template-columns: repeat(8, minmax(0, 1fr));
+  }
 }
 .flow-detail-stats > div {
   display: flex;
@@ -4351,7 +4367,15 @@ input:focus-visible, select:focus-visible, select:focus {
   padding: 6px 8px;
   border-left: 1px solid var(--line-soft, var(--line));
 }
-.flow-detail-stats > div:first-child { border-left: 0; }
+.flow-detail-stats > div:nth-child(4n + 1) { border-left: 0; }
+.flow-detail-stats > div:nth-child(n + 5) {
+  border-top: 1px solid var(--line-soft, var(--line));
+}
+@media (min-width: 960px) {
+  .flow-detail-stats > div:nth-child(4n + 1) { border-left: 1px solid var(--line-soft, var(--line)); }
+  .flow-detail-stats > div:first-child { border-left: 0; }
+  .flow-detail-stats > div:nth-child(n + 5) { border-top: 0; }
+}
 .flow-detail-stats span { font-size: 10.5px; }
 .flow-detail-stats strong {
   overflow: hidden;
@@ -4429,7 +4453,9 @@ input:focus-visible, select:focus-visible, select:focus {
   .flow-mobile-label { display: block; }
   .flow-row { min-height: 67px; }
   .flow-detail-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .flow-detail-stats > div:nth-child(4) { border-left: 0; }
+  .flow-detail-stats > div:nth-child(4n + 1) { border-left: 1px solid var(--line-soft, var(--line)); }
+  .flow-detail-stats > div:nth-child(3n + 1) { border-left: 0; }
+  .flow-detail-stats > div:nth-child(n + 5) { border-top: 0; }
   .flow-detail-stats > div:nth-child(n + 4) { border-top: 1px solid var(--line-soft, var(--line)); }
 }
 

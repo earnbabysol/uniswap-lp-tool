@@ -24,6 +24,7 @@ import {
   v4PositionManagerAbi,
   v4StateViewAbi,
 } from './abis'
+import { fetchJson } from './async'
 import { CHAIN_CONFIGS, type SupportedChainId } from './chain'
 import { loadGraphApiKey } from './graphSettings'
 import { checkPoolTokensSafe, isHoneypotWhitelisted } from './honeypot'
@@ -78,6 +79,13 @@ export type FlowEvent = {
   effectiveFeePips?: number
   /** V3 用池合约余额；V4 singleton 无法直接拆分余额，使用当前活跃流动性深度。 */
   aprBasis?: 'pool-balance' | 'active-liquidity'
+  /** 山寨侧代币地址（非稳定币 / 非包装原生币） */
+  coinAddress?: Address
+  coinSymbol?: string
+  /** DexScreener 市值（USD）；无则回退 FDV */
+  marketCapUsd?: number
+  /** 代币/交易对开盘时间（unix 秒，来自 pairCreatedAt） */
+  tokenCreatedAt?: number
 }
 
 /** 复制 / 开仓用的池引用 */
@@ -260,8 +268,59 @@ type FlowAprCacheEntry = {
 
 const flowAprCache = new Map<string, FlowAprCacheEntry>()
 
+type FlowMarketMeta = {
+  coinAddress: Address
+  coinSymbol: string
+  marketCapUsd?: number
+  tokenCreatedAt?: number
+}
+
+type FlowMarketCacheEntry = {
+  at: number
+  meta: FlowMarketMeta
+}
+
+const FLOW_MARKET_TTL_MS = 5 * 60_000
+const FLOW_MARKET_CACHE_CAP = 800
+const flowMarketCache = new Map<string, FlowMarketCacheEntry>()
+
 function flowAprKey(chainId: FlowChainId, version: FlowVersion, poolRef: string): string {
   return `${chainId}:${version}:${poolRef.toLowerCase()}`
+}
+
+function flowMarketKey(chainId: FlowChainId, token: Address): string {
+  return `${chainId}:${token.toLowerCase()}`
+}
+
+function dexScreenerChain(chainId: FlowChainId): string {
+  return chainId === 56 ? 'bsc' : 'robinhood'
+}
+
+/** 动向对里的「山寨侧」：非稳定币、非 WETH/原生 */
+function flowCoinSide(event: FlowEvent): { address: Address; symbol: string } | null {
+  const cfg = CHAIN_CONFIGS[event.chainId]
+  const stables = new Set(
+    [cfg.contracts.stable, ...(cfg.usdStables ?? [])].map((x) => x.toLowerCase()),
+  )
+  const weth = cfg.contracts.weth.toLowerCase()
+  const isAnchor = (addr: Address) => {
+    const lower = addr.toLowerCase()
+    return lower === weth || lower === zeroAddress || stables.has(lower)
+  }
+  const a0 = isAnchor(event.token0)
+  const a1 = isAnchor(event.token1)
+  if (a0 && !a1) return { address: event.token1, symbol: event.symbol1 }
+  if (a1 && !a0) return { address: event.token0, symbol: event.symbol0 }
+  // 两边都是山寨时取 token0，方便至少能挂上一条市值
+  if (!a0 && !a1) return { address: event.token0, symbol: event.symbol0 }
+  return null
+}
+
+function clearFlowMarketCache(chainId: FlowChainId): void {
+  const prefix = `${chainId}:`
+  for (const key of flowMarketCache.keys()) {
+    if (key.startsWith(prefix)) flowMarketCache.delete(key)
+  }
 }
 
 function clearFlowAprCache(chainId: FlowChainId): void {
@@ -2470,6 +2529,140 @@ async function enrichFlowApr(events: FlowEvent[]): Promise<{
   }
 }
 
+type DexScreenerPair = {
+  chainId?: string
+  liquidity?: { usd?: number }
+  marketCap?: number
+  fdv?: number
+  pairCreatedAt?: number
+  baseToken?: { address?: string; symbol?: string }
+  quoteToken?: { address?: string; symbol?: string }
+}
+
+async function fetchDexScreenerTokenMetas(
+  chainId: FlowChainId,
+  tokens: Array<{ address: Address; symbol: string }>,
+): Promise<Map<string, FlowMarketMeta>> {
+  const out = new Map<string, FlowMarketMeta>()
+  if (tokens.length === 0) return out
+  const chainSlug = dexScreenerChain(chainId)
+  const chunks: Array<Array<{ address: Address; symbol: string }>> = []
+  for (let i = 0; i < tokens.length; i += 30) chunks.push(tokens.slice(i, i + 30))
+
+  for (const chunk of chunks) {
+    const url = `https://api.dexscreener.com/latest/dex/tokens/${chunk.map((t) => t.address).join(',')}`
+    let pairs: DexScreenerPair[] = []
+    try {
+      const json = await fetchJson<{ pairs?: DexScreenerPair[] | null }>(url, 8_000)
+      pairs = Array.isArray(json.pairs) ? json.pairs : []
+    } catch {
+      continue
+    }
+    const bestByToken = new Map<string, { liq: number; meta: FlowMarketMeta }>()
+    for (const pair of pairs) {
+      if ((pair.chainId || '').toLowerCase() !== chainSlug) continue
+      const liq = Number(pair.liquidity?.usd) || 0
+      const mcapRaw = Number(pair.marketCap)
+      const fdvRaw = Number(pair.fdv)
+      const marketCapUsd = mcapRaw > 0 ? mcapRaw : fdvRaw > 0 ? fdvRaw : undefined
+      const createdMs = Number(pair.pairCreatedAt)
+      const tokenCreatedAt =
+        Number.isFinite(createdMs) && createdMs > 1_000_000_000_000
+          ? Math.floor(createdMs / 1000)
+          : Number.isFinite(createdMs) && createdMs > 1_000_000_000
+            ? Math.floor(createdMs)
+            : undefined
+      for (const side of [pair.baseToken, pair.quoteToken]) {
+        const addr = side?.address?.toLowerCase()
+        if (!addr) continue
+        if (!chunk.some((t) => t.address.toLowerCase() === addr)) continue
+        const prev = bestByToken.get(addr)
+        if (prev && prev.liq >= liq) continue
+        const known = chunk.find((t) => t.address.toLowerCase() === addr)
+        bestByToken.set(addr, {
+          liq,
+          meta: {
+            coinAddress: (known?.address ?? side!.address!) as Address,
+            coinSymbol: known?.symbol || side?.symbol || 'TOKEN',
+            marketCapUsd,
+            tokenCreatedAt,
+          },
+        })
+      }
+    }
+    for (const [addr, row] of bestByToken) out.set(addr, row.meta)
+    // 没命中的也写入空壳，避免每轮重打
+    for (const token of chunk) {
+      const key = token.address.toLowerCase()
+      if (!out.has(key)) {
+        out.set(key, {
+          coinAddress: token.address,
+          coinSymbol: token.symbol,
+        })
+      }
+    }
+  }
+  return out
+}
+
+async function enrichFlowMarketMeta(events: FlowEvent[]): Promise<FlowEvent[]> {
+  const now = Date.now()
+  const pendingByChain = new Map<FlowChainId, Map<string, { address: Address; symbol: string }>>()
+  const resolved = new Map<string, FlowMarketMeta>()
+
+  for (const event of events) {
+    const coin = flowCoinSide(event)
+    if (!coin) continue
+    const key = flowMarketKey(event.chainId, coin.address)
+    const hit = flowMarketCache.get(key)
+    if (hit && now - hit.at < FLOW_MARKET_TTL_MS) {
+      resolved.set(key, hit.meta)
+      continue
+    }
+    const bucket = pendingByChain.get(event.chainId) ?? new Map()
+    bucket.set(coin.address.toLowerCase(), coin)
+    pendingByChain.set(event.chainId, bucket)
+  }
+
+  await Promise.all([...pendingByChain.entries()].map(async ([chainId, tokens]) => {
+    try {
+      const fetched = await fetchDexScreenerTokenMetas(chainId, [...tokens.values()])
+      for (const [addr, meta] of fetched) {
+        const key = flowMarketKey(chainId, meta.coinAddress)
+        flowMarketCache.set(key, { at: Date.now(), meta })
+        resolved.set(key, meta)
+        // 兼容用小写地址查
+        resolved.set(flowMarketKey(chainId, addr as Address), meta)
+      }
+    } catch {
+      /* DexScreener 失败不挡主列表 */
+    }
+  }))
+
+  pruneMapSize(flowMarketCache, FLOW_MARKET_CACHE_CAP)
+
+  return events.map((event) => {
+    const coin = flowCoinSide(event)
+    if (!coin) return event
+    const meta = resolved.get(flowMarketKey(event.chainId, coin.address))
+      ?? flowMarketCache.get(flowMarketKey(event.chainId, coin.address))?.meta
+    if (!meta) {
+      return {
+        ...event,
+        coinAddress: coin.address,
+        coinSymbol: coin.symbol,
+      }
+    }
+    return {
+      ...event,
+      coinAddress: meta.coinAddress,
+      coinSymbol: meta.coinSymbol || coin.symbol,
+      marketCapUsd: meta.marketCapUsd,
+      tokenCreatedAt: meta.tokenCreatedAt,
+    }
+  })
+}
+
 function takeBalancedChains(
   events: FlowEvent[],
   chainIds: FlowChainId[],
@@ -2556,14 +2749,30 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
 
   events.sort((a, b) => b.timestamp - a.timestamp)
   const balanced = takeBalancedChains(events, opts.chainIds, limit * 2)
-  const apr = await enrichFlowApr(balanced)
+  const [apr, withMarket] = await Promise.all([
+    enrichFlowApr(balanced),
+    enrichFlowMarketMeta(balanced),
+  ])
   notices.push(...apr.notices)
+  // APR 与市值并行；按 id 合并，避免互相覆盖
+  const marketById = new Map(withMarket.map((event) => [event.id, event]))
+  const merged = apr.events.map((event) => {
+    const market = marketById.get(event.id)
+    if (!market) return event
+    return {
+      ...event,
+      coinAddress: market.coinAddress,
+      coinSymbol: market.coinSymbol,
+      marketCapUsd: market.marketCapUsd,
+      tokenCreatedAt: market.tokenCreatedAt,
+    }
+  })
   const uniqueNotices = [...new Map(notices.map((notice) => [
     `${notice.level}:${notice.message}`,
     notice,
   ])).values()]
   return {
-    events: apr.events,
+    events: merged,
     notices: uniqueNotices,
   }
 }
