@@ -1,5 +1,5 @@
 /**
- * LP 资金动向：Uniswap V3 + V4（BSC / Robinhood）。
+ * LP 资金动向：Uniswap V3 + V4（BSC / Robinhood / Base）。
  * V3：Subgraph 可选 + NPM 日志；V4：PoolManager.ModifyLiquidity。
  * The Graph API Key 非必须。
  */
@@ -35,12 +35,13 @@ import { checkPoolTokensSafe, isHoneypotWhitelisted } from './honeypot'
 import { Q96, getAmountsForPosition, rawToNumber, tickToPrice } from './math'
 import { loadCustomRpcUrl } from './rpcSettings'
 import { classifyRpcError, readLogsAdaptive, runRpcTask } from './rpcScheduler'
-import { takeFlowPoolEvents } from './flowSelection'
+import { takeFlowPoolEvents, type FlowSelectableChainId } from './flowSelection'
 
 export { takeFlowPoolEvents } from './flowSelection'
 
 /** 动向支持的链 */
-export type FlowChainId = 56 | 4663
+export const FLOW_CHAIN_IDS = [56, 4663, 8453] as const satisfies readonly FlowSelectableChainId[]
+export type FlowChainId = (typeof FLOW_CHAIN_IDS)[number]
 
 export type FlowSide = 'in' | 'out'
 export type FlowVersion = 'v3' | 'v4'
@@ -161,12 +162,13 @@ const META_CACHE_CAP = 1_200
 const V4_POOL_CACHE_CAP = 600
 
 /**
- * 约 45 分钟的初次窗口。两条链当前都不是传统的 2~3 秒块：实测 BSC 约
- * 0.45s、Robinhood 约 0.1s。时间戳会再用窗口首尾区块动态校准。
+ * 约 45 分钟的初次窗口。BSC/Robinhood 为高频出块，Base 约 2 秒；时间戳
+ * 会再用窗口首尾区块动态校准，所以这里只需留出少量窗口余量。
  */
 const LOG_SCAN: Record<FlowChainId, { lookback: bigint; span: bigint; reorg: bigint }> = {
   56: { lookback: 7_000n, span: 5_000n, reorg: 24n },
   4663: { lookback: 30_000n, span: 30_000n, reorg: 120n },
+  8453: { lookback: 1_800n, span: 900n, reorg: 12n },
 }
 
 // Swap 比 NPM/ModifyLiquidity 密集几个数量级，不能沿用普通动向日志的大跨度；
@@ -174,6 +176,7 @@ const LOG_SCAN: Record<FlowChainId, { lookback: bigint; span: bigint; reorg: big
 const APR_LOG_SPAN: Record<FlowChainId, bigint> = {
   56: 1_500n,
   4663: 5_000n,
+  8453: 600n,
 }
 
 type PosRow = {
@@ -229,11 +232,25 @@ const logCaches: Record<FlowChainId, ChainLogCache> = {
     client: null,
     clientKey: '',
   },
+  8453: {
+    tip: 0n,
+    events: [],
+    pos: new Map(),
+    pools: new Map(),
+    meta: new Map(),
+    metaPending: new Map(),
+    wethUsd: 0,
+    wethUsdAt: 0,
+    wethUsdPromise: null,
+    client: null,
+    clientKey: '',
+  },
 }
 
 const receiptCaches: Record<FlowChainId, Map<string, Promise<TransactionReceipt>>> = {
   56: new Map(),
   4663: new Map(),
+  8453: new Map(),
 }
 
 type V4PoolRow = {
@@ -258,6 +275,7 @@ type V4Cache = {
 const v4Caches: Record<FlowChainId, V4Cache> = {
   56: { tip: 0n, events: [], pools: new Map() },
   4663: { tip: 0n, events: [], pools: new Map() },
+  8453: { tip: 0n, events: [], pools: new Map() },
 }
 
 type StoredFlowEvent = Omit<FlowEvent, 'blockNumber'> & { blockNumber?: string }
@@ -395,7 +413,9 @@ function flowMarketKey(chainId: FlowChainId, token: Address): string {
 }
 
 function dexScreenerChain(chainId: FlowChainId): string {
-  return chainId === 56 ? 'bsc' : 'robinhood'
+  if (chainId === 56) return 'bsc'
+  if (chainId === 8453) return 'base'
+  return 'robinhood'
 }
 
 /** 动向对里的「山寨侧」：非稳定币、非 WETH/原生 */
@@ -466,6 +486,10 @@ function makeClient(chainId: FlowChainId): PublicClient {
   // 合约读取仍可由 fallback 中的官方 dataseed 承担。
   const defaults = chainId === 56
     ? ['https://bsc.publicnode.com', ...cfg.defaultRpcUrls]
+    : chainId === 8453
+      // Base PublicNode 对约 45 分钟前的 getLogs 要求付费 Archive token。
+      // 动向历史扫描改用官方节点 + dRPC；选择性日志优先走 Blockscout。
+      ? ['https://mainnet.base.org', 'https://base.drpc.org']
     : [...cfg.defaultRpcUrls]
   const urls = [...new Set([...(custom ? [custom] : []), ...defaults])]
   return createPublicClient({
@@ -475,8 +499,10 @@ function makeClient(chainId: FlowChainId): PublicClient {
         http(url, {
           // BSC PublicNode 批量调用稳定；Robinhood 公共节点对 batch 很容易
           // 429，逐请求配合下方并发上限反而更快。
-          batch: chainId === 56 ? { batchSize: 20, wait: 12 } : false,
-          timeout: chainId === 56 ? (i === 0 ? 8_000 : 7_000) : i === 0 ? 8_000 : 10_000,
+          batch: chainId === 56 || chainId === 8453 ? { batchSize: 20, wait: 12 } : false,
+          timeout: chainId === 56 || chainId === 8453
+            ? (i === 0 ? 8_000 : 7_000)
+            : i === 0 ? 8_000 : 10_000,
           retryCount: 0,
         }),
       ),
@@ -554,6 +580,7 @@ type ScanHead = {
 const scanHeadCaches: Record<FlowChainId, { at: number; promise: Promise<ScanHead> | null }> = {
   56: { at: 0, promise: null },
   4663: { at: 0, promise: null },
+  8453: { at: 0, promise: null },
 }
 
 /** V3/V4 同轮刷新共享链头，并用真实首尾时间校准高频出块链。 */
@@ -670,12 +697,15 @@ function addressTopic(address: Address): Hex {
   return pad(address, { size: 32 })
 }
 
+type IndexedFlowChainId = Extract<FlowChainId, 4663 | 8453>
+
 /**
- * Robinhood's public RPC is rate limited and explicitly not intended for a
- * production log indexer. Blockscout exposes the already-indexed logs via its
- * paginated v2 API, so historical V3/V4 scans do not need eth_getLogs at all.
+ * Robinhood's public RPC is heavily rate limited and Base's public archive
+ * access is inconsistent. Both chains expose indexed logs through Blockscout,
+ * so selective historical V3/V4 movement scans do not need eth_getLogs first.
  */
-async function readRobinhoodV2Logs<TArgs>(opts: {
+async function readIndexedV2Logs<TArgs>(opts: {
+  chainId: IndexedFlowChainId
   event: AbiEvent
   address: Address
   indexedTopics?: Partial<Record<IndexedTopicPosition, Hex>>
@@ -683,7 +713,7 @@ async function readRobinhoodV2Logs<TArgs>(opts: {
   toBlock: bigint
   label: string
 }): Promise<FlowDecodedLog<TArgs>[]> {
-  const cfg = CHAIN_CONFIGS[4663]
+  const cfg = CHAIN_CONFIGS[opts.chainId]
   const topic0 = toEventSelector(opts.event)
   // The v2 endpoint can match a topic in any indexed position. Prefer the
   // most selective indexed filter (pool id / sender); otherwise use topic0.
@@ -699,7 +729,7 @@ async function readRobinhoodV2Logs<TArgs>(opts: {
       if (value != null) url.searchParams.set(key, String(value))
     }
     const payload = await runRpcTask({
-      chainId: 4663,
+      chainId: opts.chainId,
       lane: 'indexer',
       label: `${opts.label} (Blockscout)`,
       task: () => fetchJson<BlockscoutV2LogsResponse>(url.toString(), 15_000),
@@ -749,15 +779,15 @@ async function readRobinhoodV2Logs<TArgs>(opts: {
   throw new Error(`Blockscout ${opts.label} 分页超过安全上限`)
 }
 
-type RobinhoodEventLogCache = {
+type IndexedEventLogCache = {
   fromBlock: bigint
   toBlock: bigint
   logs: FlowDecodedLog<unknown>[]
 }
 
-const robinhoodEventLogCaches = new Map<string, RobinhoodEventLogCache>()
+const indexedEventLogCaches = new Map<string, IndexedEventLogCache>()
 
-function decodeRobinhoodLogs<TArgs>(opts: {
+function decodeIndexedLogs<TArgs>(opts: {
   logs: BlockscoutV2Log[]
   event: AbiEvent
   indexedTopics?: Partial<Record<IndexedTopicPosition, Hex>>
@@ -811,7 +841,8 @@ function blockscoutQuantity(value: string | undefined): bigint {
  * faster for movement discovery than exporting every PoolManager log to CSV.
  * When the cap is reached, bisect the block range so no rows are truncated.
  */
-async function readRobinhoodRpcApiLogs<TArgs>(opts: {
+async function readIndexedRpcApiLogs<TArgs>(opts: {
+  chainId: IndexedFlowChainId
   event: AbiEvent
   address: Address
   indexedTopics?: Partial<Record<IndexedTopicPosition, Hex>>
@@ -819,7 +850,7 @@ async function readRobinhoodRpcApiLogs<TArgs>(opts: {
   toBlock: bigint
   label: string
 }): Promise<FlowDecodedLog<TArgs>[]> {
-  const cfg = CHAIN_CONFIGS[4663]
+  const cfg = CHAIN_CONFIGS[opts.chainId]
   const topic0 = toEventSelector(opts.event)
 
   const readRange = async (fromBlock: bigint, toBlock: bigint): Promise<BlockscoutV2Log[]> => {
@@ -837,12 +868,11 @@ async function readRobinhoodRpcApiLogs<TArgs>(opts: {
       url.searchParams.set(`topic0_${position}_opr`, 'and')
     }
     const payload = await runRpcTask({
-      chainId: 4663,
+      chainId: opts.chainId,
       lane: 'indexer',
       label: `${opts.label} (Blockscout getLogs)`,
-      // Robinhood Blockscout's anonymous quota is tiny. A 429 is not a
-      // transient RPC hiccup: retrying it three times used to leave the page
-      // blank for 20-30 seconds and consumed the next quota window as well.
+      // Anonymous Blockscout quotas are small. A 429 is not worth retrying
+      // here: the caller can immediately use the bounded public-RPC fallback.
       retries: 0,
       task: () => fetchJson<BlockscoutRpcLogsResponse>(url.toString(), 15_000),
     })
@@ -871,7 +901,7 @@ async function readRobinhoodRpcApiLogs<TArgs>(opts: {
   }
 
   const logs = await readRange(opts.fromBlock, opts.toBlock)
-  return decodeRobinhoodLogs<TArgs>({
+  return decodeIndexedLogs<TArgs>({
     logs,
     event: opts.event,
     indexedTopics: opts.indexedTopics,
@@ -880,7 +910,8 @@ async function readRobinhoodRpcApiLogs<TArgs>(opts: {
   })
 }
 
-async function readRobinhoodIndexedLogs<TArgs>(opts: {
+async function readIndexedLogs<TArgs>(opts: {
+  chainId: IndexedFlowChainId
   event: AbiEvent
   address: Address
   indexedTopics?: Partial<Record<IndexedTopicPosition, Hex>>
@@ -892,12 +923,12 @@ async function readRobinhoodIndexedLogs<TArgs>(opts: {
   const topicKey = ([1, 2, 3] as const)
     .map((position) => opts.indexedTopics?.[position]?.toLowerCase() ?? '')
     .join(':')
-  const cacheKey = `${addressKey}:${toEventSelector(opts.event).toLowerCase()}:${topicKey}`
+  const cacheKey = `${opts.chainId}:${addressKey}:${toEventSelector(opts.event).toLowerCase()}:${topicKey}`
 
   const readRange = async (fromBlock: bigint, toBlock: bigint) => {
     const rangeOpts = { ...opts, fromBlock, toBlock }
     try {
-      return await readRobinhoodRpcApiLogs<TArgs>(rangeOpts)
+      return await readIndexedRpcApiLogs<TArgs>(rangeOpts)
     } catch (error) {
       // Both API versions share the instance quota. Falling straight into a
       // 50-row paginated crawl after a 429 only turns an APR miss into a
@@ -906,11 +937,11 @@ async function readRobinhoodIndexedLogs<TArgs>(opts: {
       if (import.meta.env.DEV) {
         console.debug(`[flow] ${opts.label} getLogs 降级到 v2 分页：${friendlyErrorText(error)}`)
       }
-      return readRobinhoodV2Logs<TArgs>(rangeOpts)
+      return readIndexedV2Logs<TArgs>(rangeOpts)
     }
   }
 
-  let eventCache = robinhoodEventLogCaches.get(cacheKey)
+  let eventCache = indexedEventLogCaches.get(cacheKey)
   if (!eventCache || opts.fromBlock < eventCache.fromBlock) {
     const logs = await readRange(opts.fromBlock, opts.toBlock)
     eventCache = {
@@ -918,10 +949,10 @@ async function readRobinhoodIndexedLogs<TArgs>(opts: {
       toBlock: opts.toBlock,
       logs: logs as FlowDecodedLog<unknown>[],
     }
-    robinhoodEventLogCaches.set(cacheKey, eventCache)
-    if (robinhoodEventLogCaches.size > 200) {
-      const oldest = robinhoodEventLogCaches.keys().next().value as string | undefined
-      if (oldest) robinhoodEventLogCaches.delete(oldest)
+    indexedEventLogCaches.set(cacheKey, eventCache)
+    if (indexedEventLogCaches.size > 300) {
+      const oldest = indexedEventLogCaches.keys().next().value as string | undefined
+      if (oldest) indexedEventLogCaches.delete(oldest)
     }
   }
 
@@ -944,7 +975,11 @@ async function readRobinhoodIndexedLogs<TArgs>(opts: {
     .map((log) => log as FlowDecodedLog<TArgs>)
 }
 
-/** Prefer Robinhood's indexed API, with RPC as a compatibility fallback. */
+/**
+ * Robinhood prefers Blockscout because its public RPC is intentionally tiny.
+ * Base does the reverse: the official RPC handles the selective 45-minute
+ * ranges quickly, while anonymous Blockscout is kept as a fallback only.
+ */
 async function readFlowLogs<TArgs>(opts: {
   chainId: FlowChainId
   event: AbiEvent
@@ -960,9 +995,48 @@ async function readFlowLogs<TArgs>(opts: {
   preferIndexer?: boolean
   request: (fromBlock: bigint, toBlock: bigint) => Promise<readonly FlowDecodedLog<TArgs>[]>
 }): Promise<FlowDecodedLog<TArgs>[]> {
+  const fallbackSpan = opts.chainId === 4663 && opts.allowPublicRpcFallback
+    ? (opts.maxSpan < 10_000n ? opts.maxSpan : 10_000n)
+    : opts.maxSpan
+  const readRpc = () => readLogsAdaptive({
+    chainId: opts.chainId,
+    fromBlock: opts.fromBlock,
+    toBlock: opts.toBlock,
+    maxSpan: fallbackSpan,
+    label: opts.label,
+    request: opts.request,
+  })
+
+  if (opts.chainId === 8453) {
+    try {
+      return await readRpc()
+    } catch (rpcError) {
+      if (!opts.explorerAddress || opts.preferIndexer === false) throw rpcError
+      try {
+        return await readIndexedLogs<TArgs>({
+          chainId: 8453,
+          event: opts.event,
+          address: opts.explorerAddress,
+          indexedTopics: opts.explorerIndexedTopics,
+          fromBlock: opts.fromBlock,
+          toBlock: opts.toBlock,
+          label: opts.label,
+        })
+      } catch (indexerError) {
+        if (import.meta.env.DEV) {
+          console.debug(
+            `[flow] ${opts.label} Base RPC 与 Blockscout 均不可用：${friendlyErrorText(indexerError)}`,
+          )
+        }
+        throw rpcError
+      }
+    }
+  }
+
   if (opts.chainId === 4663 && opts.explorerAddress && opts.preferIndexer !== false) {
     try {
-      return await readRobinhoodIndexedLogs<TArgs>({
+      return await readIndexedLogs<TArgs>({
+        chainId: 4663,
         event: opts.event,
         address: opts.explorerAddress,
         indexedTopics: opts.explorerIndexedTopics,
@@ -984,17 +1058,7 @@ async function readFlowLogs<TArgs>(opts: {
       if (!customRpc && !opts.allowPublicRpcFallback) throw error
     }
   }
-  const fallbackSpan = opts.chainId === 4663 && opts.allowPublicRpcFallback
-    ? (opts.maxSpan < 10_000n ? opts.maxSpan : 10_000n)
-    : opts.maxSpan
-  return readLogsAdaptive({
-    chainId: opts.chainId,
-    fromBlock: opts.fromBlock,
-    toBlock: opts.toBlock,
-    maxSpan: fallbackSpan,
-    label: opts.label,
-    request: opts.request,
-  })
+  return readRpc()
 }
 
 async function timedSource<T>(label: string, promise: Promise<T>): Promise<T> {
@@ -1999,6 +2063,7 @@ async function fetchNpmFlowLogs(
   const npm = cfg.contracts.v3Npm
   const cache = logCaches[chainId]
   const scan = LOG_SCAN[chainId]
+  let stage = '链头'
   try {
     const head = await retryRateLimited(chainId, () => getScanHead(client, chainId))
     const { latest, windowStart } = head
@@ -2018,6 +2083,7 @@ async function fetchNpmFlowLogs(
       }
     }
 
+    stage = 'NPM 日志'
     const rawLogs = from <= latest
       ? await timedSource(`${flowChainLabel(chainId)} V3 movement logs`,
         fetchNpmLogsRange(client, chainId, npm, from, latest, scan.span))
@@ -2053,7 +2119,9 @@ async function fetchNpmFlowLogs(
         tokenRefs.set(id, { id, log })
       }
     }
+    stage = 'WETH 价格'
     const wethUsd = await retryRateLimited(chainId, () => wethUsdOnChain(client, chainId))
+    stage = '仓位元数据'
     const positions = await timedSource(`${flowChainLabel(chainId)} V3 pool metadata`,
       retryRateLimited(chainId, () =>
         resolvePositionsBatch(client, chainId, [...tokenRefs.values()])))
@@ -2123,6 +2191,7 @@ async function fetchNpmFlowLogs(
       ),
     }
   } catch (e) {
+    const detail = `${stage}：${friendlyErrorText(e)}`
     if (cache.events.length) {
       return {
         events: takeFlowPoolEvents(
@@ -2130,10 +2199,10 @@ async function fetchNpmFlowLogs(
           [chainId],
           opts.limit,
         ),
-        error: friendlyErrorText(e),
+        error: detail,
       }
     }
-    return { events: [], error: friendlyErrorText(e) }
+    return { events: [], error: detail }
   }
 }
 
@@ -3124,7 +3193,7 @@ async function enrichFlowApr(events: FlowEvent[]): Promise<{
     groups.sort((a, b) => a.version.localeCompare(b.version))
     for (const { version, rows } of groups) {
       try {
-        const canUseOnchain = chainId === 56 || Boolean(loadCustomRpcUrl(chainId))
+        const canUseOnchain = chainId === 56 || chainId === 8453 || Boolean(loadCustomRpcUrl(chainId))
         const fetchOnchain = () => version === 'v3'
           ? timedSource(`${flowChainLabel(chainId)} V3 on-chain APR`, fetchV3AprMetrics(chainId, rows))
           : timedSource(`${flowChainLabel(chainId)} V4 on-chain APR`, fetchV4AprMetrics(chainId, rows))
@@ -3440,6 +3509,22 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
     jobs.push(
       timedSource('Robinhood V3', fetchNpmFlowLogs(4663, { minUsd, limit })).then((result) => {
         if (result.error) notices.push({ level: 'error', message: `Robinhood V3：${result.error}` })
+        parts.push(...result.events)
+        publishCollectedParts()
+      }),
+    )
+  }
+  if (opts.chainIds.includes(8453)) {
+    jobs.push(
+      timedSource('Base V4', fetchV4FlowLogs(8453, { minUsd, limit })).then((result) => {
+        if (result.error) notices.push({ level: 'error', message: `Base V4：${result.error}` })
+        parts.push(...result.events)
+        publishCollectedParts()
+      }),
+    )
+    jobs.push(
+      timedSource('Base V3', fetchNpmFlowLogs(8453, { minUsd, limit })).then((result) => {
+        if (result.error) notices.push({ level: 'error', message: `Base V3：${result.error}` })
         parts.push(...result.events)
         publishCollectedParts()
       }),

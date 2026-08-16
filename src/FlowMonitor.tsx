@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Address } from 'viem'
 import {
   FLOW_WINDOW_MINUTES,
+  FLOW_CHAIN_IDS,
   fetchFlowEvents,
   flowChainLabel,
   flowExplorerTx,
@@ -14,7 +15,7 @@ import {
 } from './flowEvents'
 import { shortAddr } from './wallet'
 
-type ChainFilter = 'both' | FlowChainId
+type ChainFilter = 'all' | FlowChainId
 type SideFilter = 'all' | FlowSide
 type VersionFilter = 'all' | FlowVersion
 type SortMode = 'apr' | 'inflow' | 'net' | 'volume' | 'latest'
@@ -198,7 +199,7 @@ function flowPoolCount(events: FlowEvent[]): number {
 }
 
 export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
-  const [chainFilter, setChainFilter] = useState<ChainFilter>('both')
+  const [chainFilter, setChainFilter] = useState<ChainFilter>('all')
   const [sideFilter, setSideFilter] = useState<SideFilter>('all')
   const [versionFilter, setVersionFilter] = useState<VersionFilter>('all')
   const [sortMode, setSortMode] = useState<SortMode>('apr')
@@ -250,7 +251,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
     setLoadStage('正在扫描池子…')
     const t0 = performance.now()
     const chainIds: FlowChainId[] =
-      options.chainFilter === 'both' ? [56, 4663] : [options.chainFilter]
+      options.chainFilter === 'all' ? [...FLOW_CHAIN_IDS] : [options.chainFilter]
     try {
       let rows: FlowEvent[]
       let nextNotices: FlowNotice[]
@@ -272,7 +273,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         rows = result.events
         nextNotices = result.notices
       } else {
-        // 双链首次扫描时 BSC 往往更慢；哪个链先完成就先把该链榜单展示出来，
+        // 多链首次扫描时哪个链先完成就先展示该链榜单，
         // 不让用户盯着空白页等最慢的数据源。
         const previousRows = eventsRef.current
         const results = new Map<FlowChainId, { events: FlowEvent[]; notices: FlowNotice[] }>()
@@ -376,7 +377,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
     for (const event of events) {
       // 切换单链时，旧请求可能仍在结束阶段；UI 必须立刻隐藏另一条链的缓存，
       // 不能让“BSC”筛选短暂显示 Robinhood 行。
-      if (chainFilter !== 'both' && event.chainId !== chainFilter) continue
+      if (chainFilter !== 'all' && event.chainId !== chainFilter) continue
       if (versionFilter !== 'all' && event.version !== versionFilter) continue
       const poolRef = flowPoolRef(event)
       const key = `${event.chainId}:${event.version}:${poolRef.toLowerCase()}`
@@ -505,7 +506,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         <div>
           <h2 className="pos-page-title">LP 资金动向</h2>
           <p className="muted pos-page-sub">
-            最近 {FLOW_WINDOW_MINUTES} 分钟 · Uniswap V3 + V4 · BSC / Robinhood 开/加仓与撤出
+            最近 {FLOW_WINDOW_MINUTES} 分钟 · Uniswap V3 + V4 · BSC / Robinhood / Base 开/加仓与撤出
           </p>
           <p className="flow-trust-note">
             默认按手续费年化从高到低。年化优先采用 DexScreener 24h 成交量 × 池费率 ÷ 当前流动性 × 365；
@@ -532,15 +533,16 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         <label className="inline-setting">
           链
           <select
-            value={chainFilter === 'both' ? 'both' : String(chainFilter)}
+            value={chainFilter === 'all' ? 'all' : String(chainFilter)}
             onChange={(e) => {
               const v = e.target.value
-              setChainFilter(v === 'both' ? 'both' : (Number(v) as FlowChainId))
+              setChainFilter(v === 'all' ? 'all' : (Number(v) as FlowChainId))
             }}
           >
-            <option value="both">BSC + Robinhood</option>
+            <option value="all">全部（BSC + Robinhood + Base）</option>
             <option value="56">BSC</option>
             <option value="4663">Robinhood</option>
+            <option value="8453">Base</option>
           </select>
         </label>
         <label className="inline-setting">
@@ -625,7 +627,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
               />
               仅看有效样本
             </label>
-            <label className="inline-setting check" title="仅过滤风险接口明确判定的 BSC 貔貅；未知代币不会误杀，Robinhood 暂无对应检测服务">
+            <label className="inline-setting check" title="仅过滤风险接口明确判定的 BSC 貔貅；Base / Robinhood 未知代币不会误杀">
               <input type="checkbox" checked={filterHp} onChange={(e) => setFilterHp(e.target.checked)} />
               过滤已确认貔貅
             </label>

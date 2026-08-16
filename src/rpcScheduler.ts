@@ -127,6 +127,15 @@ function laneConfig(chainId: number, lane: RpcLane): { concurrency: number; inte
     // together prevents V3, V4 and APR refreshes from stampeding the endpoint.
     return { concurrency: 1, intervalMs: 350 }
   }
+  if (chainId === 8453) {
+    // Base's official endpoint handles these bounded ranges well, but V3 and
+    // V4 starting together plus metadata multicalls can still trip burst
+    // limits in a browser. Keep logs serial and leave reads modestly parallel.
+    if (lane === 'indexer') return { concurrency: 1, intervalMs: 200 }
+    return lane === 'logs'
+      ? { concurrency: 1, intervalMs: 120 }
+      : { concurrency: 2, intervalMs: 60 }
+  }
   return lane === 'logs'
     ? { concurrency: 2, intervalMs: 35 }
     : { concurrency: 4, intervalMs: 15 }

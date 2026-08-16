@@ -42,4 +42,18 @@ const balanced = takeFlowPoolEvents(dual, [56, 4663], 4)
 assert.equal(balanced.filter((event) => event.chainId === 56).length, 2)
 assert.equal(balanced.filter((event) => event.chainId === 4663).length, 2)
 
+const triple = [
+  ...[1, 2, 3].map((n) => makeEvent({ id: `b${n}`, chainId: 56, pool: address(`156${n}`), timestamp: 300 - n })),
+  ...[1, 2, 3].map((n) => makeEvent({ id: `r${n}`, chainId: 4663, pool: address(`246${n}`), timestamp: 200 - n })),
+  ...[1, 2, 3].map((n) => makeEvent({ id: `a${n}`, chainId: 8453, pool: address(`384${n}`), timestamp: 100 - n })),
+]
+const allChains = takeFlowPoolEvents(triple, [56, 4663, 8453], 6)
+assert.equal(allChains.filter((event) => event.chainId === 56).length, 2)
+assert.equal(allChains.filter((event) => event.chainId === 4663).length, 2)
+assert.equal(allChains.filter((event) => event.chainId === 8453).length, 2)
+const baseOnly = takeFlowPoolEvents(triple, [8453], 10)
+assert.equal(baseOnly.length, 3)
+assert.ok(baseOnly.every((event) => event.chainId === 8453))
+assert.deepEqual(takeFlowPoolEvents(triple, [], 10), [])
+
 console.log('flow event selection tests passed')
