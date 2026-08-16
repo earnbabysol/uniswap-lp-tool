@@ -119,7 +119,10 @@ function laneConfig(chainId: number, lane: RpcLane): { concurrency: number; inte
       : { concurrency: 2, intervalMs: 70 }
   }
   if (chainId === 4663) {
-    if (lane === 'indexer') return { concurrency: 3, intervalMs: 250 }
+    // Blockscout's free instance starts returning 429 around short 4 req/s
+    // bursts. Two workers at ~2.8 req/s keep selective getLogs fast without
+    // exhausting the quota before APR enrichment starts.
+    if (lane === 'indexer') return { concurrency: 2, intervalMs: 350 }
     // All Robinhood reads share one public quota. Serializing logs and calls
     // together prevents V3, V4 and APR refreshes from stampeding the endpoint.
     return { concurrency: 1, intervalMs: 350 }

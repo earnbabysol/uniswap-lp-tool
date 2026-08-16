@@ -2956,6 +2956,20 @@ input:focus-visible, select:focus-visible, select:focus {
 .page-mint .mint-create-title { font-size: 14px; margin-bottom: 4px; }
 .page-mint .mint-amounts { background: var(--card); }
 .page-mint .mint-amounts .grid2 { gap: 8px; }
+.page-mint .mint-native-setting {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 9px;
+  margin: 0 0 10px;
+  font-size: 13.5px;
+}
+.page-mint .mint-native-wallet {
+  margin-left: auto;
+  color: var(--ink);
+  font-size: 13.5px;
+  font-weight: 600;
+}
 .page-mint label.amt { padding: 7px 9px; gap: 3px; }
 .page-mint label.amt input { font-size: 16px; padding: 1px 0 0; }
 .page-mint .amt-head { font-size: 12.5px; gap: 5px; }

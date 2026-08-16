@@ -35,6 +35,9 @@ import { checkPoolTokensSafe, isHoneypotWhitelisted } from './honeypot'
 import { Q96, getAmountsForPosition, rawToNumber, tickToPrice } from './math'
 import { loadCustomRpcUrl } from './rpcSettings'
 import { classifyRpcError, readLogsAdaptive, runRpcTask } from './rpcScheduler'
+import { takeFlowPoolEvents } from './flowSelection'
+
+export { takeFlowPoolEvents } from './flowSelection'
 
 /** 动向支持的链 */
 export type FlowChainId = 56 | 4663
@@ -80,10 +83,12 @@ export type FlowEvent = {
   feeAprPct?: number
   /** 窗口内可锚定的 Swap 笔数。 */
   aprSwapCount?: number
+  /** APR 样本窗口；DexScreener 为 24h，链上精算回退为当前动向窗口。 */
+  aprWindowMinutes?: number
   /** 成交额加权后的实际费率，单位为 1e-6。 */
   effectiveFeePips?: number
-  /** V3 用池合约余额；V4 singleton 无法直接拆分余额，使用当前活跃流动性深度。 */
-  aprBasis?: 'pool-balance' | 'active-liquidity'
+  /** 年化分母来源。 */
+  aprBasis?: 'pool-balance' | 'active-liquidity' | 'dexscreener-liquidity'
   /** 山寨侧代币地址（非稳定币 / 非包装原生币） */
   coinAddress?: Address
   coinSymbol?: string
@@ -104,6 +109,9 @@ export type FlowFetchOpts = {
   minUsd?: number
   /** 默认 true */
   filterHoneypot?: boolean
+  /** 池发现完成后先发布首屏；风险、市值与年化随后补齐。 */
+  onBaseEvents?: (result: { events: FlowEvent[]; notices: FlowNotice[] }) => void
+  /** 最大池数，而不是事件条数。 */
   limit?: number
 }
 
@@ -144,12 +152,8 @@ const EVENT_TTL_MS = FLOW_WINDOW_MINUTES * 60_000
 const WETH_USD_TTL_MS = 5 * 60_000
 /** 年化依赖 Swap getLogs，TTL 拉长减轻公共 RPC / 主线程压力 */
 const APR_TTL_MS = 180_000
-/**
- * 每次刷新最多新算多少个「池」的年化（按事件金额取 Top-N）。
- * 其余池复用缓存；无缓存则先不显示 APR，下一轮再轮换。
- */
-const APR_POOL_LIMIT = 8
-const APR_WINDOWS_PER_YEAR = (365 * 24 * 60) / FLOW_WINDOW_MINUTES
+/** DexScreener 精确池批量查询覆盖完整可见榜单。 */
+const APR_POOL_LIMIT = 60
 /** 模块级 Map 上限，防止长挂动向页缓涨内存 */
 const POS_CACHE_CAP = 800
 const POOL_CACHE_CAP = 600
@@ -258,7 +262,7 @@ const v4Caches: Record<FlowChainId, V4Cache> = {
 
 type StoredFlowEvent = Omit<FlowEvent, 'blockNumber'> & { blockNumber?: string }
 type StoredFlowSnapshot = {
-  version: 1
+  version: 1 | 2
   savedAt: number
   v3Tip: string
   v4Tip: string
@@ -270,7 +274,7 @@ const FLOW_SNAPSHOT_LIMIT = 600
 const hydratedFlowChains = new Set<FlowChainId>()
 
 function flowSnapshotKey(chainId: FlowChainId): string {
-  return `rangedesk.flow-scan.v1.${chainId}`
+  return `rangedesk.flow-scan.v2.${chainId}`
 }
 
 function storeFlowEvent(event: FlowEvent): StoredFlowEvent {
@@ -303,10 +307,14 @@ function hydrateFlowSnapshot(chainId: FlowChainId): void {
   hydratedFlowChains.add(chainId)
   if (typeof localStorage === 'undefined') return
   try {
+    // v1 may contain a sparse list from the old event-count quota. Show those
+    // rows immediately, but never restore its cursor: the v2 full pool scan
+    // still runs and replaces it with the expanded list.
     const raw = localStorage.getItem(flowSnapshotKey(chainId))
+      ?? localStorage.getItem(`rangedesk.flow-scan.v1.${chainId}`)
     if (!raw) return
     const parsed = JSON.parse(raw) as Partial<StoredFlowSnapshot>
-    if (parsed.version !== 1) return
+    if (parsed.version !== 1 && parsed.version !== 2) return
     const restoreList = (items: StoredFlowEvent[] | undefined, version: FlowVersion) => (
       Array.isArray(items)
         ? items
@@ -318,8 +326,10 @@ function hydrateFlowSnapshot(chainId: FlowChainId): void {
     )
     logCaches[chainId].events = restoreList(parsed.v3Events, 'v3')
     v4Caches[chainId].events = restoreList(parsed.v4Events, 'v4')
-    if (/^\d+$/.test(parsed.v3Tip ?? '')) logCaches[chainId].tip = BigInt(parsed.v3Tip!)
-    if (/^\d+$/.test(parsed.v4Tip ?? '')) v4Caches[chainId].tip = BigInt(parsed.v4Tip!)
+    if (parsed.version === 2) {
+      if (/^\d+$/.test(parsed.v3Tip ?? '')) logCaches[chainId].tip = BigInt(parsed.v3Tip!)
+      if (/^\d+$/.test(parsed.v4Tip ?? '')) v4Caches[chainId].tip = BigInt(parsed.v4Tip!)
+    }
   } catch {
     // Corrupt or old browser data is simply ignored; a fresh chain scan repairs it.
   }
@@ -329,7 +339,7 @@ function persistFlowSnapshot(chainId: FlowChainId): void {
   if (typeof localStorage === 'undefined') return
   try {
     const snapshot: StoredFlowSnapshot = {
-      version: 1,
+      version: 2,
       savedAt: Date.now(),
       v3Tip: logCaches[chainId].tip.toString(),
       v4Tip: v4Caches[chainId].tip.toString(),
@@ -348,8 +358,9 @@ type FlowAprMetric = {
   aprLiquidityUsd?: number
   feeAprPct?: number
   aprSwapCount: number
+  aprWindowMinutes?: number
   effectiveFeePips?: number
-  aprBasis: 'pool-balance' | 'active-liquidity'
+  aprBasis: 'pool-balance' | 'active-liquidity' | 'dexscreener-liquidity'
 }
 
 type FlowAprCacheEntry = {
@@ -640,6 +651,21 @@ type BlockscoutV2LogsResponse = {
   next_page_params?: Record<string, string | number | null> | null
 }
 
+type BlockscoutRpcLog = {
+  address?: string
+  blockNumber?: string
+  data?: string
+  logIndex?: string
+  topics?: Array<string | null>
+  transactionHash?: string
+}
+
+type BlockscoutRpcLogsResponse = {
+  status?: string
+  message?: string
+  result?: BlockscoutRpcLog[] | string
+}
+
 function addressTopic(address: Address): Hex {
   return pad(address, { size: 32 })
 }
@@ -723,177 +749,13 @@ async function readRobinhoodV2Logs<TArgs>(opts: {
   throw new Error(`Blockscout ${opts.label} 分页超过安全上限`)
 }
 
-type RobinhoodBulkLogSnapshot = {
-  fromBlock: bigint
-  toBlock: bigint
-  logs: BlockscoutV2Log[]
-}
-
-type RobinhoodBulkLogCache = {
-  entry?: RobinhoodBulkLogSnapshot
-  promise?: Promise<RobinhoodBulkLogSnapshot>
-}
-
 type RobinhoodEventLogCache = {
   fromBlock: bigint
   toBlock: bigint
   logs: FlowDecodedLog<unknown>[]
 }
 
-const robinhoodBulkLogCaches = new Map<string, RobinhoodBulkLogCache>()
 const robinhoodEventLogCaches = new Map<string, RobinhoodEventLogCache>()
-let robinhoodCsvBlockedUntil = 0
-
-async function fetchText(url: string, timeoutMs: number): Promise<string> {
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
-  try {
-    const response = await fetch(url, { signal: ctrl.signal })
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    return await response.text()
-  } finally {
-    clearTimeout(timer)
-  }
-}
-
-function parseBlockscoutCsv(text: string): BlockscoutV2Log[] {
-  const lines = text.split(/\r?\n/)
-  if (!lines[0]?.startsWith('TxHash,Index,BlockNumber,')) {
-    throw new Error('Blockscout CSV 日志格式异常')
-  }
-  const logs: BlockscoutV2Log[] = []
-  for (let i = 1; i < lines.length; i += 1) {
-    const line = lines[i]
-    if (!line) continue
-    // All exported log columns are numeric or hex, so commas cannot occur in
-    // field values and a small parser is both safer and faster than a CSV lib.
-    const columns = line.split(',')
-    if (columns.length < 10) continue
-    const blockNumber = Number(columns[2])
-    if (!Number.isSafeInteger(blockNumber)) continue
-    logs.push({
-      transaction_hash: columns[0],
-      index: Number(columns[1]) || 0,
-      block_number: blockNumber,
-      address: columns[4],
-      data: columns[5],
-      topics: columns.slice(6, 10).map((topic) => topic || null),
-    })
-  }
-  return logs
-}
-
-async function fetchRobinhoodCsvSnapshot(opts: {
-  address: Address
-  fromBlock: bigint
-  toBlock: bigint
-  label: string
-}): Promise<RobinhoodBulkLogSnapshot> {
-  if (Date.now() < robinhoodCsvBlockedUntil) {
-    throw new Error('Blockscout CSV 429（本轮改用分页接口）')
-  }
-  const cfg = CHAIN_CONFIGS[4663]
-  // Build the first snapshot for the whole monitor window even when the
-  // persisted movement cursor only asks for the newest reorg overlap. APR
-  // runs immediately afterwards and can then reuse the same PoolManager data
-  // instead of downloading a second, much larger snapshot.
-  const lookback = LOG_SCAN[4663].lookback
-  const snapshotFromBlock = opts.toBlock > lookback ? opts.toBlock - lookback : 0n
-  const blockCount = Number(opts.toBlock - snapshotFromBlock + 1n)
-  // The chain currently produces roughly 30k blocks per 45 minutes. Add a
-  // generous clock/indexing margin, then filter by exact block below.
-  const estimatedWindowMs = Number.isFinite(blockCount)
-    ? (blockCount / 30_000) * 50 * 60_000 + 3 * 60_000
-    : 55 * 60_000
-  const durationMs = Math.min(55 * 60_000, Math.max(5 * 60_000, estimatedWindowMs))
-  const toPeriod = Date.now() + 90_000
-  const fromPeriod = toPeriod - durationMs
-  const poolManager = cfg.contracts.v4PoolManager.toLowerCase()
-  // PoolManager emits dense Swap logs. Keep each export well below its 10k
-  // row cap; normal NPM and per-pool exports fit in one request.
-  const maxWindowMs = opts.address.toLowerCase() === poolManager ? 25 * 60_000 : durationMs
-
-  const fetchPeriod = async (fromMs: number, toMs: number): Promise<BlockscoutV2Log[]> => {
-    const url = new URL(`${cfg.explorerApi}/api/v2/addresses/${opts.address}/logs/csv`)
-    url.searchParams.set('from_period', new Date(fromMs).toISOString())
-    url.searchParams.set('to_period', new Date(toMs).toISOString())
-    let text: string
-    try {
-      text = await runRpcTask({
-        chainId: 4663,
-        lane: 'indexer',
-        label: `${opts.label} (Blockscout CSV)`,
-        // CSV exports have an hourly quota. Retrying seconds later cannot
-        // restore it; fall back to the higher-quota paginated API immediately.
-        retries: 0,
-        task: () => fetchText(url.toString(), 30_000),
-      })
-    } catch (error) {
-      if (classifyRpcError(error) === 'rate-limit') {
-        robinhoodCsvBlockedUntil = Date.now() + 60 * 60_000
-      }
-      throw error
-    }
-    const logs = parseBlockscoutCsv(text)
-    if (logs.length >= 9_999 && toMs - fromMs > 60_000) {
-      const middle = Math.floor(fromMs + (toMs - fromMs) / 2)
-      const left = await fetchPeriod(fromMs, middle)
-      const right = await fetchPeriod(middle + 1, toMs)
-      return [...left, ...right]
-    }
-    return logs
-  }
-
-  const periods: Array<{ from: number; to: number }> = []
-  for (let from = fromPeriod; from < toPeriod; from += maxWindowMs) {
-    periods.push({ from, to: Math.min(toPeriod, from + maxWindowMs) })
-  }
-  const rawLogs = (await mapPool(periods, 3, (period) =>
-    fetchPeriod(period.from, period.to))).flat()
-  const unique = new Map<string, BlockscoutV2Log>()
-  for (const log of rawLogs) {
-    const key = `${log.transaction_hash ?? ''}:${log.index ?? 0}`
-    unique.set(key, log)
-  }
-  return {
-    fromBlock: snapshotFromBlock,
-    toBlock: opts.toBlock,
-    logs: [...unique.values()],
-  }
-}
-
-async function getRobinhoodBulkSnapshot(opts: {
-  address: Address
-  fromBlock: bigint
-  toBlock: bigint
-  label: string
-}): Promise<RobinhoodBulkLogSnapshot> {
-  const addressKey = opts.address.toLowerCase()
-  let cache = robinhoodBulkLogCaches.get(addressKey)
-  if (!cache) {
-    cache = {}
-    robinhoodBulkLogCaches.set(addressKey, cache)
-  }
-  if (cache.entry && opts.fromBlock >= cache.entry.fromBlock) return cache.entry
-  if (cache.promise) return cache.promise
-
-  const pending = fetchRobinhoodCsvSnapshot(opts)
-  cache.promise = pending
-  try {
-    const entry = await pending
-    cache.entry = entry
-    for (const key of robinhoodEventLogCaches.keys()) {
-      if (key.startsWith(`${addressKey}:`)) robinhoodEventLogCaches.delete(key)
-    }
-    if (robinhoodBulkLogCaches.size > 80) {
-      const oldest = robinhoodBulkLogCaches.keys().next().value as string | undefined
-      if (oldest) robinhoodBulkLogCaches.delete(oldest)
-    }
-    return entry
-  } finally {
-    if (cache.promise === pending) cache.promise = undefined
-  }
-}
 
 function decodeRobinhoodLogs<TArgs>(opts: {
   logs: BlockscoutV2Log[]
@@ -934,6 +796,90 @@ function decodeRobinhoodLogs<TArgs>(opts: {
   return output
 }
 
+function blockscoutQuantity(value: string | undefined): bigint {
+  if (!value || value === '0x') return 0n
+  try {
+    return BigInt(value)
+  } catch {
+    return 0n
+  }
+}
+
+/**
+ * Blockscout's Etherscan-compatible log endpoint accepts address + indexed
+ * topics + an exact block range and returns up to 1,000 rows. It is much
+ * faster for movement discovery than exporting every PoolManager log to CSV.
+ * When the cap is reached, bisect the block range so no rows are truncated.
+ */
+async function readRobinhoodRpcApiLogs<TArgs>(opts: {
+  event: AbiEvent
+  address: Address
+  indexedTopics?: Partial<Record<IndexedTopicPosition, Hex>>
+  fromBlock: bigint
+  toBlock: bigint
+  label: string
+}): Promise<FlowDecodedLog<TArgs>[]> {
+  const cfg = CHAIN_CONFIGS[4663]
+  const topic0 = toEventSelector(opts.event)
+
+  const readRange = async (fromBlock: bigint, toBlock: bigint): Promise<BlockscoutV2Log[]> => {
+    const url = new URL(`${cfg.explorerApi}/api`)
+    url.searchParams.set('module', 'logs')
+    url.searchParams.set('action', 'getLogs')
+    url.searchParams.set('fromBlock', fromBlock.toString())
+    url.searchParams.set('toBlock', toBlock.toString())
+    url.searchParams.set('address', opts.address)
+    url.searchParams.set('topic0', topic0)
+    for (const position of [1, 2, 3] as const) {
+      const topic = opts.indexedTopics?.[position]
+      if (!topic) continue
+      url.searchParams.set(`topic${position}`, topic)
+      url.searchParams.set(`topic0_${position}_opr`, 'and')
+    }
+    const payload = await runRpcTask({
+      chainId: 4663,
+      lane: 'indexer',
+      label: `${opts.label} (Blockscout getLogs)`,
+      // Robinhood Blockscout's anonymous quota is tiny. A 429 is not a
+      // transient RPC hiccup: retrying it three times used to leave the page
+      // blank for 20-30 seconds and consumed the next quota window as well.
+      retries: 0,
+      task: () => fetchJson<BlockscoutRpcLogsResponse>(url.toString(), 15_000),
+    })
+    if (!Array.isArray(payload.result)) {
+      const message = `${payload.message ?? ''} ${String(payload.result ?? '')}`.trim()
+      if (/no (logs|records) found/i.test(message)) return []
+      throw new Error(message || 'Blockscout getLogs 响应格式异常')
+    }
+    const rows = payload.result.map((raw): BlockscoutV2Log => ({
+      address: raw.address,
+      block_number: Number(blockscoutQuantity(raw.blockNumber)),
+      data: raw.data,
+      index: Number(blockscoutQuantity(raw.logIndex)),
+      topics: raw.topics,
+      transaction_hash: raw.transactionHash,
+    }))
+    if (rows.length >= 1_000 && fromBlock < toBlock) {
+      const middle = fromBlock + (toBlock - fromBlock) / 2n
+      const [left, right] = await Promise.all([
+        readRange(fromBlock, middle),
+        readRange(middle + 1n, toBlock),
+      ])
+      return [...left, ...right]
+    }
+    return rows
+  }
+
+  const logs = await readRange(opts.fromBlock, opts.toBlock)
+  return decodeRobinhoodLogs<TArgs>({
+    logs,
+    event: opts.event,
+    indexedTopics: opts.indexedTopics,
+    fromBlock: opts.fromBlock,
+    toBlock: opts.toBlock,
+  })
+}
+
 async function readRobinhoodIndexedLogs<TArgs>(opts: {
   event: AbiEvent
   address: Address
@@ -948,37 +894,40 @@ async function readRobinhoodIndexedLogs<TArgs>(opts: {
     .join(':')
   const cacheKey = `${addressKey}:${toEventSelector(opts.event).toLowerCase()}:${topicKey}`
 
+  const readRange = async (fromBlock: bigint, toBlock: bigint) => {
+    const rangeOpts = { ...opts, fromBlock, toBlock }
+    try {
+      return await readRobinhoodRpcApiLogs<TArgs>(rangeOpts)
+    } catch (error) {
+      // Both API versions share the instance quota. Falling straight into a
+      // 50-row paginated crawl after a 429 only turns an APR miss into a
+      // minute-long refresh. Preserve the base list and retry next cycle.
+      if (classifyRpcError(error) === 'rate-limit') throw error
+      if (import.meta.env.DEV) {
+        console.debug(`[flow] ${opts.label} getLogs 降级到 v2 分页：${friendlyErrorText(error)}`)
+      }
+      return readRobinhoodV2Logs<TArgs>(rangeOpts)
+    }
+  }
+
   let eventCache = robinhoodEventLogCaches.get(cacheKey)
   if (!eventCache || opts.fromBlock < eventCache.fromBlock) {
-    try {
-      const bulk = await getRobinhoodBulkSnapshot(opts)
-      const logs = decodeRobinhoodLogs<TArgs>({
-        logs: bulk.logs,
-        event: opts.event,
-        indexedTopics: opts.indexedTopics,
-        fromBlock: bulk.fromBlock,
-        toBlock: bulk.toBlock,
-      })
-      eventCache = {
-        fromBlock: bulk.fromBlock,
-        toBlock: bulk.toBlock,
-        logs: logs as FlowDecodedLog<unknown>[],
-      }
-      robinhoodEventLogCaches.set(cacheKey, eventCache)
-    } catch (error) {
-      if (import.meta.env.DEV) {
-        console.debug(`[flow] ${opts.label} CSV 降级到分页：${friendlyErrorText(error)}`)
-      }
-      return readRobinhoodV2Logs<TArgs>(opts)
+    const logs = await readRange(opts.fromBlock, opts.toBlock)
+    eventCache = {
+      fromBlock: opts.fromBlock,
+      toBlock: opts.toBlock,
+      logs: logs as FlowDecodedLog<unknown>[],
+    }
+    robinhoodEventLogCaches.set(cacheKey, eventCache)
+    if (robinhoodEventLogCaches.size > 200) {
+      const oldest = robinhoodEventLogCaches.keys().next().value as string | undefined
+      if (oldest) robinhoodEventLogCaches.delete(oldest)
     }
   }
 
   if (opts.toBlock > eventCache.toBlock) {
     const deltaFrom = eventCache.toBlock + 1n
-    const delta = await readRobinhoodV2Logs<TArgs>({
-      ...opts,
-      fromBlock: deltaFrom,
-    })
+    const delta = await readRange(deltaFrom, opts.toBlock)
     const merged = new Map<string, FlowDecodedLog<unknown>>()
     for (const log of eventCache.logs) {
       merged.set(`${log.transactionHash}:${log.logIndex}`, log)
@@ -1005,9 +954,13 @@ async function readFlowLogs<TArgs>(opts: {
   toBlock: bigint
   maxSpan: bigint
   label: string
+  /** Movement discovery may use small public-RPC chunks when Blockscout is out of quota. */
+  allowPublicRpcFallback?: boolean
+  /** Private-RPC APR fallback can bypass Blockscout to preserve indexer quota. */
+  preferIndexer?: boolean
   request: (fromBlock: bigint, toBlock: bigint) => Promise<readonly FlowDecodedLog<TArgs>[]>
 }): Promise<FlowDecodedLog<TArgs>[]> {
-  if (opts.chainId === 4663 && opts.explorerAddress) {
+  if (opts.chainId === 4663 && opts.explorerAddress && opts.preferIndexer !== false) {
     try {
       return await readRobinhoodIndexedLogs<TArgs>({
         event: opts.event,
@@ -1020,21 +973,25 @@ async function readFlowLogs<TArgs>(opts: {
     } catch (error) {
       const customRpc = loadCustomRpcUrl(4663)
       if (import.meta.env.DEV) {
-        const target = customRpc ? '自定义 RPC' : '缓存保护'
+        const target = customRpc
+          ? '自定义 RPC'
+          : opts.allowPublicRpcFallback ? '小分片公共 RPC' : '缓存保护'
         console.debug(`[flow] ${opts.label} Blockscout 转入${target}：${friendlyErrorText(error)}`)
       }
-      // Never send a heavy historical query to Robinhood's rate-limited
-      // public RPC. A user-provided Alchemy/QuickNode URL may opt into that
-      // compatibility fallback; otherwise preserve cached data and surface
-      // the indexer error instead of recreating the original 429 storm.
-      if (!customRpc) throw error
+      // Swap/APR scans remain indexer-or-custom-RPC only. The three selective
+      // movement topics are safe to fall back to small public-RPC chunks, so a
+      // fresh browser still gets pools when Blockscout's hourly quota is full.
+      if (!customRpc && !opts.allowPublicRpcFallback) throw error
     }
   }
+  const fallbackSpan = opts.chainId === 4663 && opts.allowPublicRpcFallback
+    ? (opts.maxSpan < 10_000n ? opts.maxSpan : 10_000n)
+    : opts.maxSpan
   return readLogsAdaptive({
     chainId: opts.chainId,
     fromBlock: opts.fromBlock,
     toBlock: opts.toBlock,
-    maxSpan: opts.maxSpan,
+    maxSpan: fallbackSpan,
     label: opts.label,
     request: opts.request,
   })
@@ -1450,9 +1407,7 @@ async function fetchNpmLogsRange(
 ): Promise<RawLog[]> {
   if (fromBlock > toBlock) return []
   try {
-    // Read the two event streams in sequence. The shared scheduler still lets
-    // other chains progress, while avoiding a BSC burst at every chunk edge.
-    const incs = await readFlowLogs<{ tokenId?: bigint; amount0?: bigint; amount1?: bigint }>({
+    const readIncs = () => readFlowLogs<{ tokenId?: bigint; amount0?: bigint; amount1?: bigint }>({
       chainId,
       event: INC_EVENT,
       explorerAddress: npm,
@@ -1460,6 +1415,7 @@ async function fetchNpmLogsRange(
       toBlock,
       maxSpan: span,
       label: 'V3 IncreaseLiquidity logs',
+      allowPublicRpcFallback: true,
       request: (from, to) => client.getLogs({
         address: npm,
         event: INC_EVENT,
@@ -1467,7 +1423,7 @@ async function fetchNpmLogsRange(
         toBlock: to,
       }),
     })
-    const decs = await readFlowLogs<{ tokenId?: bigint; amount0?: bigint; amount1?: bigint }>({
+    const readDecs = () => readFlowLogs<{ tokenId?: bigint; amount0?: bigint; amount1?: bigint }>({
       chainId,
       event: DEC_EVENT,
       explorerAddress: npm,
@@ -1475,6 +1431,7 @@ async function fetchNpmLogsRange(
       toBlock,
       maxSpan: span,
       label: 'V3 DecreaseLiquidity logs',
+      allowPublicRpcFallback: true,
       request: (from, to) => client.getLogs({
         address: npm,
         event: DEC_EVENT,
@@ -1482,6 +1439,12 @@ async function fetchNpmLogsRange(
         toBlock: to,
       }),
     })
+    // Robinhood movement logs use the independent Blockscout indexer lane, so
+    // both selective queries can run together. Keep BSC RPC streams serial to
+    // avoid recreating its 429 burst.
+    const [incs, decs] = chainId === 4663
+      ? await Promise.all([readIncs(), readDecs()])
+      : [await readIncs(), await readDecs()]
     const rows: RawLog[] = []
     for (const l of incs) {
       rows.push({
@@ -2047,7 +2010,7 @@ async function fetchNpmFlowLogs(
     } else if (cache.tip >= latest) {
       const kept = cache.events.filter((e) => e.amountUsd >= opts.minUsd && isRecentTimestamp(e.timestamp))
       kept.sort((a, b) => b.timestamp - a.timestamp)
-      return { events: kept.slice(0, opts.limit * 2) }
+      return { events: takeFlowPoolEvents(kept, [chainId], opts.limit) }
     } else {
       from = windowStart
       if (cache.tip === 0n || cache.tip < windowStart) {
@@ -2056,7 +2019,8 @@ async function fetchNpmFlowLogs(
     }
 
     const rawLogs = from <= latest
-      ? await fetchNpmLogsRange(client, chainId, npm, from, latest, scan.span)
+      ? await timedSource(`${flowChainLabel(chainId)} V3 movement logs`,
+        fetchNpmLogsRange(client, chainId, npm, from, latest, scan.span))
       : []
     const poolLogs = rawLogs.length > 0
       ? await fetchV3PoolLogsRange(client, chainId, npm, from, latest, scan.span)
@@ -2075,17 +2039,24 @@ async function fetchNpmFlowLogs(
       }
     }
     const tokenRefs = new Map<string, { id: string; log: RawLog }>()
+    // A busy NPM window can contain hundreds of tokenIds concentrated in the
+    // same handful of pools. Resolving every NFT before showing 60 pools made
+    // first paint wait ~25s. Keep the newest bounded candidate set; all events
+    // for those tokenIds are still parsed below, so their net flow stays exact.
+    const maxPositionRefs = Math.min(600, Math.max(240, opts.limit * 4))
     for (const log of useful) {
       const id = log.args.tokenId?.toString()
       if (!id) continue
       const current = tokenRefs.get(id)
+      if (!current && tokenRefs.size >= maxPositionRefs) continue
       if (!current || (log.side === 'out' && current.log.side !== 'out')) {
         tokenRefs.set(id, { id, log })
       }
     }
     const wethUsd = await retryRateLimited(chainId, () => wethUsdOnChain(client, chainId))
-    const positions = await retryRateLimited(chainId, () =>
-      resolvePositionsBatch(client, chainId, [...tokenRefs.values()]))
+    const positions = await timedSource(`${flowChainLabel(chainId)} V3 pool metadata`,
+      retryRateLimited(chainId, () =>
+        resolvePositionsBatch(client, chainId, [...tokenRefs.values()])))
     const parsed = useful.map((l) => {
       const tokenId = l.args.tokenId
       if (tokenId == null) return null
@@ -2145,16 +2116,20 @@ async function fetchNpmFlowLogs(
     persistFlowSnapshot(chainId)
     pruneChainCaches(chainId)
     return {
-      events: cache.events
-        .filter((e) => e.amountUsd >= opts.minUsd)
-        .slice(0, opts.limit * 2),
+      events: takeFlowPoolEvents(
+        cache.events.filter((e) => e.amountUsd >= opts.minUsd),
+        [chainId],
+        opts.limit,
+      ),
     }
   } catch (e) {
     if (cache.events.length) {
       return {
-        events: cache.events
-          .filter((e) => e.amountUsd >= opts.minUsd && isRecentTimestamp(e.timestamp))
-          .slice(0, opts.limit * 2),
+        events: takeFlowPoolEvents(
+          cache.events.filter((e) => e.amountUsd >= opts.minUsd && isRecentTimestamp(e.timestamp)),
+          [chainId],
+          opts.limit,
+        ),
         error: friendlyErrorText(e),
       }
     }
@@ -2383,6 +2358,7 @@ async function fetchV4ModifyRange(
       toBlock,
       maxSpan: span,
       label: 'V4 ModifyLiquidity logs',
+      allowPublicRpcFallback: true,
       request: (from, to) => client.getLogs({
         address: poolManager,
         event: V4_MODIFY,
@@ -2429,7 +2405,7 @@ async function fetchV4FlowLogs(
     } else if (cache.tip >= latest) {
       const kept = cache.events.filter((e) => e.amountUsd >= opts.minUsd && isRecentTimestamp(e.timestamp))
       kept.sort((a, b) => b.timestamp - a.timestamp)
-      return { events: kept.slice(0, opts.limit * 2) }
+      return { events: takeFlowPoolEvents(kept, [chainId], opts.limit) }
     } else {
       from = windowStart
       if (cache.tip === 0n || cache.tip < windowStart) cache.events = []
@@ -2437,7 +2413,7 @@ async function fetchV4FlowLogs(
 
     const raw =
       from <= latest
-        ? await fetchV4ModifyRange(
+        ? await timedSource(`${flowChainLabel(chainId)} V4 movement logs`, fetchV4ModifyRange(
           client,
           chainId,
           cfg.contracts.v4PoolManager,
@@ -2445,7 +2421,7 @@ async function fetchV4FlowLogs(
           from,
           latest,
           scan.span,
-        )
+        ))
         : []
 
     const stables = [cfg.contracts.stable, ...(cfg.usdStables ?? [])]
@@ -2455,11 +2431,18 @@ async function fetchV4FlowLogs(
       .filter((l) => l.liquidityDelta !== 0n && l.poolId)
       .sort((a, b) => Number(b.blockNumber - a.blockNumber))
       .slice(0, 10_000)
+    // Resolve only enough recent pool ids to fill the visible pool quota. The
+    // old path resolved every active V4 pool in the window before first paint.
+    const maxPoolCandidates = Math.min(240, Math.max(80, opts.limit * 2))
     const poolIds = [...new Map(useful.map((log) => [log.poolId.toLowerCase(), log.poolId])).values()]
+      .slice(0, maxPoolCandidates)
+    const selectedPoolIds = new Set(poolIds.map((poolId) => poolId.toLowerCase()))
+    const selectedLogs = useful.filter((log) => selectedPoolIds.has(log.poolId.toLowerCase()))
     const wethUsd = await retryRateLimited(chainId, () => wethUsdOnChain(client, chainId))
-    const pools = await retryRateLimited(chainId, () =>
-      resolveV4PoolsBatch(client, chainId, poolIds))
-    const parsed = useful.map((l) => {
+    const pools = await timedSource(`${flowChainLabel(chainId)} V4 pool metadata`,
+      retryRateLimited(chainId, () =>
+        resolveV4PoolsBatch(client, chainId, poolIds)))
+    const parsed = selectedLogs.map((l) => {
       const info = pools.get(l.poolId.toLowerCase())
       if (!info) return null
       const absLiq = l.liquidityDelta < 0n ? -l.liquidityDelta : l.liquidityDelta
@@ -2522,16 +2505,20 @@ async function fetchV4FlowLogs(
     persistFlowSnapshot(chainId)
     pruneChainCaches(chainId)
     return {
-      events: cache.events
-        .filter((e) => e.amountUsd >= opts.minUsd)
-        .slice(0, opts.limit * 2),
+      events: takeFlowPoolEvents(
+        cache.events.filter((e) => e.amountUsd >= opts.minUsd),
+        [chainId],
+        opts.limit,
+      ),
     }
   } catch (e) {
     if (cache.events.length) {
       return {
-        events: cache.events
-          .filter((e) => e.amountUsd >= opts.minUsd && isRecentTimestamp(e.timestamp))
-          .slice(0, opts.limit * 2),
+        events: takeFlowPoolEvents(
+          cache.events.filter((e) => e.amountUsd >= opts.minUsd && isRecentTimestamp(e.timestamp)),
+          [chainId],
+          opts.limit,
+        ),
         error: friendlyErrorText(e),
       }
     }
@@ -2676,9 +2663,14 @@ function anchoredLiquidityUsd(opts: {
   return 0
 }
 
-function annualizedFeePct(windowFeeUsd: number, liquidityUsd: number): number | undefined {
+function annualizedFeePct(
+  windowFeeUsd: number,
+  liquidityUsd: number,
+  windowMinutes = FLOW_WINDOW_MINUTES,
+): number | undefined {
   if (!(windowFeeUsd >= 0) || !(liquidityUsd > 0)) return undefined
-  const apr = (windowFeeUsd / liquidityUsd) * APR_WINDOWS_PER_YEAR * 100
+  const windowsPerYear = (365 * 24 * 60) / Math.max(1, windowMinutes)
+  const apr = (windowFeeUsd / liquidityUsd) * windowsPerYear * 100
   if (!Number.isFinite(apr) || apr < 0) return undefined
   // 防止极端小池把 Infinity/指数级数字带进排序与布局；仍保留足够高的风险信号。
   return Math.min(apr, 1_000_000_000)
@@ -2728,6 +2720,7 @@ async function fetchV3AprSwaps(
         toBlock: job.to,
         maxSpan: APR_LOG_SPAN[chainId],
         label: 'V3 Swap logs',
+        preferIndexer: false,
         request: (from, to) => client.getLogs({
           address,
           event: V3_SWAP,
@@ -2814,6 +2807,7 @@ async function fetchV4AprSwaps(
         toBlock: job.to,
         maxSpan: APR_LOG_SPAN[chainId],
         label: 'V4 Swap logs',
+        preferIndexer: false,
         request: (from, to) => client.getLogs({
           address: cfg.contracts.v4PoolManager,
           event: V4_SWAP,
@@ -3100,7 +3094,8 @@ async function enrichFlowApr(events: FlowEvent[]): Promise<{
     if (!prev || event.amountUsd > prev.amountUsd) pendingPools.set(key, event)
   }
 
-  // 只对新池里金额 Top-N 扫 Swap；其余跳过本轮（有旧缓存仍可用）
+  // Exact pair ids are batched by DexScreener, so this covers the complete
+  // visible list without dozens of per-pool eth_getLogs calls.
   const ranked = [...pendingPools.entries()]
     .sort((a, b) => b[1].amountUsd - a[1].amountUsd)
     .slice(0, APR_POOL_LIMIT)
@@ -3129,9 +3124,24 @@ async function enrichFlowApr(events: FlowEvent[]): Promise<{
     groups.sort((a, b) => a.version.localeCompare(b.version))
     for (const { version, rows } of groups) {
       try {
-        const next = version === 'v3'
-          ? await timedSource(`${flowChainLabel(chainId)} V3 APR`, fetchV3AprMetrics(chainId, rows))
-          : await timedSource(`${flowChainLabel(chainId)} V4 APR`, fetchV4AprMetrics(chainId, rows))
+        const canUseOnchain = chainId === 56 || Boolean(loadCustomRpcUrl(chainId))
+        const fetchOnchain = () => version === 'v3'
+          ? timedSource(`${flowChainLabel(chainId)} V3 on-chain APR`, fetchV3AprMetrics(chainId, rows))
+          : timedSource(`${flowChainLabel(chainId)} V4 on-chain APR`, fetchV4AprMetrics(chainId, rows))
+        let next: Map<string, FlowAprMetric>
+        try {
+          next = await timedSource(
+            `${flowChainLabel(chainId)} ${version.toUpperCase()} DexScreener APR`,
+            fetchDexScreenerAprMetrics(chainId, version, rows),
+          )
+          if (next.size === 0 && canUseOnchain) next = await fetchOnchain()
+        } catch (dexError) {
+          // Robinhood's public RPC is intentionally not an APR fallback: its
+          // log quota is needed for movement discovery. A configured private
+          // RPC (or BSC) may still use the exact on-chain calculation.
+          if (!canUseOnchain) throw dexError
+          next = await fetchOnchain()
+        }
         for (const [key, metric] of next) {
           metrics.set(key, metric)
           flowAprCache.set(key, { at: Date.now(), metric })
@@ -3162,12 +3172,79 @@ async function enrichFlowApr(events: FlowEvent[]): Promise<{
 
 type DexScreenerPair = {
   chainId?: string
+  dexId?: string
+  pairAddress?: string
+  labels?: string[] | null
   liquidity?: { usd?: number }
+  volume?: Record<string, number | undefined>
+  txns?: Record<string, { buys?: number; sells?: number } | undefined>
   marketCap?: number
   fdv?: number
   pairCreatedAt?: number
   baseToken?: { address?: string; symbol?: string }
   quoteToken?: { address?: string; symbol?: string }
+}
+
+/**
+ * Exact-pair 24h APR. One request carries many pool addresses/ids, avoiding
+ * per-pool Swap scans and preserving Blockscout's tiny anonymous quota for the
+ * actual movement feed.
+ */
+async function fetchDexScreenerAprMetrics(
+  chainId: FlowChainId,
+  version: FlowVersion,
+  events: FlowEvent[],
+): Promise<Map<string, FlowAprMetric>> {
+  const byRef = new Map<string, FlowEvent>()
+  for (const event of events) {
+    const ref = flowPoolRef(event).toLowerCase()
+    const previous = byRef.get(ref)
+    if (!previous || event.amountUsd > previous.amountUsd) byRef.set(ref, event)
+  }
+  const refs = [...byRef.keys()]
+  const chunks: string[][] = []
+  for (let i = 0; i < refs.length; i += 30) chunks.push(refs.slice(i, i + 30))
+  const chainSlug = dexScreenerChain(chainId)
+  const responses = await Promise.all(chunks.map(async (chunk) => {
+    const url = `https://api.dexscreener.com/latest/dex/pairs/${chainSlug}/${chunk.join(',')}`
+    const json = await fetchJson<{ pairs?: DexScreenerPair[] | null }>(url, 8_000)
+    return Array.isArray(json.pairs) ? json.pairs : []
+  }))
+
+  const out = new Map<string, FlowAprMetric>()
+  for (const pair of responses.flat()) {
+    if ((pair.chainId ?? '').toLowerCase() !== chainSlug) continue
+    if (pair.dexId && pair.dexId.toLowerCase() !== 'uniswap') continue
+    const pairRef = pair.pairAddress?.toLowerCase()
+    if (!pairRef) continue
+    const event = byRef.get(pairRef)
+    if (!event) continue
+    const versionLabels = (pair.labels ?? []).map((label) => label.toLowerCase())
+    if (versionLabels.some((label) => label === 'v3' || label === 'v4') && !versionLabels.includes(version)) {
+      continue
+    }
+    // Dynamic-fee V4 pools need per-swap fee data; do not invent a fee just to
+    // populate the leaderboard.
+    if (version === 'v4' && (event.fee & 0x800000) !== 0) continue
+    const feePips = Math.min(1_000_000, Math.max(0, event.fee & 0x7fffff))
+    const volume24h = clampUsd(Number(pair.volume?.h24) || 0)
+    const liquidityUsd = clampUsd(Number(pair.liquidity?.usd) || 0)
+    if (!(liquidityUsd > 0)) continue
+    const fee24h = clampUsd(volume24h * feePips / 1_000_000)
+    const h24 = pair.txns?.h24
+    const swapCount = Math.max(0, Math.floor((Number(h24?.buys) || 0) + (Number(h24?.sells) || 0)))
+    out.set(flowAprKey(chainId, version, pairRef), {
+      windowSwapUsd: volume24h,
+      windowFeeUsd: fee24h,
+      aprLiquidityUsd: liquidityUsd,
+      feeAprPct: annualizedFeePct(fee24h, liquidityUsd, 24 * 60),
+      aprSwapCount: swapCount,
+      aprWindowMinutes: 24 * 60,
+      effectiveFeePips: feePips,
+      aprBasis: 'dexscreener-liquidity',
+    })
+  }
+  return out
 }
 
 async function fetchDexScreenerTokenMetas(
@@ -3294,32 +3371,6 @@ async function enrichFlowMarketMeta(events: FlowEvent[]): Promise<FlowEvent[]> {
   })
 }
 
-function takeBalancedChains(
-  events: FlowEvent[],
-  chainIds: FlowChainId[],
-  max: number,
-): FlowEvent[] {
-  const wantsBoth = chainIds.includes(56) && chainIds.includes(4663)
-  if (!wantsBoth || events.length <= max) return events.slice(0, max)
-
-  const quota = Math.floor(max / 2)
-  const selected: FlowEvent[] = []
-  const selectedIds = new Set<string>()
-  const counts: Record<FlowChainId, number> = { 56: 0, 4663: 0 }
-  for (const event of events) {
-    if (counts[event.chainId] >= quota) continue
-    selected.push(event)
-    selectedIds.add(event.id)
-    counts[event.chainId] += 1
-  }
-  for (const event of events) {
-    if (selected.length >= max) break
-    if (selectedIds.has(event.id)) continue
-    selected.push(event)
-  }
-  return selected.sort((a, b) => b.timestamp - a.timestamp)
-}
-
 export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
   events: FlowEvent[]
   notices: FlowNotice[]
@@ -3330,6 +3381,33 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
   const filterHp = opts.filterHoneypot !== false
   const notices: FlowNotice[] = []
   const parts: FlowEvent[] = []
+  const publishBase = (events: FlowEvent[], currentNotices: FlowNotice[] = notices) => {
+    if (!opts.onBaseEvents || events.length === 0) return
+    try {
+      opts.onBaseEvents({ events, notices: [...currentNotices] })
+    } catch {
+      // UI progress callbacks must never break data collection.
+    }
+  }
+  const publishCollectedParts = () => {
+    const seen = new Set<string>()
+    const collected = parts.filter((event) => {
+      if (seen.has(event.id)) return false
+      seen.add(event.id)
+      return event.amountUsd >= minUsd && isRecentTimestamp(event.timestamp)
+    })
+    collected.sort((a, b) => b.timestamp - a.timestamp)
+    publishBase(takeFlowPoolEvents(collected, opts.chainIds, limit))
+  }
+
+  // A returning visitor gets the recent persisted list synchronously while
+  // the reorg overlap is refreshed in the background.
+  for (const chainId of opts.chainIds) hydrateFlowSnapshot(chainId)
+  const cached = opts.chainIds.flatMap((chainId) => [
+    ...logCaches[chainId].events,
+    ...v4Caches[chainId].events,
+  ]).filter((event) => event.amountUsd >= minUsd && isRecentTimestamp(event.timestamp))
+  publishBase(takeFlowPoolEvents(cached, opts.chainIds, limit), [])
 
   const jobs: Promise<void>[] = []
   if (opts.chainIds.includes(56)) {
@@ -3338,26 +3416,32 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
         if (r.note) notices.push({ level: 'warning', message: r.note })
         if (r.error) notices.push({ level: 'error', message: `BSC V3：${r.error}` })
         parts.push(...r.events)
+        publishCollectedParts()
       }),
     )
     jobs.push(
       timedSource('BSC V4', fetchV4FlowLogs(56, { minUsd, limit })).then((r) => {
         if (r.error) notices.push({ level: 'error', message: `BSC V4：${r.error}` })
         parts.push(...r.events)
+        publishCollectedParts()
       }),
     )
   }
   if (opts.chainIds.includes(4663)) {
-    jobs.push(
-      timedSource('Robinhood V3', fetchNpmFlowLogs(4663, { minUsd, limit })).then((result) => {
-        if (result.error) notices.push({ level: 'error', message: `Robinhood V3：${result.error}` })
-        parts.push(...result.events)
-      }),
-    )
+    // V4 needs only one selective log stream and much less metadata than V3.
+    // Start it first so a useful pool list can paint while V3 NFTs resolve.
     jobs.push(
       timedSource('Robinhood V4', fetchV4FlowLogs(4663, { minUsd, limit })).then((result) => {
         if (result.error) notices.push({ level: 'error', message: `Robinhood V4：${result.error}` })
         parts.push(...result.events)
+        publishCollectedParts()
+      }),
+    )
+    jobs.push(
+      timedSource('Robinhood V3', fetchNpmFlowLogs(4663, { minUsd, limit })).then((result) => {
+        if (result.error) notices.push({ level: 'error', message: `Robinhood V3：${result.error}` })
+        parts.push(...result.events)
+        publishCollectedParts()
       }),
     )
   }
@@ -3370,6 +3454,11 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
     return e.amountUsd >= minUsd && isRecentTimestamp(e.timestamp)
   })
 
+  events.sort((a, b) => b.timestamp - a.timestamp)
+  // Do not hold the first useful list behind GoPlus or batched market/APR
+  // enrichment. Those sources update the same rows below.
+  publishBase(takeFlowPoolEvents(events, opts.chainIds, limit))
+
   if (filterHp && events.length) {
     try {
       events = await filterHoneypotFast(events)
@@ -3379,7 +3468,7 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
   }
 
   events.sort((a, b) => b.timestamp - a.timestamp)
-  const balanced = takeBalancedChains(events, opts.chainIds, limit * 2)
+  const balanced = takeFlowPoolEvents(events, opts.chainIds, limit)
   const [apr, withMarket] = await Promise.all([
     enrichFlowApr(balanced),
     enrichFlowMarketMeta(balanced),

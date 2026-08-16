@@ -363,11 +363,28 @@ export async function resolveTokenMeta(address: Address): Promise<TokenMeta> {
 }
 
 export async function getErc20Balance(token: Address, owner: Address): Promise<bigint> {
-  return publicClient.readContract({ address: token, abi: erc20Abi, functionName: 'balanceOf', args: [owner] })
+  const chainId = getActiveChainId()
+  return runRpcTask({
+    chainId,
+    lane: 'read',
+    label: '读取代币余额',
+    task: () => publicClient.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: 'balanceOf',
+      args: [owner],
+    }),
+  })
 }
 
 export async function getNativeBalance(owner: Address): Promise<bigint> {
-  return publicClient.getBalance({ address: owner })
+  const chainId = getActiveChainId()
+  return runRpcTask({
+    chainId,
+    lane: 'read',
+    label: '读取原生币余额',
+    task: () => publicClient.getBalance({ address: owner }),
+  })
 }
 
 /**

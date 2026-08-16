@@ -372,7 +372,9 @@ export default function App() {
   const [lastRefreshAt, setLastRefreshAt] = useState<number | null>(null)
   /** 原生余额 raw（18 位 wei；Arc 上也是原生 USDC 的 18 位内部精度，用于 gas/value） */
   const [ethBal, setEthBal] = useState<bigint>(0n)
+  const [ethBalStatus, setEthBalStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
   const [wethBal, setWethBal] = useState<bigint>(0n)
+  const balanceRefreshGenRef = useRef(0)
   /** 钱包条展示：Arc 用 ERC-20 USDC(6)，其它链直接展示 ethBal(18) */
   const [gasTokenDisplay, setGasTokenDisplay] = useState<{ raw: bigint; decimals: number }>({
     raw: 0n,
@@ -700,26 +702,59 @@ export default function App() {
   }, [filteredPositions, pushToast])
 
   const refreshBalances = useCallback(async (addr: Address) => {
-    try {
-      const eth = await getNativeBalance(addr)
-      setEthBal(eth)
-      if (chainCfg.key === 'arc') {
-        // 展示走 ERC-20 USDC(6)，与 Rabby/MetaMask 一致；ethBal 仍保留原生 18 位供 gas
-        const usdc = await getTokenBalanceView(CONTRACTS.stable, addr)
-        setGasTokenDisplay({ raw: usdc.raw, decimals: usdc.decimals })
-        setWethBal(0n)
-        return
+    const requestChainId = chainCfg.id
+    // 旧 render 可能在切链后的微任务里继续调用这里；绝不能把旧链余额写回新链。
+    if (getActiveChainId() !== requestChainId) return
+    const generation = ++balanceRefreshGenRef.current
+    setEthBalStatus('loading')
+    const stillCurrent = () =>
+      generation === balanceRefreshGenRef.current && getActiveChainId() === requestChainId
+
+    const extraBalance = chainCfg.key === 'arc'
+      ? getTokenBalanceView(CONTRACTS.stable, addr)
+      : chainCfg.hasWrappedNative
+        ? getErc20Balance(CONTRACTS.weth, addr)
+        : Promise.resolve(null)
+    const [nativeResult, extraResult] = await Promise.allSettled([
+      getNativeBalance(addr),
+      extraBalance,
+    ])
+    if (!stillCurrent()) return
+
+    // 两类余额独立落地：WETH / USDC 节点偶发失败时，不再连带吞掉已经读到的原生 ETH。
+    if (nativeResult.status === 'fulfilled') {
+      setEthBal(nativeResult.value)
+      setEthBalStatus('ready')
+      if (chainCfg.key !== 'arc') {
+        setGasTokenDisplay({ raw: nativeResult.value, decimals: 18 })
       }
-      setGasTokenDisplay({ raw: eth, decimals: 18 })
-      if (chainHasWrappedNative()) {
-        setWethBal(await getErc20Balance(CONTRACTS.weth, addr))
-      } else {
-        setWethBal(0n)
-      }
-    } catch {
-      /* ignore */
+    } else {
+      // 读取失败不是余额为 0；建仓页会明确显示失败，避免拿假 0 做余额判断。
+      setEthBalStatus('error')
     }
-  }, [chainCfg.key])
+    if (chainCfg.key === 'arc') {
+      if (
+        extraResult.status === 'fulfilled'
+        && extraResult.value
+        && typeof extraResult.value !== 'bigint'
+      ) {
+        setGasTokenDisplay({ raw: extraResult.value.raw, decimals: extraResult.value.decimals })
+      }
+      setWethBal(0n)
+    } else if (chainCfg.hasWrappedNative) {
+      if (extraResult.status === 'fulfilled' && typeof extraResult.value === 'bigint') {
+        setWethBal(extraResult.value)
+      }
+    } else {
+      setWethBal(0n)
+    }
+  }, [chainCfg])
+
+  // 账户和应用链任一变化都重读余额。此前切链只刷新仓位，原生 ETH 可能保留为 0/旧链值。
+  useEffect(() => {
+    if (!address) return
+    void refreshBalances(address)
+  }, [address, refreshBalances])
 
   const connect = async () => {
     // 互斥：本地私钥解锁时不允许再连插件钱包
@@ -789,6 +824,10 @@ export default function App() {
     setLocalAddr(null)
     setPositions([])
     setSelectedId(null)
+    balanceRefreshGenRef.current += 1
+    setEthBal(0n)
+    setEthBalStatus('idle')
+    setWethBal(0n)
     setAutoCfg((c) => ({ ...c, enabled: false }))
     setStatus(signerMode === 'local' ? '已锁定本地私钥' : '已断开连接')
     setStatusHash(null)
@@ -1058,6 +1097,10 @@ export default function App() {
       setTokenA(cfg.defaultTokenA)
       setTokenB(cfg.defaultTokenB)
       setTokenMetaCache({})
+      balanceRefreshGenRef.current += 1
+      setEthBal(0n)
+      setEthBalStatus('idle')
+      setWethBal(0n)
       setGasTokenDisplay({ raw: 0n, decimals: cfg.key === 'arc' ? 6 : 18 })
       setPool(null)
       setScannedPools([])
@@ -1395,15 +1438,32 @@ export default function App() {
 
   useEffect(() => {
     if (!address || !pool) return
+    let cancelled = false
+    const requestChainId = chainId
+    const requestChainKey = chainCfg.key
     void (async () => {
-      const [b0, b1] = await Promise.all([
+      const shouldReadNative = pairHasWeth(pool.token0.address, pool.token1.address)
+      const [b0, b1, native] = await Promise.allSettled([
         isNativeCurrency(pool.token0.address) ? getNativeBalance(address) : getErc20Balance(pool.token0.address, address),
         isNativeCurrency(pool.token1.address) ? getNativeBalance(address) : getErc20Balance(pool.token1.address, address),
+        shouldReadNative ? getNativeBalance(address) : Promise.resolve(null),
       ])
-      setBal0(b0)
-      setBal1(b1)
+      if (cancelled || getActiveChainId() !== requestChainId) return
+      if (b0.status === 'fulfilled') setBal0(b0.value)
+      if (b1.status === 'fulfilled') setBal1(b1.value)
+      // 建仓页切到“直接付 ETH”时展示 ethBal；加载池时同步更新它，不能只依赖连接钱包那一次。
+      if (native.status === 'fulfilled' && typeof native.value === 'bigint') {
+        setEthBal(native.value)
+        setEthBalStatus('ready')
+        if (requestChainKey !== 'arc') {
+          setGasTokenDisplay({ raw: native.value, decimals: 18 })
+        }
+      }
     })()
-  }, [address, pool])
+    return () => {
+      cancelled = true
+    }
+  }, [address, chainCfg.key, chainId, pool])
 
   const loadPoolByPair = async () => {
     setBusy(true)
@@ -2694,20 +2754,28 @@ export default function App() {
   const label1 = pool
     ? (mintUseEth && isEthLikeCurrency(pool.token1.address) ? getNativeSymbol() : pool.token1.symbol)
     : ''
+  const showBal0IsNative = Boolean(pool && mintUseEth && isEthLikeCurrency(pool.token0.address))
+  const showBal1IsNative = Boolean(pool && mintUseEth && isEthLikeCurrency(pool.token1.address))
   const showBal0 = pool
-    ? (mintUseEth && isEthLikeCurrency(pool.token0.address) ? ethBal : bal0)
+    ? (showBal0IsNative ? ethBal : bal0)
     : 0n
   const showBal1 = pool
-    ? (mintUseEth && isEthLikeCurrency(pool.token1.address) ? ethBal : bal1)
+    ? (showBal1IsNative ? ethBal : bal1)
     : 0n
+  const mintBalanceText = (raw: bigint, decimals: number, isNative: boolean) => {
+    if (isNative && ethBalStatus !== 'ready') {
+      return ethBalStatus === 'error' ? '读取失败' : '读取中…'
+    }
+    return formatAmount(raw, decimals, 6)
+  }
   const gasReserve = 10n ** 15n
   const mintMax0 = pool
-    ? (mintUseEth && isEthLikeCurrency(pool.token0.address)
+    ? (showBal0IsNative
       ? (ethBal > gasReserve ? ethBal - gasReserve : 0n)
       : bal0)
     : 0n
   const mintMax1 = pool
-    ? (mintUseEth && isEthLikeCurrency(pool.token1.address)
+    ? (showBal1IsNative
       ? (ethBal > gasReserve ? ethBal - gasReserve : 0n)
       : bal1)
     : 0n
@@ -2727,8 +2795,8 @@ export default function App() {
     const v1 = n1
     const total = v0 + v1
     const pct0 = total > 0 ? (v0 / total) * 100 : 0
-    const short0 = raw0 > showBal0
-    const short1 = raw1 > showBal1
+    const short0 = (!showBal0IsNative || ethBalStatus === 'ready') && raw0 > showBal0
+    const short1 = (!showBal1IsNative || ethBalStatus === 'ready') && raw1 > showBal1
     return {
       raw0,
       raw1,
@@ -2742,7 +2810,7 @@ export default function App() {
       empty: raw0 === 0n && raw1 === 0n,
       unit: pool.token1.symbol,
     }
-  }, [pool, amount0, amount1, showBal0, showBal1])
+  }, [pool, amount0, amount1, showBal0, showBal1, showBal0IsNative, showBal1IsNative, ethBalStatus])
 
   /**
    * 经典建仓和 DLMM 模式共用同一条真实 Mint 链路。
@@ -5464,11 +5532,17 @@ export default function App() {
               </div>
 
               {poolUsesWeth && (
-                <label className="inline-setting check" style={{ marginBottom: 10 }}>
+                <label className="inline-setting check mint-native-setting">
                   <input type="checkbox" checked={useNativeEth} onChange={(e) => setUseNativeEth(e.target.checked)} />
-                  {mintProtocol === 'v4' || pool?.version === 'v4'
-                    ? `直接付 ${getNativeSymbol()}（有原生池用 value；否则自动 Wrap 成 ${getWrappedNativeSymbol()}，不必先去工具页）`
-                    : `直接付 ${getNativeSymbol()}（Uniswap 自动 Wrap 成 ${getWrappedNativeSymbol()}）`}
+                  <span>
+                    {mintProtocol === 'v4' || pool?.version === 'v4'
+                      ? `直接付 ${getNativeSymbol()}（有原生池用 value；否则自动 Wrap 成 ${getWrappedNativeSymbol()}，不必先去工具页）`
+                      : `直接付 ${getNativeSymbol()}（Uniswap 自动 Wrap 成 ${getWrappedNativeSymbol()}）`}
+                  </span>
+                  <span className="mint-native-wallet mono">
+                    钱包 {getNativeSymbol()} {mintBalanceText(ethBal, 18, true)}
+                    {' · '}{getWrappedNativeSymbol()} {formatAmount(wethBal, 18, 6)}
+                  </span>
                 </label>
               )}
 
@@ -5491,11 +5565,17 @@ export default function App() {
                       {pairSide === 1 && !mintPlan?.empty && <span className="amt-auto">自动配平</span>}
                     </span>
                     <span className="bal-hint">
-                      余额 {formatAmount(showBal0, pool.token0.decimals, 6)}
+                      余额 {mintBalanceText(showBal0, pool.token0.decimals, showBal0IsNative)}
                       <button
                         type="button"
                         className="amt-max"
-                        disabled={!address || !mintTicks || mintMax0 === 0n || mintNeedSide === 1}
+                        disabled={
+                          !address
+                          || !mintTicks
+                          || mintMax0 === 0n
+                          || mintNeedSide === 1
+                          || (showBal0IsNative && ethBalStatus !== 'ready')
+                        }
                         onClick={() => onMintSide(0, formatAmountExact(mintMax0, pool.token0.decimals))}
                       >
                         Max
@@ -5521,11 +5601,17 @@ export default function App() {
                       {pairSide === 0 && !mintPlan?.empty && <span className="amt-auto">自动配平</span>}
                     </span>
                     <span className="bal-hint">
-                      余额 {formatAmount(showBal1, pool.token1.decimals, 6)}
+                      余额 {mintBalanceText(showBal1, pool.token1.decimals, showBal1IsNative)}
                       <button
                         type="button"
                         className="amt-max"
-                        disabled={!address || !mintTicks || mintMax1 === 0n || mintNeedSide === 0}
+                        disabled={
+                          !address
+                          || !mintTicks
+                          || mintMax1 === 0n
+                          || mintNeedSide === 0
+                          || (showBal1IsNative && ethBalStatus !== 'ready')
+                        }
                         onClick={() => onMintSide(1, formatAmountExact(mintMax1, pool.token1.decimals))}
                       >
                         Max

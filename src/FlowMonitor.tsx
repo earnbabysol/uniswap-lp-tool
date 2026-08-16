@@ -31,6 +31,7 @@ type FlowPoolRow = {
   windowFeeUsd?: number
   aprLiquidityUsd?: number
   aprSwapCount?: number
+  aprWindowMinutes?: number
   effectiveFeePips?: number
   aprBasis?: FlowEvent['aprBasis']
   marketCapUsd?: number
@@ -124,7 +125,17 @@ function aprSampleLabel(row: FlowPoolRow): string {
   if ((row.windowFeeUsd ?? 0) / Math.max(1, row.aprLiquidityUsd ?? 0) > 0.1) {
     return '异常费收 · 谨慎'
   }
-  return `${FLOW_WINDOW_MINUTES}m 短窗估算`
+  const windowLabel = formatAprWindow(row.aprWindowMinutes)
+  return row.aprBasis === 'dexscreener-liquidity'
+    ? `${windowLabel} 成交估算`
+    : `${windowLabel} 短窗估算`
+}
+
+function formatAprWindow(minutes: number | undefined): string {
+  const value = minutes ?? FLOW_WINDOW_MINUTES
+  if (value >= 24 * 60 && value % (24 * 60) === 0) return `${value / (24 * 60)}d`
+  if (value >= 60 && value % 60 === 0) return `${value / 60}h`
+  return `${value}m`
 }
 
 async function copyText(text: string): Promise<boolean> {
@@ -179,6 +190,13 @@ export type FlowMonitorProps = {
   onOpenPool: (args: OpenFlowPoolArgs) => void
 }
 
+const FLOW_POOL_LIMIT_PER_CHAIN = 60
+
+function flowPoolCount(events: FlowEvent[]): number {
+  return new Set(events.map((event) =>
+    `${event.chainId}:${event.version}:${flowPoolRef(event).toLowerCase()}`)).size
+}
+
 export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
   const [chainFilter, setChainFilter] = useState<ChainFilter>('both')
   const [sideFilter, setSideFilter] = useState<SideFilter>('all')
@@ -197,6 +215,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
   const [expandedKey, setExpandedKey] = useState<string | null>(null)
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const [elapsedMs, setElapsedMs] = useState<number | null>(null)
+  const [loadStage, setLoadStage] = useState('')
   const eventsRef = useRef<FlowEvent[]>([])
   const genRef = useRef(0)
   const mountedRef = useRef(true)
@@ -228,6 +247,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
     runningKeyRef.current = key
     runningGenRef.current = gen
     setBusy(true)
+    setLoadStage('正在扫描池子…')
     const t0 = performance.now()
     const chainIds: FlowChainId[] =
       options.chainFilter === 'both' ? [56, 4663] : [options.chainFilter]
@@ -239,7 +259,15 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
           chainIds,
           minUsd: options.minUsd,
           filterHoneypot: options.filterHp,
-          limit: 30,
+          limit: FLOW_POOL_LIMIT_PER_CHAIN,
+          onBaseEvents: (base) => {
+            if (!mountedRef.current || gen !== genRef.current) return
+            const partialRows = [...base.events].sort((a, b) => b.timestamp - a.timestamp)
+            eventsRef.current = partialRows
+            setEvents(partialRows)
+            setNotices(base.notices)
+            setLoadStage(`已发现 ${flowPoolCount(partialRows)} 个池，正在补全年化与风险…`)
+          },
         })
         rows = result.events
         nextNotices = result.notices
@@ -264,7 +292,14 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
               chainIds: [chainId],
               minUsd: options.minUsd,
               filterHoneypot: options.filterHp,
-              limit: 20,
+              limit: FLOW_POOL_LIMIT_PER_CHAIN,
+              onBaseEvents: (base) => {
+                if (!mountedRef.current || gen !== genRef.current) return
+                results.set(chainId, base)
+                publishPartial()
+                const discovered = [...results.values()].flatMap((item) => item.events)
+                setLoadStage(`已发现 ${flowPoolCount(discovered)} 个池，正在补全年化与风险…`)
+              },
             })
             results.set(chainId, result)
           } catch (error) {
@@ -301,6 +336,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         queueMicrotask(() => void loadRef.current())
       } else if (mountedRef.current) {
         setBusy(false)
+        setLoadStage('')
       }
     }
   }, [])
@@ -360,6 +396,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
           windowFeeUsd: event.windowFeeUsd,
           aprLiquidityUsd: event.aprLiquidityUsd,
           aprSwapCount: event.aprSwapCount,
+          aprWindowMinutes: event.aprWindowMinutes,
           effectiveFeePips: event.effectiveFeePips,
           aprBasis: event.aprBasis,
           marketCapUsd: event.marketCapUsd,
@@ -379,6 +416,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         previous.windowFeeUsd = event.windowFeeUsd
         previous.aprLiquidityUsd = event.aprLiquidityUsd
         previous.aprSwapCount = event.aprSwapCount
+        previous.aprWindowMinutes = event.aprWindowMinutes
         previous.effectiveFeePips = event.effectiveFeePips
         previous.aprBasis = event.aprBasis
       }
@@ -470,10 +508,10 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
             最近 {FLOW_WINDOW_MINUTES} 分钟 · Uniswap V3 + V4 · BSC / Robinhood 开/加仓与撤出
           </p>
           <p className="flow-trust-note">
-            默认按手续费年化从高到低。年化 = 近 {FLOW_WINDOW_MINUTES} 分钟锚定 Swap 手续费 ÷ 流动性基数 × 365；
-            短窗口只用于发现，不代表未来收益。
+            默认按手续费年化从高到低。年化优先采用 DexScreener 24h 成交量 × 池费率 ÷ 当前流动性 × 365；
+            这是发现指标，不代表未来收益。
             <span className="flow-trust-note-extra">
-              V3 取池合约余额；V4 按当前活跃流动性深度估算，仅采用稳定币与 WETH/WBNB 锚点。
+              精确池批量查询，不再为每个池扫描 Swap；未收录或动态费率池会显示为“—”。
             </span>
           </p>
         </div>
@@ -597,11 +635,11 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
             </label>
           </div>
         </details>
-        {updatedAt && (
+        {(updatedAt || busy) && (
           <span className="muted flow-updated">
-            更新于 {new Date(updatedAt).toLocaleTimeString()}
-            {elapsedMs != null ? ` · ${elapsedMs}ms` : ''}
-            {busy ? ' · 增量中…' : ''}
+            {updatedAt ? `更新于 ${new Date(updatedAt).toLocaleTimeString()}` : '首次加载'}
+            {updatedAt && elapsedMs != null ? ` · ${elapsedMs}ms` : ''}
+            {busy ? ` · ${loadStage || '增量中…'}` : ''}
           </span>
         )}
       </div>
@@ -657,7 +695,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
 
       {busy && events.length === 0 ? (
         <p className="muted flow-empty">
-          正在扫描最近 {FLOW_WINDOW_MINUTES} 分钟链上日志并计算池级年化，首次可能需要 10–30 秒…
+          正在定向扫描最近 {FLOW_WINDOW_MINUTES} 分钟的 LP 动向；发现池后会立即展示，年化随后补齐…
         </p>
       ) : visible.length === 0 ? (
         <p className="muted flow-empty">
@@ -675,7 +713,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
             <span>流入资金</span>
             <span>流出资金</span>
             <span>净流</span>
-            <span>{FLOW_WINDOW_MINUTES}m Swap</span>
+            <span>APR 成交量</span>
             <span>最近动向 / 操作</span>
           </div>
           <div className="flow-list">
@@ -691,7 +729,11 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
                 ?? (e.version === 'v4' ? 'active-liquidity' : 'pool-balance')
               const basisLabel = basis === 'active-liquidity'
                 ? 'V4 当前活跃流动性深度（估算）'
+                : basis === 'dexscreener-liquidity'
+                  ? 'DexScreener 当前池流动性'
                 : 'V3 当前池合约余额（锚定侧估值）'
+              const aprWindowLabel = formatAprWindow(row.aprWindowMinutes)
+              const aprVolumeLabel = `${aprWindowLabel} Swap`
               return (
                 <article
                   key={row.key}
@@ -730,7 +772,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
 
                     <div
                       className={`flow-row-metric flow-row-apr ${reliable ? 'reliable' : 'volatile'}`}
-                      title={`近 ${FLOW_WINDOW_MINUTES} 分钟手续费 ÷ ${basisLabel} × 365，简单年化、不复利`}
+                      title={`${aprWindowLabel} 成交手续费 ÷ ${basisLabel} × 365，简单年化、不复利`}
                     >
                       <span className="flow-mobile-label">手续费年化</span>
                       <strong data-testid="flow-apr-value">{formatApr(row.feeAprPct)}</strong>
@@ -749,7 +791,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
                       <strong>{row.net > 0 ? '+' : ''}{formatUsd(row.net)}</strong>
                     </div>
                     <div className="flow-row-metric flow-row-volume">
-                      <span className="flow-mobile-label">{FLOW_WINDOW_MINUTES}m Swap</span>
+                      <span className="flow-mobile-label">{aprVolumeLabel}</span>
                       <strong>{row.windowSwapUsd == null ? '—' : formatUsd(row.windowSwapUsd)}</strong>
                     </div>
                     <div className="flow-row-actions">
@@ -800,19 +842,19 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
                           <strong>{formatTokenDate(row.tokenCreatedAt)}</strong>
                         </div>
                         <div>
-                          <span className="muted">{FLOW_WINDOW_MINUTES}m Swap</span>
+                          <span className="muted">{aprVolumeLabel}</span>
                           <strong>{row.windowSwapUsd == null ? '—' : formatUsd(row.windowSwapUsd)}</strong>
                         </div>
                         <div>
-                          <span className="muted">{FLOW_WINDOW_MINUTES}m 手续费</span>
+                          <span className="muted">{aprWindowLabel} 手续费</span>
                           <strong>{row.windowFeeUsd == null ? '—' : formatUsd(row.windowFeeUsd)}</strong>
                         </div>
                         <div title={basisLabel}>
-                          <span className="muted">年化基数 {e.version === 'v4' ? '≈' : ''}</span>
+                          <span className="muted">年化基数 {basis !== 'pool-balance' ? '≈' : ''}</span>
                           <strong>{row.aprLiquidityUsd == null ? '—' : formatUsd(row.aprLiquidityUsd)}</strong>
                         </div>
                         <div>
-                          <span className="muted">锚定 Swap</span>
+                          <span className="muted">{aprWindowLabel} Swap</span>
                           <strong>{row.aprSwapCount == null ? '—' : `${row.aprSwapCount} 笔`}</strong>
                         </div>
                         <div>
