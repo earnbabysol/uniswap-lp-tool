@@ -30,6 +30,7 @@ import { loadGraphApiKey } from './graphSettings'
 import { checkPoolTokensSafe, isHoneypotWhitelisted } from './honeypot'
 import { Q96, getAmountsForPosition, rawToNumber, tickToPrice } from './math'
 import { loadCustomRpcUrl } from './rpcSettings'
+import { classifyRpcError, readLogsAdaptive, runRpcTask } from './rpcScheduler'
 
 /** 动向支持的链 */
 export type FlowChainId = 56 | 4663
@@ -251,6 +252,92 @@ const v4Caches: Record<FlowChainId, V4Cache> = {
   4663: { tip: 0n, events: [], pools: new Map() },
 }
 
+type StoredFlowEvent = Omit<FlowEvent, 'blockNumber'> & { blockNumber?: string }
+type StoredFlowSnapshot = {
+  version: 1
+  savedAt: number
+  v3Tip: string
+  v4Tip: string
+  v3Events: StoredFlowEvent[]
+  v4Events: StoredFlowEvent[]
+}
+
+const FLOW_SNAPSHOT_LIMIT = 600
+const hydratedFlowChains = new Set<FlowChainId>()
+
+function flowSnapshotKey(chainId: FlowChainId): string {
+  return `rangedesk.flow-scan.v1.${chainId}`
+}
+
+function storeFlowEvent(event: FlowEvent): StoredFlowEvent {
+  const { blockNumber, ...rest } = event
+  return { ...rest, blockNumber: blockNumber?.toString() }
+}
+
+function restoreFlowEvent(value: StoredFlowEvent, chainId: FlowChainId): FlowEvent | null {
+  if (
+    !value
+    || value.chainId !== chainId
+    || (value.version !== 'v3' && value.version !== 'v4')
+    || (value.side !== 'in' && value.side !== 'out')
+    || typeof value.id !== 'string'
+    || !Number.isFinite(value.timestamp)
+    || !Number.isFinite(value.amountUsd)
+  ) return null
+  try {
+    return {
+      ...value,
+      blockNumber: value.blockNumber == null ? undefined : BigInt(value.blockNumber),
+    }
+  } catch {
+    return null
+  }
+}
+
+function hydrateFlowSnapshot(chainId: FlowChainId): void {
+  if (hydratedFlowChains.has(chainId)) return
+  hydratedFlowChains.add(chainId)
+  if (typeof localStorage === 'undefined') return
+  try {
+    const raw = localStorage.getItem(flowSnapshotKey(chainId))
+    if (!raw) return
+    const parsed = JSON.parse(raw) as Partial<StoredFlowSnapshot>
+    if (parsed.version !== 1) return
+    const restoreList = (items: StoredFlowEvent[] | undefined, version: FlowVersion) => (
+      Array.isArray(items)
+        ? items
+            .map((item) => restoreFlowEvent(item, chainId))
+            .filter((event): event is FlowEvent => (
+              event != null && event.version === version && isRecentTimestamp(event.timestamp)
+            ))
+        : []
+    )
+    logCaches[chainId].events = restoreList(parsed.v3Events, 'v3')
+    v4Caches[chainId].events = restoreList(parsed.v4Events, 'v4')
+    if (/^\d+$/.test(parsed.v3Tip ?? '')) logCaches[chainId].tip = BigInt(parsed.v3Tip!)
+    if (/^\d+$/.test(parsed.v4Tip ?? '')) v4Caches[chainId].tip = BigInt(parsed.v4Tip!)
+  } catch {
+    // Corrupt or old browser data is simply ignored; a fresh chain scan repairs it.
+  }
+}
+
+function persistFlowSnapshot(chainId: FlowChainId): void {
+  if (typeof localStorage === 'undefined') return
+  try {
+    const snapshot: StoredFlowSnapshot = {
+      version: 1,
+      savedAt: Date.now(),
+      v3Tip: logCaches[chainId].tip.toString(),
+      v4Tip: v4Caches[chainId].tip.toString(),
+      v3Events: logCaches[chainId].events.slice(0, FLOW_SNAPSHOT_LIMIT).map(storeFlowEvent),
+      v4Events: v4Caches[chainId].events.slice(0, FLOW_SNAPSHOT_LIMIT).map(storeFlowEvent),
+    }
+    localStorage.setItem(flowSnapshotKey(chainId), JSON.stringify(snapshot))
+  } catch {
+    // Storage quota/privacy mode must never make live monitoring fail.
+  }
+}
+
 type FlowAprMetric = {
   windowSwapUsd: number
   windowFeeUsd: number
@@ -314,13 +401,6 @@ function flowCoinSide(event: FlowEvent): { address: Address; symbol: string } | 
   // 两边都是山寨时取 token0，方便至少能挂上一条市值
   if (!a0 && !a1) return { address: event.token0, symbol: event.symbol0 }
   return null
-}
-
-function clearFlowMarketCache(chainId: FlowChainId): void {
-  const prefix = `${chainId}:`
-  for (const key of flowMarketCache.keys()) {
-    if (key.startsWith(prefix)) flowMarketCache.delete(key)
-  }
 }
 
 function clearFlowAprCache(chainId: FlowChainId): void {
@@ -391,6 +471,7 @@ function makeClient(chainId: FlowChainId): PublicClient {
 }
 
 function getClient(chainId: FlowChainId): PublicClient {
+  hydrateFlowSnapshot(chainId)
   const c = logCaches[chainId]
   const clientKey = loadCustomRpcUrl(chainId) ?? '<default>'
   // 设置页修改 RPC 后不需要刷新整个页面。
@@ -510,23 +591,11 @@ function errorText(error: unknown): string {
 }
 
 function isRateLimitError(error: unknown): boolean {
-  const lower = errorText(error).toLowerCase()
-  return lower.includes('429') || lower.includes('rate limit')
+  return classifyRpcError(error) === 'rate-limit'
 }
 
-async function retryRateLimited<T>(run: () => Promise<T>): Promise<T> {
-  const delays = [1_200]
-  let lastError: unknown
-  for (let attempt = 0; attempt <= delays.length; attempt += 1) {
-    try {
-      return await run()
-    } catch (error) {
-      lastError = error
-      if (!isRateLimitError(error) || attempt >= delays.length) throw error
-      await new Promise<void>((resolve) => window.setTimeout(resolve, delays[attempt]))
-    }
-  }
-  throw lastError
+async function retryRateLimited<T>(chainId: FlowChainId, run: () => Promise<T>): Promise<T> {
+  return runRpcTask({ chainId, lane: 'read', task: run })
 }
 
 function friendlyErrorText(error: unknown): string {
@@ -925,49 +994,69 @@ type RawV3PoolLog = {
 
 async function fetchNpmLogsRange(
   client: PublicClient,
+  chainId: FlowChainId,
   npm: Address,
   fromBlock: bigint,
   toBlock: bigint,
   span: bigint,
 ): Promise<RawLog[]> {
   if (fromBlock > toBlock) return []
-  const chunks: Array<{ from: bigint; to: bigint }> = []
-  for (let from = fromBlock; from <= toBlock; from += span) {
-    const to = from + span - 1n > toBlock ? toBlock : from + span - 1n
-    chunks.push({ from, to })
-  }
-  const nested = await mapPool(chunks, 2, async ({ from, to }) => {
-    try {
-      const [incs, decs] = await Promise.all([
-        client.getLogs({ address: npm, event: INC_EVENT, fromBlock: from, toBlock: to }),
-        client.getLogs({ address: npm, event: DEC_EVENT, fromBlock: from, toBlock: to }),
-      ])
-      const rows: RawLog[] = []
-      for (const l of incs) {
-        rows.push({
-          args: l.args as { tokenId?: bigint; amount0?: bigint; amount1?: bigint },
-          transactionHash: l.transactionHash,
-          logIndex: l.logIndex ?? 0,
-          blockNumber: l.blockNumber ?? 0n,
-          side: 'in',
-        })
-      }
-      for (const l of decs) {
-        rows.push({
-          args: l.args as { tokenId?: bigint; amount0?: bigint; amount1?: bigint },
-          transactionHash: l.transactionHash,
-          logIndex: l.logIndex ?? 0,
-          blockNumber: l.blockNumber ?? 0n,
-          side: 'out',
-        })
-      }
-      return rows
-    } catch (e) {
-      // 不能把 RPC 失败当作“该分片没有事件”，否则外层会推进 tip 并永久漏单。
-      throw new Error(`V3 日志 ${from.toString()}–${to.toString()}：${friendlyErrorText(e)}`)
+  try {
+    // Read the two event streams in sequence. The shared scheduler still lets
+    // other chains progress, while avoiding a BSC burst at every chunk edge.
+    const incs = await readLogsAdaptive({
+      chainId,
+      fromBlock,
+      toBlock,
+      maxSpan: span,
+      label: 'V3 IncreaseLiquidity logs',
+      request: (from, to) => client.getLogs({
+        address: npm,
+        event: INC_EVENT,
+        fromBlock: from,
+        toBlock: to,
+      }),
+    })
+    const decs = await readLogsAdaptive({
+      chainId,
+      fromBlock,
+      toBlock,
+      maxSpan: span,
+      label: 'V3 DecreaseLiquidity logs',
+      request: (from, to) => client.getLogs({
+        address: npm,
+        event: DEC_EVENT,
+        fromBlock: from,
+        toBlock: to,
+      }),
+    })
+    const rows: RawLog[] = []
+    for (const l of incs) {
+      rows.push({
+        args: l.args as { tokenId?: bigint; amount0?: bigint; amount1?: bigint },
+        transactionHash: l.transactionHash,
+        logIndex: l.logIndex ?? 0,
+        blockNumber: l.blockNumber ?? 0n,
+        side: 'in',
+      })
     }
-  })
-  return nested.flat()
+    for (const l of decs) {
+      rows.push({
+        args: l.args as { tokenId?: bigint; amount0?: bigint; amount1?: bigint },
+        transactionHash: l.transactionHash,
+        logIndex: l.logIndex ?? 0,
+        blockNumber: l.blockNumber ?? 0n,
+        side: 'out',
+      })
+    }
+    return rows
+  } catch (error) {
+    // Never advance the outer scan cursor after a partial RPC failure.
+    throw new Error(
+      `V3 日志 ${fromBlock.toString()}–${toBlock.toString()}：${friendlyErrorText(error)}`,
+      { cause: error },
+    )
+  }
 }
 
 /**
@@ -980,53 +1069,68 @@ async function fetchNpmLogsRange(
  */
 async function fetchV3PoolLogsRange(
   client: PublicClient,
+  chainId: FlowChainId,
   npm: Address,
   fromBlock: bigint,
   toBlock: bigint,
   span: bigint,
 ): Promise<RawV3PoolLog[]> {
   if (fromBlock > toBlock) return []
-  const chunks: Array<{ from: bigint; to: bigint }> = []
-  for (let from = fromBlock; from <= toBlock; from += span) {
-    const to = from + span - 1n > toBlock ? toBlock : from + span - 1n
-    chunks.push({ from, to })
-  }
-  const nested = await mapPool(chunks, 2, async ({ from, to }) => {
-    try {
-      const [mints, burns] = await Promise.all([
-        client.getLogs({ event: V3_POOL_MINT, args: { owner: npm }, fromBlock: from, toBlock: to }),
-        client.getLogs({ event: V3_POOL_BURN, args: { owner: npm }, fromBlock: from, toBlock: to }),
-      ])
-      const rows: RawV3PoolLog[] = []
-      for (const log of mints) {
-        rows.push({
-          pool: log.address,
-          amount0: log.args.amount0 ?? 0n,
-          amount1: log.args.amount1 ?? 0n,
-          transactionHash: log.transactionHash,
-          logIndex: log.logIndex ?? 0,
-          side: 'in',
-        })
-      }
-      for (const log of burns) {
-        rows.push({
-          pool: log.address,
-          amount0: log.args.amount0 ?? 0n,
-          amount1: log.args.amount1 ?? 0n,
-          transactionHash: log.transactionHash,
-          logIndex: log.logIndex ?? 0,
-          side: 'out',
-        })
-      }
-      return rows
-    } catch (error) {
-      if (import.meta.env.DEV) {
-        console.debug(`[flow] V3 pool 日志索引不可用：${friendlyErrorText(error)}`)
-      }
-      return []
+  try {
+    const mints = await readLogsAdaptive({
+      chainId,
+      fromBlock,
+      toBlock,
+      maxSpan: span,
+      label: 'V3 pool Mint logs',
+      request: (from, to) => client.getLogs({
+        event: V3_POOL_MINT,
+        args: { owner: npm },
+        fromBlock: from,
+        toBlock: to,
+      }),
+    })
+    const burns = await readLogsAdaptive({
+      chainId,
+      fromBlock,
+      toBlock,
+      maxSpan: span,
+      label: 'V3 pool Burn logs',
+      request: (from, to) => client.getLogs({
+        event: V3_POOL_BURN,
+        args: { owner: npm },
+        fromBlock: from,
+        toBlock: to,
+      }),
+    })
+    const rows: RawV3PoolLog[] = []
+    for (const log of mints) {
+      rows.push({
+        pool: log.address,
+        amount0: log.args.amount0 ?? 0n,
+        amount1: log.args.amount1 ?? 0n,
+        transactionHash: log.transactionHash,
+        logIndex: log.logIndex ?? 0,
+        side: 'in',
+      })
     }
-  })
-  return nested.flat()
+    for (const log of burns) {
+      rows.push({
+        pool: log.address,
+        amount0: log.args.amount0 ?? 0n,
+        amount1: log.args.amount1 ?? 0n,
+        transactionHash: log.transactionHash,
+        logIndex: log.logIndex ?? 0,
+        side: 'out',
+      })
+    }
+    return rows
+  } catch (error) {
+    if (import.meta.env.DEV) {
+      console.debug(`[flow] V3 pool 日志索引不可用：${friendlyErrorText(error)}`)
+    }
+    return []
+  }
 }
 
 async function resolvePos(
@@ -1491,9 +1595,11 @@ async function fetchNpmFlowLogs(
       }
     }
 
-    const rawLogs = from <= latest ? await fetchNpmLogsRange(client, npm, from, latest, scan.span) : []
+    const rawLogs = from <= latest
+      ? await fetchNpmLogsRange(client, chainId, npm, from, latest, scan.span)
+      : []
     const poolLogs = rawLogs.length > 0
-      ? await fetchV3PoolLogsRange(client, npm, from, latest, scan.span)
+      ? await fetchV3PoolLogsRange(client, chainId, npm, from, latest, scan.span)
       : []
     const stables = [cfg.contracts.stable, ...(cfg.usdStables ?? [])]
 
@@ -1576,6 +1682,7 @@ async function fetchNpmFlowLogs(
 
     cache.events = merged.slice(0, 5_000)
     cache.tip = latest
+    persistFlowSnapshot(chainId)
     pruneChainCaches(chainId)
     return {
       events: cache.events
@@ -1783,6 +1890,7 @@ async function resolveV4PoolsBatch(
 
 async function fetchV4ModifyRange(
   client: PublicClient,
+  chainId: FlowChainId,
   poolManager: Address,
   positionManager: Address,
   fromBlock: bigint,
@@ -1799,35 +1907,37 @@ async function fetchV4ModifyRange(
   blockNumber: bigint
 }>> {
   if (fromBlock > toBlock) return []
-  const chunks: Array<{ from: bigint; to: bigint }> = []
-  for (let from = fromBlock; from <= toBlock; from += span) {
-    const to = from + span - 1n > toBlock ? toBlock : from + span - 1n
-    chunks.push({ from, to })
-  }
-  const nested = await mapPool(chunks, 2, async ({ from, to }) => {
-    try {
-      const logs = await client.getLogs({
+  try {
+    const logs = await readLogsAdaptive({
+      chainId,
+      fromBlock,
+      toBlock,
+      maxSpan: span,
+      label: 'V4 ModifyLiquidity logs',
+      request: (from, to) => client.getLogs({
         address: poolManager,
         event: V4_MODIFY,
         args: { sender: positionManager },
         fromBlock: from,
         toBlock: to,
-      })
-      return logs.map((l) => ({
-        poolId: l.args.id as `0x${string}`,
-        tickLower: Number(l.args.tickLower),
-        tickUpper: Number(l.args.tickUpper),
-        liquidityDelta: l.args.liquidityDelta ?? 0n,
-        salt: (l.args.salt || '0x') as `0x${string}`,
-        transactionHash: l.transactionHash,
-        logIndex: l.logIndex ?? 0,
-        blockNumber: l.blockNumber ?? 0n,
-      }))
-    } catch (e) {
-      throw new Error(`V4 日志 ${from.toString()}–${to.toString()}：${friendlyErrorText(e)}`)
-    }
-  })
-  return nested.flat()
+      }),
+    })
+    return logs.map((log) => ({
+      poolId: log.args.id as `0x${string}`,
+      tickLower: Number(log.args.tickLower),
+      tickUpper: Number(log.args.tickUpper),
+      liquidityDelta: log.args.liquidityDelta ?? 0n,
+      salt: (log.args.salt || '0x') as `0x${string}`,
+      transactionHash: log.transactionHash,
+      logIndex: log.logIndex ?? 0,
+      blockNumber: log.blockNumber ?? 0n,
+    }))
+  } catch (error) {
+    throw new Error(
+      `V4 日志 ${fromBlock.toString()}–${toBlock.toString()}：${friendlyErrorText(error)}`,
+      { cause: error },
+    )
+  }
 }
 
 /** Uniswap V4：扫 PoolManager.ModifyLiquidity（经 PositionManager） */
@@ -1860,6 +1970,7 @@ async function fetchV4FlowLogs(
       from <= latest
         ? await fetchV4ModifyRange(
           client,
+          chainId,
           cfg.contracts.v4PoolManager,
           cfg.contracts.v4PositionManager,
           from,
@@ -1940,6 +2051,7 @@ async function fetchV4FlowLogs(
       .sort((a, b) => b.timestamp - a.timestamp)
     cache.events = merged.slice(0, 5_000)
     cache.tip = latest
+    persistFlowSnapshot(chainId)
     pruneChainCaches(chainId)
     return {
       events: cache.events
@@ -2134,12 +2246,19 @@ async function fetchV3AprSwaps(
   const nested = await mapPool(jobs, 2, async (job) => {
     const address = job.addresses.length === 1 ? job.addresses[0]! : job.addresses
     try {
-      const logs = await retryRateLimited(() => client.getLogs({
-        address,
-        event: V3_SWAP,
+      const logs = await readLogsAdaptive({
+        chainId,
         fromBlock: job.from,
         toBlock: job.to,
-      }))
+        maxSpan: APR_LOG_SPAN[chainId],
+        label: 'V3 Swap logs',
+        request: (from, to) => client.getLogs({
+          address,
+          event: V3_SWAP,
+          fromBlock: from,
+          toBlock: to,
+        }),
+      })
       return logs.map((log) => ({
         pool: log.address,
         amount0: log.args.amount0 ?? 0n,
@@ -2150,12 +2269,19 @@ async function fetchV3AprSwaps(
       // 少数 RPC 不接受 address 数组，退回逐池查询；仍保持块范围受控。
       if (job.addresses.length === 1 || isRateLimitError(error)) throw error
       const fallbackLogs = await mapPool(job.addresses, 3, async (pool) => (
-        retryRateLimited(() => client.getLogs({
-          address: pool,
-          event: V3_SWAP,
+        readLogsAdaptive({
+          chainId,
           fromBlock: job.from,
           toBlock: job.to,
-        }))
+          maxSpan: APR_LOG_SPAN[chainId],
+          label: 'V3 per-pool Swap logs',
+          request: (from, to) => client.getLogs({
+            address: pool,
+            event: V3_SWAP,
+            fromBlock: from,
+            toBlock: to,
+          }),
+        })
       ))
       return fallbackLogs.flat().map((log) => ({
         pool: log.address,
@@ -2192,13 +2318,20 @@ async function fetchV4AprSwaps(
   const nested = await mapPool(jobs, 2, async (job) => {
     const id = job.ids.length === 1 ? job.ids[0]! : job.ids
     try {
-      const logs = await retryRateLimited(() => client.getLogs({
-        address: cfg.contracts.v4PoolManager,
-        event: V4_SWAP,
-        args: { id },
+      const logs = await readLogsAdaptive({
+        chainId,
         fromBlock: job.from,
         toBlock: job.to,
-      }))
+        maxSpan: APR_LOG_SPAN[chainId],
+        label: 'V4 Swap logs',
+        request: (from, to) => client.getLogs({
+          address: cfg.contracts.v4PoolManager,
+          event: V4_SWAP,
+          args: { id },
+          fromBlock: from,
+          toBlock: to,
+        }),
+      })
       return logs.map((log) => ({
         poolId: log.args.id as `0x${string}`,
         amount0: log.args.amount0 ?? 0n,
@@ -2209,13 +2342,20 @@ async function fetchV4AprSwaps(
     } catch (error) {
       if (job.ids.length === 1 || isRateLimitError(error)) throw error
       const fallbackLogs = await mapPool(job.ids, 3, async (poolId) => (
-        retryRateLimited(() => client.getLogs({
-          address: cfg.contracts.v4PoolManager,
-          event: V4_SWAP,
-          args: { id: poolId },
+        readLogsAdaptive({
+          chainId,
           fromBlock: job.from,
           toBlock: job.to,
-        }))
+          maxSpan: APR_LOG_SPAN[chainId],
+          label: 'V4 per-pool Swap logs',
+          request: (from, to) => client.getLogs({
+            address: cfg.contracts.v4PoolManager,
+            event: V4_SWAP,
+            args: { id: poolId },
+            fromBlock: from,
+            toBlock: to,
+          }),
+        })
       ))
       return fallbackLogs.flat().map((log) => ({
         poolId: log.args.id as `0x${string}`,
@@ -2243,17 +2383,17 @@ async function fetchV3AprMetrics(
   let wethUsd: number
   let poolRows: Map<string, PosRow | null>
   try {
-    head = await retryRateLimited(() => getScanHead(client, chainId))
+    head = await retryRateLimited(chainId, () => getScanHead(client, chainId))
   } catch (error) {
     throw new Error(`链头：${friendlyErrorText(error)}`)
   }
   try {
-    wethUsd = await retryRateLimited(() => wethUsdOnChain(client, chainId))
+    wethUsd = await retryRateLimited(chainId, () => wethUsdOnChain(client, chainId))
   } catch (error) {
     throw new Error(`锚定价格：${friendlyErrorText(error)}`)
   }
   try {
-    poolRows = await retryRateLimited(() => resolveV3PoolsBatch(client, chainId, refs))
+    poolRows = await retryRateLimited(chainId, () => resolveV3PoolsBatch(client, chainId, refs))
   } catch (error) {
     throw new Error(`池元数据：${friendlyErrorText(error)}`)
   }
@@ -2271,7 +2411,7 @@ async function fetchV3AprMetrics(
   }
   let balanceResults: UnknownCallResult[]
   try {
-    balanceResults = await retryRateLimited(() =>
+    balanceResults = await retryRateLimited(chainId, () =>
       readBatch(client, candidates.flatMap(({ pool, row }) => [
         { address: row.token0, abi: erc20Abi, functionName: 'balanceOf', args: [pool] },
         { address: row.token1, abi: erc20Abi, functionName: 'balanceOf', args: [pool] },
@@ -2349,9 +2489,9 @@ async function fetchV4AprMetrics(
     ? [[event.poolId.toLowerCase(), event.poolId] as const]
     : [])).values()]
   const [head, wethUsd, poolRows] = await Promise.all([
-    retryRateLimited(() => getScanHead(client, chainId)),
-    retryRateLimited(() => wethUsdOnChain(client, chainId)),
-    retryRateLimited(() => resolveV4PoolsBatch(client, chainId, poolIds)),
+    retryRateLimited(chainId, () => getScanHead(client, chainId)),
+    retryRateLimited(chainId, () => wethUsdOnChain(client, chainId)),
+    retryRateLimited(chainId, () => resolveV4PoolsBatch(client, chainId, poolIds)),
   ])
   const candidates = poolIds.flatMap((poolId) => {
     const row = poolRows.get(poolId.toLowerCase())
@@ -2359,7 +2499,7 @@ async function fetchV4AprMetrics(
   })
   const cfg = CHAIN_CONFIGS[chainId]
   const swaps = await fetchV4AprSwaps(client, chainId, candidates.map(({ poolId }) => poolId), head)
-  const stateResults = await retryRateLimited(() =>
+  const stateResults = await retryRateLimited(chainId, () =>
     readBatch(client, candidates.flatMap(({ poolId }) => [
       {
         address: cfg.contracts.v4StateView,

@@ -17,7 +17,7 @@
 import type { Address } from 'viem'
 import type { PoolInfo, PositionRow, TokenMeta } from './lp'
 import type { TxRecord } from './history'
-import { priceToClosestTick, priceToSqrtPriceX96 } from './math'
+import { priceToClosestTick, priceToSqrtPriceX96, tickToPrice } from './math'
 
 const USDG: TokenMeta = { address: '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168', symbol: 'USDG', decimals: 6 }
 const WETH: TokenMeta = { address: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73', symbol: 'WETH', decimals: 18 }
@@ -28,6 +28,7 @@ const QQQ: TokenMeta = { address: '0xD5f3879160bc7c32ebb4dC785F8a4F505888de68', 
 
 /* 必须是合法的 EIP-55 校验和地址，否则 viem 在详情卡里读余额时会直接抛 */
 export const FIXTURE_ADDRESS = '0x7a16fF8270133F063aAb6C9977183D9e72835428' as Address
+const DLMM_FIXTURE_POOL = '0x8f11111111111111111111111111111111111111' as Address
 
 const DAY = 86_400
 const now = () => Math.floor(Date.now() / 1000)
@@ -147,7 +148,68 @@ function build(s: Spec): PositionRow {
   }
 }
 
-export const FIXTURE_POSITIONS: PositionRow[] = SPECS.map(build)
+function buildDlmmFixture(index: number): PositionRow {
+  const spacing = 60
+  const currentPrice = 178.9
+  const currentTick = priceToClosestTick(currentPrice, NVDA.decimals, USDG.decimals)
+  const activeFloor = Math.floor(currentTick / spacing) * spacing
+  const tickLower = activeFloor - (8 - index * 2) * spacing
+  const tickUpper = tickLower + 2 * spacing
+  const priceLower = tickToPrice(tickLower, NVDA.decimals, USDG.decimals)
+  const priceUpper = tickToPrice(tickUpper, NVDA.decimals, USDG.decimals)
+  const amountUsd = 2_400 + index * 680
+  const unclaimedUsd = 18 + index * 7.5
+  const claimedUsd = 12 + index * 4
+  const costBasisUsd = amountUsd * 1.04
+  return {
+    version: 'v3',
+    tokenId: BigInt(24_100 + index),
+    dex: 'uniswap',
+    dexLabel: 'Uniswap',
+    token0: NVDA,
+    token1: USDG,
+    fee: 3000,
+    tickLower,
+    tickUpper,
+    liquidity: u(amountUsd * 4.2, 18),
+    tick: currentTick,
+    inRange: false,
+    priceLower,
+    priceUpper,
+    price: currentPrice,
+    amount0: 0n,
+    amount1: u(amountUsd, USDG.decimals),
+    fees0: 0n,
+    fees1: u(unclaimedUsd, USDG.decimals),
+    amount0Usd: 0,
+    amount1Usd: amountUsd,
+    fees0Usd: 0,
+    fees1Usd: unclaimedUsd,
+    totalUsd: amountUsd,
+    pct0: 0,
+    pct1: 100,
+    claimed0: 0n,
+    claimed1: u(claimedUsd, USDG.decimals),
+    claimedFeesUsd: claimedUsd,
+    totalFeesUsd: unclaimedUsd + claimedUsd,
+    costBasisUsd,
+    cashOutUsd: claimedUsd,
+    pnlUsd: amountUsd + unclaimedUsd + claimedUsd - costBasisUsd,
+    pnlReady: true,
+    pnlQuality: 'historical',
+    openedAt: now() - (11 + index) * DAY,
+    ageDays: 11 + index,
+    feeAprPct: 16 + index * 2.4,
+    poolAddress: DLMM_FIXTURE_POOL,
+    tickSpacing: spacing,
+    sqrtPriceX96: priceToSqrtPriceX96(currentPrice, NVDA.decimals, USDG.decimals),
+  }
+}
+
+export const FIXTURE_POSITIONS: PositionRow[] = [
+  ...SPECS.map(build),
+  ...Array.from({ length: 4 }, (_, index) => buildDlmmFixture(index)),
+]
 
 /*
  * 建仓页的「已选池」夹具。

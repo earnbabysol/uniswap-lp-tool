@@ -18,13 +18,6 @@ import {
 import { loadCustomRpcUrl } from './rpcSettings'
 import { getActiveAccount, type LocalAccount } from './signer'
 
-function getReadRpcUrls(): string[] {
-  const cfg = getActiveChainConfig()
-  const custom = loadCustomRpcUrl(cfg.id)
-  if (custom) return [custom]
-  return [...cfg.defaultRpcUrls]
-}
-
 /**
  * 只读 transport。
  * Arc 主网几乎没有可用公共 RPC（thirdweb 只能 eth_chainId），所以有钱包时优先走

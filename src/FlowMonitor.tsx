@@ -338,6 +338,9 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
   const pools = useMemo(() => {
     const grouped = new Map<string, FlowPoolRow>()
     for (const event of events) {
+      // 切换单链时，旧请求可能仍在结束阶段；UI 必须立刻隐藏另一条链的缓存，
+      // 不能让“BSC”筛选短暂显示 Robinhood 行。
+      if (chainFilter !== 'both' && event.chainId !== chainFilter) continue
       if (versionFilter !== 'all' && event.version !== versionFilter) continue
       const poolRef = flowPoolRef(event)
       const key = `${event.chainId}:${event.version}:${poolRef.toLowerCase()}`
@@ -389,7 +392,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
       }
     }
     return [...grouped.values()]
-  }, [events, versionFilter])
+  }, [chainFilter, events, versionFilter])
 
   const visible = useMemo(() => {
     const query = search.trim().toLowerCase()
@@ -684,7 +687,9 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
               const expanded = expandedKey === row.key
               const detailId = `flow-pool-detail-${index}`
               const pairLabel = `${e.symbol0} / ${e.symbol1}`
-              const basisLabel = row.aprBasis === 'active-liquidity'
+              const basis = row.aprBasis
+                ?? (e.version === 'v4' ? 'active-liquidity' : 'pool-balance')
+              const basisLabel = basis === 'active-liquidity'
                 ? 'V4 当前活跃流动性深度（估算）'
                 : 'V3 当前池合约余额（锚定侧估值）'
               return (

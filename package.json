@@ -7,6 +7,10 @@
     "dev": "vite",
     "build": "vite build",
     "test:pnl": "node scripts/pnl-accounting.test.mjs",
+    "test:rpc": "node scripts/rpc-scheduler.test.mjs",
+    "test:dlmm": "node scripts/dlmm-distribution.test.mjs",
+    "test:dlmm-groups": "node scripts/dlmm-groups.test.mjs",
+    "test": "npm run test:pnl && npm run test:rpc && npm run test:dlmm && npm run test:dlmm-groups",
     "typecheck": "tsc -b",
     "lint": "oxlint",
     "preview": "vite preview"

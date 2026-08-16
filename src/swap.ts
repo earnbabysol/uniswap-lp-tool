@@ -120,8 +120,7 @@ async function quoteV3ExactIn(opts: {
           sqrtPriceLimitX96: 0n,
         }],
       })
-      const amountOut = Array.isArray(result) ? (result[0] as bigint) : (result as bigint)
-      return amountOut
+      return result[0]
     }
     const { result } = await publicClient.simulateContract({
       address: CONTRACTS.v3Quoter,
@@ -152,8 +151,7 @@ async function quoteV4ExactIn(opts: {
         hookData: '0x',
       }],
     })
-    const amountOut = Array.isArray(result) ? (result[0] as bigint) : (result as bigint)
-    return amountOut
+    return result[0]
   } catch {
     return null
   }

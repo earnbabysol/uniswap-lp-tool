@@ -18,13 +18,16 @@ import {
 import {
   claimV3,
   claimV4,
+  claimV3PositionBatch,
+  claimV4PositionBatch,
   claimAndCompound,
+  closeV3PositionBatch,
+  closeV4PositionBatch,
   createV3PoolAndSeed,
   createV4PoolAndSeed,
   describeFullRange,
   describeRange,
   discoverPoolsByToken,
-  findV3Pool,
   findBestV3Pool,
   findV4Pool,
   formatAmount,
@@ -51,13 +54,14 @@ import {
   reanchorRangeToLiveSpot,
   remapMintAmountsForRange,
   mintV3Position,
+  mintV3DlmmPositions,
   mintV4Position,
+  mintV4DlmmPositions,
   pairHasWeth,
   recordPositionClaim,
   removeV3Liquidity,
   removeV4Liquidity,
   rebalanceV3,
-  resolveTokenMeta,
   scanV3Pools,
   scanV4Pools,
   ticksFromCoinPrices,
@@ -81,7 +85,7 @@ import { RangeDepthChart } from './RangeDepthChart'
 import { PositionDetailCard, estimateRebalanceHalfPercent } from './PositionDetailCard'
 import { PositionLegs } from './PositionLegs'
 import { quotePoolSwap, swapInPool, type PoolSwapQuote } from './swap'
-import { parseAmount, formatAge, formatPrice, formatUsd, pairAmountForRange, neededMintSide, formatAmountExact, priceToClosestTick, priceToSqrtPriceX96, tickToPrice } from './math'
+import { parseAmount, formatPrice, formatUsd, pairAmountForRange, neededMintSide, formatAmountExact, priceToClosestTick, priceToSqrtPriceX96, tickToPrice } from './math'
 import { withTimeout } from './async'
 import {
   connectWallet,
@@ -123,7 +127,7 @@ import {
   designMode,
   designSignerMode,
 } from './fixtures'
-import { usePersistentState, useTheme, type ThemeMode } from './prefs'
+import { usePersistentState, useTheme, writePref, type ThemeMode } from './prefs'
 import {
   ConfirmDialog,
   InfoHint,
@@ -134,6 +138,23 @@ import {
 } from './ui'
 import { TokenPicker, type TokenOption } from './TokenPicker'
 import FlowMonitor from './FlowMonitor'
+import DlmmMode, { type DlmmMintRequest } from './DlmmMode'
+import DlmmPositionsPanel from './DlmmPositionsPanel'
+import {
+  allocateDlmmAmount,
+  buildEvmDlmmPlan,
+  buildEvmDlmmTranches,
+  type DlmmSide,
+} from './dlmm'
+import {
+  attachDlmmGroupTokenIds,
+  createDlmmGroupRecord,
+  forgetDlmmGroupRecord,
+  loadDlmmGroupRecords,
+  resolveDlmmPositionGroups,
+  upsertDlmmGroupRecord,
+  type DlmmPositionGroup,
+} from './dlmmGroups'
 import type { FlowChainId, FlowVersion } from './flowEvents'
 import {
   describeGraphApiKey,
@@ -148,7 +169,7 @@ type SortKey = 'value' | 'fees' | 'pnl' | 'pair' | 'apr' | 'risk'
 type FilterKey = 'all' | 'in' | 'out' | 'v3' | 'v4' | 'risk'
 type RangeMode = 'percent' | 'custom' | 'full'
 type Density = 'cozy' | 'compact'
-type TabKey = 'positions' | 'mint' | 'tools' | 'auto' | 'history' | 'flow'
+type TabKey = 'positions' | 'mint' | 'dlmm' | 'tools' | 'auto' | 'history' | 'flow'
 
 const REFRESH_OPTIONS = [30, 60, 180, 600] as const
 
@@ -156,6 +177,7 @@ const REFRESH_OPTIONS = [30, 60, 180, 600] as const
 const NAV_ITEMS: { key: TabKey; label: string; icon: string; hotkey: string; blurb: string }[] = [
   { key: 'positions', label: '仓位', icon: '▤', hotkey: '1', blurb: '在管仓位、手续费与区间状态' },
   { key: 'mint', label: '新建仓', icon: '＋', hotkey: '2', blurb: '选池、定区间、自动配平并建仓' },
+  { key: 'dlmm', label: 'DLMM', icon: '▥', hotkey: '7', blurb: '低价分批买入或高价分批卖出' },
   { key: 'tools', label: '工具', icon: '⚒', hotkey: '3', blurb: '批量操作与链上辅助查询' },
   { key: 'auto', label: '自动化', icon: '◈', hotkey: '4', blurb: '本地私钥签名与自动复投 / Rebalance' },
   { key: 'history', label: '交易历史', icon: '⇅', hotkey: '5', blurb: '本机记录的交易与浏览器链接' },
@@ -357,7 +379,10 @@ export default function App() {
     decimals: 18,
   })
 
-  const [tab, setTab] = useState<TabKey>('positions')
+  const [tab, setTab] = useState<TabKey>(() => {
+    const requested = new URLSearchParams(window.location.search).get('tab')
+    return NAV_ITEMS.some((item) => item.key === requested) ? requested as TabKey : 'positions'
+  })
   /** 签名方式：'wallet' 插件钱包 / 'local' 本地私钥。两者互斥 */
   const [signerMode, setSignerMode] = useState<'none' | 'wallet' | 'local'>('none')
   const [localAddr, setLocalAddr] = useState<Address | null>(null)
@@ -368,9 +393,17 @@ export default function App() {
   const [autoLastRunAt, setAutoLastRunAt] = useState<number | null>(null)
   const [autoNextIn, setAutoNextIn] = useState<number | null>(null)
   const [positions, setPositions] = useState<PositionRow[]>([])
+  const [dlmmGroupRecords, setDlmmGroupRecords] = useState(() => loadDlmmGroupRecords())
   const [percentLower, setPercentLower] = useState(-5)
   const [percentUp, setPercentUp] = useState(5)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+
+  useEffect(() => {
+    const url = new URL(window.location.href)
+    if (tab === 'positions') url.searchParams.delete('tab')
+    else url.searchParams.set('tab', tab)
+    window.history.replaceState(null, '', url)
+  }, [tab])
   const [slippageBps, setSlippageBps] = usePersistentState('slippageBps', 300)
   /** V4 山寨币转账税（bps）。0.25%=25；GoPlus 对 MEOW 类约 1% 会自动填 ~100 */
   const [transferTaxBps, setTransferTaxBps] = useState(0)
@@ -474,6 +507,23 @@ export default function App() {
     () => positions.find((p) => `${p.version}-${p.tokenId}` === selectedId) ?? null,
     [positions, selectedId],
   )
+
+  const dlmmPositionGroups = useMemo(
+    () => resolveDlmmPositionGroups(dlmmGroupRecords, positions, chainId, address),
+    [dlmmGroupRecords, positions, chainId, address],
+  )
+
+  useEffect(() => {
+    if (!address || positions.length === 0) return
+    const before = dlmmGroupRecords
+      .flatMap((record) => record.bands.map((band) => band.tokenId ?? ''))
+      .join('|')
+    const next = attachDlmmGroupTokenIds(dlmmGroupRecords, positions, chainId, address)
+    const after = next
+      .flatMap((record) => record.bands.map((band) => band.tokenId ?? ''))
+      .join('|')
+    if (before !== after) setDlmmGroupRecords(next)
+  }, [address, chainId, dlmmGroupRecords, positions])
 
   useEffect(() => {
     if (!selectedId) return
@@ -865,8 +915,6 @@ export default function App() {
     }
     const started = Date.now()
     const partial: string[] = []
-    let v3: PositionRow[] | null = null
-    let v4: PositionRow[] | null = null
     /** 本轮拿到的完整快照，给自动化用（两侧都失败时为空） */
     let merged: PositionRow[] = []
     try {
@@ -883,7 +931,6 @@ export default function App() {
       const v3P = withTimeout(loadV3Positions(address), deep ? 90_000 : 35_000, 'V3 仓位')
         .then((rows) => {
           if (!stillCurrent()) return null
-          v3 = rows
           setPositions((prev) => {
             const keepV4 = prev.filter((p) => p.version === 'v4')
             return [...rows, ...keepV4]
@@ -908,7 +955,6 @@ export default function App() {
       )
         .then((rows) => {
           if (!stillCurrent()) return null
-          v4 = rows
           setPositions((prev) => {
             const keepV3 = prev.filter((p) => p.version === 'v3')
             return [...keepV3, ...rows]
@@ -922,7 +968,7 @@ export default function App() {
           return null
         })
 
-      await Promise.all([v3P, v4P])
+      const [v3, v4] = await Promise.all([v3P, v4P])
       if (!stillCurrent()) return []
 
       setPositions((prev) => {
@@ -1197,6 +1243,7 @@ export default function App() {
       else if (e.key === '4') setTab('auto')
       else if (e.key === '5') setTab('history')
       else if (e.key === '6') setTab('flow')
+      else if (e.key === '7') setTab('dlmm')
       else if (e.key === 'r' || e.key === 'R') {
         if (address) void refreshPositions({ silent: false })
       } else if (e.key === '/') {
@@ -1601,8 +1648,12 @@ export default function App() {
         : info.tickSpacing
           ? ` · spacing ${info.tickSpacing}`
           : ''
+      const hooksNote =
+        info.version === 'v4' && (!info.hooks || info.hooks === '0x0000000000000000000000000000000000000000')
+          ? ' · hooks 空（若币种限制 PoolManager 结算，可能无法组 LP）'
+          : ''
       setStatus(
-        `已加载 ${tag} · ${q.coin.symbol}/${q.quote.symbol} · Fee ${feePct}%${spacingNote} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`,
+        `已加载 ${tag} · ${q.coin.symbol}/${q.quote.symbol} · Fee ${feePct}%${spacingNote}${hooksNote} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`,
       )
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e))
@@ -1863,9 +1914,6 @@ export default function App() {
    */
   const findToken = (addr: Address) =>
     tokenOptions.find((x) => x.addr.toLowerCase() === addr?.toLowerCase())
-
-  /** <select> 用的值：解析成选项里的原始大小写，否则选中态会丢 */
-  const tokenSelectValue = (addr: Address) => findToken(addr)?.addr ?? addr
 
   const tokenDecimals = (addr: Address) => {
     const known = KNOWN_TOKENS[addr?.toLowerCase()]?.decimals
@@ -2696,6 +2744,473 @@ export default function App() {
     }
   }, [pool, amount0, amount1, showBal0, showBal1])
 
+  /**
+   * 经典建仓和 DLMM 模式共用同一条真实 Mint 链路。
+   * 这样单边 Bid / Ask 不是另写一套「看起来能点」的逻辑：刷新现价、过期区间重锚、
+   * V4 税币垫付和错误翻译都与原建仓页保持一致。
+   */
+  const startMintPosition = (opts: {
+    targetPool: PoolInfo
+    tickLower: number
+    tickUpper: number
+    coinPriceLower: number
+    coinPriceUpper: number
+    input0: string
+    input1: string
+    actionLabel: string
+    dlmm?: {
+      side: DlmmSide
+      binCount: number
+      gapBins: number
+      depositTokenIndex: 0 | 1
+    }
+    afterSuccess?: () => void
+  }) => {
+    const {
+      targetPool,
+      tickLower,
+      tickUpper,
+      coinPriceLower,
+      coinPriceUpper,
+      input0,
+      input1,
+      actionLabel,
+      dlmm,
+      afterSuccess,
+    } = opts
+    const raw0 = parseAmount(input0 || '0', targetPool.token0.decimals)
+    const raw1 = parseAmount(input1 || '0', targetPool.token1.decimals)
+    if (raw0 === 0n && raw1 === 0n) {
+      setStatus('请先输入数量')
+      return
+    }
+
+    const plannedTick = targetPool.tick
+    const plannedSpot = getCoinQuote(targetPool).spot
+    const isV4 = targetPool.version === 'v4'
+    void run(actionLabel, async () => {
+      const live = isV4
+        ? (targetPool.hooks != null && targetPool.tickSpacing
+          ? await loadV4Pool({
+              currency0: targetPool.token0.address,
+              currency1: targetPool.token1.address,
+              fee: targetPool.fee,
+              tickSpacing: targetPool.tickSpacing,
+              hooks: targetPool.hooks,
+            })
+          : await findV4Pool(targetPool.token0.address, targetPool.token1.address, targetPool.fee).then((next) => {
+              if (!next) throw new Error('刷新 V4 池失败')
+              return next
+            }))
+        : await loadV3Pool(targetPool.poolAddress!)
+      setPool(live)
+
+      let useLower = tickLower
+      let useUpper = tickUpper
+      let mint0 = parseAmount(input0 || '0', live.token0.decimals)
+      let mint1 = parseAmount(input1 || '0', live.token1.decimals)
+
+      if (dlmm) {
+        // DLMM 模式的范围语义是「相对最新 active tick 的 N 个 bins」。
+        // 每次提交都重新生成，而不是等价格真的闯进旧区间才处理，确保 Bid/Ask 永远保持单边。
+        const freshPlan = buildEvmDlmmPlan(live, dlmm.side, dlmm.binCount, dlmm.gapBins)
+        if (freshPlan.depositTokenIndex !== dlmm.depositTokenIndex) {
+          throw new Error('池子币种方向已变化，请刷新页面后重新确认 Bid / Ask')
+        }
+        useLower = freshPlan.tickLower
+        useUpper = freshPlan.tickUpper
+        if (freshPlan.depositTokenIndex === 0) mint1 = 0n
+        else mint0 = 0n
+        setStatus(
+          `已按最新池价锁定 ${dlmm.side === 'bid' ? 'Bid' : 'Ask'}：${formatPrice(freshPlan.coinPriceLower)} – ${formatPrice(freshPlan.coinPriceUpper)}，继续创建…`,
+        )
+      } else if (isOneSidedRangeStale({
+        plannedTick,
+        liveTick: live.tick,
+        tickLower: useLower,
+        tickUpper: useUpper,
+      })) {
+        const fresh = reanchorRangeToLiveSpot({
+          livePool: live,
+          plannedSpot,
+          coinLower: coinPriceLower,
+          coinUpper: coinPriceUpper,
+        })
+        if (!fresh) throw new Error('现价已变化且无法自动重设区间，请刷新后重新确认')
+        useLower = fresh.tickLower
+        useUpper = fresh.tickUpper
+        const remapped = remapMintAmountsForRange({
+          sqrtPriceX96: live.sqrtPriceX96,
+          tickLower: useLower,
+          tickUpper: useUpper,
+          amount0: mint0,
+          amount1: mint1,
+          liveTick: live.tick,
+        })
+        mint0 = remapped.amount0
+        mint1 = remapped.amount1
+        if (mint0 <= 0n && mint1 <= 0n) {
+          throw new Error('自动重设区间后数量无效，请重新输入数量')
+        }
+        // 同步经典建仓页，方便失败后切回去核对精确 ticks / 数量。
+        setRangeMode('custom')
+        setPriceLo(formatPrice(fresh.coinPriceLower))
+        setPriceHi(formatPrice(fresh.coinPriceUpper))
+        setAmount0(formatAmountExact(mint0, live.token0.decimals))
+        setAmount1(formatAmountExact(mint1, live.token1.decimals))
+        setStatus(
+          `现价已变，已把单边区间重锚到 ${formatPrice(fresh.coinPriceLower)} – ${formatPrice(fresh.coinPriceUpper)}，继续创建…`,
+        )
+      }
+
+      if (isV4) {
+        return mintV4Position({
+          walletClient: wallet!,
+          owner: address!,
+          pool: live,
+          amount0: mint0,
+          amount1: mint1,
+          tickLower: useLower,
+          tickUpper: useUpper,
+          useNativeEth: mintUseEth,
+          slippageBps,
+          transferTaxBps0: mintTransferTax.tax0,
+          transferTaxBps1: mintTransferTax.tax1,
+          strictSingleSidedToken: dlmm
+            ? targetPool[dlmm.depositTokenIndex === 0 ? 'token0' : 'token1'].address
+            : undefined,
+          onStatus: setStatus,
+        })
+      }
+      return mintV3Position({
+        walletClient: wallet!,
+        owner: address!,
+        pool: live,
+        amount0: mint0,
+        amount1: mint1,
+        tickLower: useLower,
+        tickUpper: useUpper,
+        useNativeEth: mintUseEth,
+        slippageBps,
+        strictSingleSidedToken: dlmm
+          ? targetPool[dlmm.depositTokenIndex === 0 ? 'token0' : 'token1'].address
+          : undefined,
+        onStatus: setStatus,
+      })
+    }, `${targetPool.token0.symbol}/${targetPool.token1.symbol}`, { afterSuccess })
+  }
+
+  const startDlmmMint = (request: DlmmMintRequest) => {
+    if (!pool) return
+    const sideLabel = request.side === 'bid' ? 'Bid' : 'Ask'
+    if (request.executionMode === 'multi') {
+      const sourcePool = pool
+      const sourceAmount0 = parseAmount(request.amount0 || '0', sourcePool.token0.decimals)
+      const sourceAmount1 = parseAmount(request.amount1 || '0', sourcePool.token1.decimals)
+      const totalAmount = request.plan.depositTokenIndex === 0 ? sourceAmount0 : sourceAmount1
+      void run(
+        `批量创建 ${request.trancheCount} 档 ${sideLabel} · ${sourcePool.version.toUpperCase()}`,
+        async () => {
+          const live = sourcePool.version === 'v4'
+            ? (sourcePool.hooks != null && sourcePool.tickSpacing
+              ? await loadV4Pool({
+                  currency0: sourcePool.token0.address,
+                  currency1: sourcePool.token1.address,
+                  fee: sourcePool.fee,
+                  tickSpacing: sourcePool.tickSpacing,
+                  hooks: sourcePool.hooks,
+                })
+              : await findV4Pool(
+                  sourcePool.token0.address,
+                  sourcePool.token1.address,
+                  sourcePool.fee,
+                ).then((next) => {
+                  if (!next) throw new Error('刷新 V4 池失败')
+                  return next
+                }))
+            : await loadV3Pool(sourcePool.poolAddress!)
+          setPool(live)
+          const freshPlan = buildEvmDlmmPlan(
+            live,
+            request.side,
+            request.plan.binCount,
+            request.plan.gapBins,
+          )
+          if (freshPlan.depositTokenIndex !== request.plan.depositTokenIndex) {
+            throw new Error('池子币种方向已变化，请刷新后重新确认 Bid / Ask')
+          }
+          const tranches = buildEvmDlmmTranches(
+            live,
+            freshPlan,
+            request.shape,
+            request.trancheCount,
+          )
+          if (tranches.length < 2) throw new Error('当前范围不足以拆成多档，请增加 Bin 数')
+          const allocations = allocateDlmmAmount(totalAmount, tranches)
+          if (allocations.some((amount) => amount <= 0n)) {
+            throw new Error('数量太小，无法分配到全部档位；请增加数量或减少档位')
+          }
+          const bands = tranches.map((tranche, index) => ({
+            tickLower: tranche.tickLower,
+            tickUpper: tranche.tickUpper,
+            amount0: freshPlan.depositTokenIndex === 0 ? allocations[index]! : 0n,
+            amount1: freshPlan.depositTokenIndex === 1 ? allocations[index]! : 0n,
+          }))
+          setStatus(
+            `已按最新价格重建 ${bands.length} 档 ${sideLabel}，准备一笔原子批量 Mint…`,
+          )
+          const strictToken = sourcePool[
+            request.plan.depositTokenIndex === 0 ? 'token0' : 'token1'
+          ].address
+          const result = live.version === 'v4'
+            ? await mintV4DlmmPositions({
+              walletClient: wallet!,
+              owner: address!,
+              pool: live,
+              bands,
+              useNativeEth: mintUseEth,
+              slippageBps,
+              transferTaxBps0: mintTransferTax.tax0,
+              transferTaxBps1: mintTransferTax.tax1,
+              strictSingleSidedToken: strictToken,
+              onStatus: setStatus,
+            })
+            : await mintV3DlmmPositions({
+              walletClient: wallet!,
+              owner: address!,
+              pool: live,
+              bands,
+              useNativeEth: mintUseEth,
+              slippageBps,
+              strictSingleSidedToken: strictToken,
+              onStatus: setStatus,
+            })
+          const record = createDlmmGroupRecord({
+            chainId,
+            owner: address!,
+            pool: result.pool,
+            side: request.side,
+            shape: request.shape,
+            binCount: freshPlan.binCount,
+            gapBins: freshPlan.gapBins,
+            txHash: result.hash,
+            bands: result.bands,
+          })
+          setDlmmGroupRecords((previous) => upsertDlmmGroupRecord(previous, record))
+          return result
+        },
+        `${sourcePool.token0.symbol}/${sourcePool.token1.symbol}`,
+        {
+          afterSuccess: () => {
+            setAmount0('')
+            setAmount1('')
+            setTab('positions')
+          },
+        },
+      )
+      return
+    }
+    startMintPosition({
+      targetPool: pool,
+      tickLower: request.plan.tickLower,
+      tickUpper: request.plan.tickUpper,
+      coinPriceLower: request.plan.coinPriceLower,
+      coinPriceUpper: request.plan.coinPriceUpper,
+      input0: request.amount0,
+      input1: request.amount1,
+      actionLabel: `创建 ${sideLabel} · ${pool.version.toUpperCase()}`,
+      dlmm: {
+        side: request.side,
+        binCount: request.plan.binCount,
+        gapBins: request.plan.gapBins,
+        depositTokenIndex: request.plan.depositTokenIndex,
+      },
+      afterSuccess: () => {
+        setAmount0('')
+        setAmount1('')
+        setTab('positions')
+      },
+    })
+  }
+
+  const collectDlmmGroup = (group: DlmmPositionGroup) => {
+    if (group.positions.length < 2) return
+    const value = group.positions.reduce((sum, position) => sum + position.totalUsd, 0)
+    const fees = group.positions.reduce(
+      (sum, position) => sum + position.fees0Usd + position.fees1Usd,
+      0,
+    )
+    confirmThen({
+      title: `批量领取 ${group.positions.length} 档手续费？`,
+      lines: [
+        `${group.pair} · ${group.version.toUpperCase()} · 组合价值 ${formatUsd(value)}`,
+        `当前未领约 ${formatUsd(fees)}，所有档位会在同一笔交易中领取。`,
+        '任一 NFT 执行失败时整笔回滚，不会出现只领取一半的状态。',
+      ],
+      confirmLabel: `领取 ${group.positions.length} 档`,
+    }, () => {
+      void run(`批量领取 ${group.positions.length} 档`, async () => {
+        const sample = group.positions[0]!
+        const unwrapEth = useNativeEth
+          && pairHasWeth(sample.token0.address, sample.token1.address)
+        const hash = group.version === 'v4'
+          ? await claimV4PositionBatch({
+            walletClient: wallet!,
+            owner: address!,
+            positions: group.positions,
+            onStatus: setStatus,
+          })
+          : await claimV3PositionBatch({
+            walletClient: wallet!,
+            owner: address!,
+            positions: group.positions,
+            unwrapEth,
+          })
+        const wethUsd = await getWethUsdPrice().catch(() => 0)
+        const claimed = new Map(group.positions.map((position) => {
+          const next = recordPositionClaim(position, wethUsd, 'collect')
+          return [`${next.version}-${next.tokenId}`, next] as const
+        }))
+        setPositions((previous) => previous.map((position) => (
+          claimed.get(`${position.version}-${position.tokenId}`) ?? position
+        )))
+        return { hash }
+      }, group.pair)
+    })
+  }
+
+  const closeDlmmGroup = (group: DlmmPositionGroup) => {
+    if (group.positions.length < 2) return
+    const value = group.positions.reduce((sum, position) => sum + position.totalUsd, 0)
+    const fees = group.positions.reduce(
+      (sum, position) => sum + position.fees0Usd + position.fees1Usd,
+      0,
+    )
+    confirmThen({
+      title: `一键退出 ${group.positions.length} 档 DLMM？`,
+      lines: [
+        `${group.pair} · ${group.version.toUpperCase()} · 当前价值约 ${formatUsd(value)}`,
+        `未领手续费约 ${formatUsd(fees)} 会一并取回。`,
+        group.missingBandCount > 0
+          ? `本地计划有 ${group.plannedBandCount} 档，本次只退出当前识别到的 ${group.positions.length} 档。`
+          : `将销毁 ${group.positions.length} 个 NFT；任意一档失败会整笔回滚。`,
+        `退出最小到账按当前估算和 ${(slippageBps / 100).toFixed(2)}% 滑点保护。`,
+      ],
+      confirmLabel: `全撤并销毁 ${group.positions.length} 档`,
+      danger: true,
+    }, () => {
+      void run(`一键退出 ${group.positions.length} 档`, async () => {
+        const sample = group.positions[0]!
+        const unwrapEth = useNativeEth
+          && pairHasWeth(sample.token0.address, sample.token1.address)
+        const hash = group.version === 'v4'
+          ? await closeV4PositionBatch({
+            walletClient: wallet!,
+            owner: address!,
+            positions: group.positions,
+            slippageBps,
+            onStatus: setStatus,
+          })
+          : await closeV3PositionBatch({
+            walletClient: wallet!,
+            owner: address!,
+            positions: group.positions,
+            slippageBps,
+            unwrapEth,
+          })
+        const selectedKey = selected ? `${selected.version}:${selected.tokenId}` : ''
+        if (group.positions.some((position) => `${position.version}:${position.tokenId}` === selectedKey)) {
+          setSelectedId(null)
+        }
+        return { hash }
+      }, group.pair)
+    })
+  }
+
+  const previewDlmmReopen = (group: DlmmPositionGroup) => {
+    const sample = group.positions[0]
+    if (!sample) return
+    void (async () => {
+      setBusy(true)
+      setStatus('刷新池价并生成 DLMM 重挂预览…')
+      try {
+        const info: PoolInfo = import.meta.env.DEV && designMode()
+          ? {
+            version: sample.version,
+            poolAddress: sample.poolAddress,
+            poolId: sample.poolId,
+            token0: sample.token0,
+            token1: sample.token1,
+            fee: sample.fee,
+            tickSpacing: sample.tickSpacing,
+            tick: sample.tick,
+            sqrtPriceX96: sample.sqrtPriceX96,
+            price: sample.price,
+            liquidity: group.positions.reduce((sum, position) => sum + position.liquidity, 0n),
+            hooks: sample.hooks,
+          }
+          : sample.version === 'v3'
+            ? await loadV3Pool(sample.poolAddress!)
+            : sample.hooks != null && sample.tickSpacing
+              ? await loadV4Pool({
+                currency0: sample.token0.address,
+                currency1: sample.token1.address,
+                fee: sample.fee,
+                tickSpacing: sample.tickSpacing,
+                hooks: sample.hooks,
+              })
+              : await loadV4PoolById(sample.poolId!)
+        const prices = group.positions.map(getPositionCoinPrices)
+        const lower = Math.min(...prices.map((price) => price.coinPriceLower))
+        const upper = Math.max(...prices.map((price) => price.coinPriceUpper))
+        const midpoint = (lower + upper) / 2
+        const side: DlmmSide = group.record?.side ?? (midpoint <= prices[0]!.coinPrice ? 'bid' : 'ask')
+        const derivedBins = Math.max(
+          1,
+          Math.round((Math.max(...group.positions.map((position) => position.tickUpper))
+            - Math.min(...group.positions.map((position) => position.tickLower))) / info.tickSpacing),
+        )
+    writePref('dlmmSide', side)
+    writePref('dlmmRangePreset', 'custom')
+        writePref('dlmmExecutionMode', 'multi')
+        writePref('dlmmShape', group.record?.shape ?? 'bid-ask')
+        writePref('dlmmTrancheCount', Math.min(12, Math.max(2, group.plannedBandCount)))
+        writePref('dlmmBinCount', group.record?.binCount ?? derivedBins)
+        writePref('dlmmGapBins', group.record?.gapBins ?? 0)
+        setPool(info)
+        setPoolInput(sample.version === 'v3' ? sample.poolAddress ?? '' : sample.poolId ?? '')
+        setMintProtocol(sample.version)
+        setTokenA(info.token0.address)
+        setTokenB(info.token1.address)
+        setFee(info.fee)
+        if (info.version === 'v4') setV4TickSpacing(info.tickSpacing)
+        setTab('dlmm')
+        setStatus(
+          `已按最新价格生成 ${side === 'bid' ? 'Bid' : 'Ask'} 重挂预览；原组合尚未撤出，不会自动重复投入。`,
+        )
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : String(error))
+      } finally {
+        setBusy(false)
+      }
+    })()
+  }
+
+  const forgetDlmmGroup = (group: DlmmPositionGroup) => {
+    if (!group.record) return
+    confirmThen({
+      title: '忽略这条 DLMM 组合记录？',
+      lines: [
+        `${group.pair} · ${group.plannedBandCount} 档`,
+        '只删除本浏览器的组合标签，不会操作、转移或销毁链上 NFT。连续仓位仍可能被自动识别。',
+      ],
+      confirmLabel: '仅删除本地记录',
+    }, () => {
+      setDlmmGroupRecords((previous) => forgetDlmmGroupRecord(previous, group.id))
+      pushToast({ kind: 'info', title: '已删除本地组合记录', detail: group.pair })
+    })
+  }
+
   const selectedUsesWeth = selected ? pairHasWeth(selected.token0.address, selected.token1.address) : false
   const addUseEth = useNativeEth && selectedUsesWeth
   const addNeedSide = selected
@@ -3182,6 +3697,16 @@ export default function App() {
               {summary.atRisk > 0 && <span className="sum-sub warn-text">{summary.atRisk} 个接近边界</span>}
             </div>
           </div>
+
+          <DlmmPositionsPanel
+            groups={dlmmPositionGroups}
+            busy={busy}
+            onSelectPosition={(position) => setSelectedId(`${position.version}-${position.tokenId}`)}
+            onCollect={collectDlmmGroup}
+            onClose={closeDlmmGroup}
+            onReopen={previewDlmmReopen}
+            onForget={forgetDlmmGroup}
+          />
 
           <div className="pos-toolbar">
             {/* 状态轴 | 版本轴：同一个单选，分隔线只表示「问的不是同一个问题」 */}
@@ -5096,112 +5621,16 @@ export default function App() {
                   className="btn primary"
                   disabled={!address || !wallet || busy || !mintTicks}
                   onClick={() => {
-                    if (!pool || !mintTicks) return
-                    const a0 = amount0 || '0'
-                    const a1 = amount1 || '0'
-                    if (parseAmount(a0, pool.token0.decimals) === 0n && parseAmount(a1, pool.token1.decimals) === 0n) {
-                      setStatus('请先输入数量')
-                      return
-                    }
-                    const plannedTick = pool.tick
-                    const plannedSpot = getCoinQuote(pool).spot
-                    const ticks = mintTicks
-                    const plannedCoinLo = 'coinPriceLower' in ticks ? ticks.coinPriceLower : Number(priceLo)
-                    const plannedCoinHi = 'coinPriceUpper' in ticks ? ticks.coinPriceUpper : Number(priceHi)
-                    const isV4 = pool.version === 'v4' || mintProtocol === 'v4'
-                    void run(isV4 ? 'Mint V4' : 'Mint', async () => {
-                      const live = isV4
-                        ? (pool.hooks != null && pool.tickSpacing
-                          ? await loadV4Pool({
-                            currency0: pool.token0.address,
-                            currency1: pool.token1.address,
-                            fee: pool.fee,
-                            tickSpacing: pool.tickSpacing,
-                            hooks: pool.hooks,
-                          })
-                          : await findV4Pool(pool.token0.address, pool.token1.address, pool.fee).then((p) => {
-                            if (!p) throw new Error('刷新 V4 池失败')
-                            return p
-                          }))
-                        : await loadV3Pool(pool.poolAddress!)
-                      setPool(live)
-
-                      let useLower = ticks.tickLower
-                      let useUpper = ticks.tickUpper
-                      let mint0 = parseAmount(a0, live.token0.decimals)
-                      let mint1 = parseAmount(a1, live.token1.decimals)
-
-                      if (isOneSidedRangeStale({
-                        plannedTick,
-                        liveTick: live.tick,
-                        tickLower: useLower,
-                        tickUpper: useUpper,
-                      })) {
-                        // 现价漂移导致单边区间过期 → 按原相对 % 锚到最新现价，自动重算后继续 Mint
-                        const fresh = reanchorRangeToLiveSpot({
-                          livePool: live,
-                          plannedSpot,
-                          coinLower: plannedCoinLo,
-                          coinUpper: plannedCoinHi,
-                        })
-                        if (!fresh) {
-                          throw new Error('现价已变化且无法自动重设区间，请手动调整后再 Mint')
-                        }
-                        useLower = fresh.tickLower
-                        useUpper = fresh.tickUpper
-                        const remapped = remapMintAmountsForRange({
-                          sqrtPriceX96: live.sqrtPriceX96,
-                          tickLower: useLower,
-                          tickUpper: useUpper,
-                          amount0: mint0,
-                          amount1: mint1,
-                          liveTick: live.tick,
-                        })
-                        mint0 = remapped.amount0
-                        mint1 = remapped.amount1
-                        if (mint0 <= 0n && mint1 <= 0n) {
-                          throw new Error('自动重设区间后数量无效，请重新填数量再 Mint')
-                        }
-                        // 同步 UI：区间与数量
-                        setRangeMode('custom')
-                        setPriceLo(formatPrice(fresh.coinPriceLower))
-                        setPriceHi(formatPrice(fresh.coinPriceUpper))
-                        setAmount0(formatAmountExact(mint0, live.token0.decimals))
-                        setAmount1(formatAmountExact(mint1, live.token1.decimals))
-                        setStatus(
-                          `现价已变，已自动把区间重锚到市价相对位置（${formatPrice(fresh.coinPriceLower)} – ${formatPrice(fresh.coinPriceUpper)}），继续 Mint…`,
-                        )
-                      }
-
-                      if (isV4) {
-                        return mintV4Position({
-                          walletClient: wallet!,
-                          owner: address!,
-                          pool: live,
-                          amount0: mint0,
-                          amount1: mint1,
-                          tickLower: useLower,
-                          tickUpper: useUpper,
-                          useNativeEth: mintUseEth,
-                          slippageBps,
-                          transferTaxBps0: mintTransferTax.tax0,
-                          transferTaxBps1: mintTransferTax.tax1,
-                          onStatus: setStatus,
-                        })
-                      }
-                      return mintV3Position({
-                        walletClient: wallet!,
-                        owner: address!,
-                        pool: live,
-                        amount0: mint0,
-                        amount1: mint1,
-                        tickLower: useLower,
-                        tickUpper: useUpper,
-                        useNativeEth: mintUseEth,
-                        slippageBps,
-                        onStatus: setStatus,
-                      })
-                    }, `${pool.token0.symbol}/${pool.token1.symbol}`, {
+                    if (!pool || !mintTicks || !rangePreview) return
+                    startMintPosition({
+                      targetPool: pool,
+                      tickLower: mintTicks.tickLower,
+                      tickUpper: mintTicks.tickUpper,
+                      coinPriceLower: rangePreview.coinPriceLower,
+                      coinPriceUpper: rangePreview.coinPriceUpper,
+                      input0: amount0 || '0',
+                      input1: amount1 || '0',
+                      actionLabel: pool.version === 'v4' ? 'Mint V4' : 'Mint',
                       afterSuccess: () => {
                         setAmount0('')
                         setAmount1('')
@@ -5232,6 +5661,31 @@ export default function App() {
             </>
           )}
         </section>
+      )}
+
+      {tab === 'dlmm' && (
+        <DlmmMode
+          pool={pool}
+          poolInput={poolInput}
+          discovered={discovered}
+          discovering={discovering}
+          busy={busy}
+          address={address}
+          walletReady={Boolean(wallet)}
+          balance0={bal0}
+          balance1={bal1}
+          nativeBalance={ethBal}
+          useNativeEth={useNativeEth}
+          transferTaxBps={transferTaxBps}
+          onPoolInput={setPoolInput}
+          onLoadPool={() => void loadPoolByAddress()}
+          onPickPool={pickDiscoveredPool}
+          onRefreshPool={() => void refreshPoolPrice()}
+          onUseNativeEth={setUseNativeEth}
+          onTransferTaxBps={setTransferTaxBps}
+          onOpenClassic={() => setTab('mint')}
+          onExecute={startDlmmMint}
+        />
       )}
 
       {tab === 'tools' && (

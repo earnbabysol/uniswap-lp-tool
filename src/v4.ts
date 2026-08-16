@@ -16,6 +16,7 @@ import {
   getAmountsForPosition,
   getLiquidityForAmounts,
   nearestUsableTick,
+  neededMintSide,
   resolvePairedMintAmounts,
   priceToClosestTick,
   priceToSqrtPriceX96,
@@ -509,7 +510,39 @@ async function waitApprovalReady(opts: {
   return false
 }
 
-/** estimateGas 超过 raceMs 就用 fallback，避免 Arc 上一直卡在「创建中」 */
+/** 把 V4 mint/加仓模拟失败译成可读原因（尤其是会让钱包「确认」灰掉的 revert） */
+function friendlyV4SimError(raw: string, action: string): Error {
+  const lower = raw.toLowerCase()
+  if (/0xc16ce029|unauthorizedpoolsettlement/i.test(raw)) {
+    return new Error(
+      `${action} 失败：该币禁止未经 hook 授权的 PoolManager 结算（UnauthorizedPoolSettlement）。` +
+        `常见于 Quotron404 一类「只能走官方 floorHook 池」的币；无 hooks / 错误 hooks 的池无法组 LP，不是钱包问题。`,
+    )
+  }
+  if (/bannedvenue/i.test(raw)) {
+    return new Error(`${action} 失败：代币把当前结算路径标为 BannedVenue，无法转入 PoolManager。`)
+  }
+  if (/MaximumAmountExceeded/i.test(raw)) {
+    return new Error(
+      `${action} 失败：滑点保护触发（MaximumAmountExceeded）。把顶部滑点调大一点，两边数量按现价重新配平后再试。`,
+    )
+  }
+  if (/STF|transfer|TRANSFER|delta|CurrencyNotSettled|not settled/i.test(raw)) {
+    return new Error(
+      `${action} 失败：疑似带转账税/到账不足，或代币禁止转入 PoolManager。` +
+        `请填写「转账税 bps」后重试；若仍失败，该池可能不允许外人加仓。原始：${raw.slice(0, 140)}`,
+    )
+  }
+  if (/超时|timeout/i.test(lower)) {
+    return new Error(`${action} 失败：模拟超时，请稍后重试或检查 RPC。`)
+  }
+  return new Error(`${action} 失败：${raw.slice(0, 220)}`)
+}
+
+/**
+ * estimateGas：超时才用 fallback（Arc RPC 挂死时）；
+ * 真实 revert 必须抛出，否则钱包会弹出无法确认的交易（Rabby 模拟失败、确认灰掉）。
+ */
 async function estimateGasQuick(opts: {
   account: Address
   to: Address
@@ -518,9 +551,9 @@ async function estimateGasQuick(opts: {
   fallback: bigint
   raceMs?: number
 }): Promise<bigint> {
-  const { account, to, data, value, fallback, raceMs = 1500 } = opts
+  const { account, to, data, value, fallback, raceMs = 8_000 } = opts
   try {
-    const estimated = await Promise.race([
+    const estimated = await withTimeout(
       publicClient
         .estimateGas({
           account,
@@ -529,15 +562,78 @@ async function estimateGasQuick(opts: {
           value: value && value > 0n ? value : undefined,
         })
         .then((g) => (g * 130n) / 100n),
-      new Promise<bigint>((resolve) => {
-        setTimeout(() => resolve(fallback), raceMs)
-      }),
-    ])
+      raceMs,
+      'estimateGas',
+    )
     return estimated < 21_000n ? fallback : estimated
   } catch (e) {
     const raw = e instanceof Error ? e.message : String(e)
-    if (/MaximumAmountExceeded/i.test(raw)) throw e
-    return fallback
+    // 仅 RPC 超时/挂死回退；链上 revert 一律上抛
+    if (/超时|timeout/i.test(raw) && !/execution reverted|revert|0xc16ce029/i.test(raw)) {
+      return fallback
+    }
+    throw e
+  }
+}
+
+/**
+ * 开仓前探测：非原生币能否转入 PoolManager。
+ * Quotron404 等会在无 hook 授权时对 to=PoolManager 直接 UnauthorizedPoolSettlement。
+ */
+async function assertCurrenciesAllowPoolManagerTransfer(opts: {
+  currencies: Address[]
+  from: Address
+}) {
+  const pm = CONTRACTS.v4PoolManager
+  for (const token of opts.currencies) {
+    if (isNativeCurrency(token) || isEthLikeCurrency(token)) continue
+    let bal = 0n
+    try {
+      bal = await withTimeout(
+        publicClient.readContract({
+          address: token,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [opts.from],
+        }),
+        4_000,
+        '读取余额',
+      )
+    } catch {
+      continue
+    }
+    if (bal <= 0n) continue
+    const amt = bal > 1n ? 1n : bal
+    try {
+      await withTimeout(
+        publicClient.simulateContract({
+          address: token,
+          abi: erc20Abi,
+          functionName: 'transfer',
+          args: [pm, amt],
+          account: opts.from,
+        }),
+        6_000,
+        '探测 PoolManager 转入',
+      )
+    } catch (e) {
+      const raw = e instanceof Error ? e.message : String(e)
+      const data =
+        typeof e === 'object' && e && 'data' in e ? String((e as { data?: unknown }).data ?? '') : ''
+      const blob = `${raw} ${data}`
+      if (/0xc16ce029|unauthorizedpoolsettlement/i.test(blob)) {
+        throw new Error(
+          `代币 ${token.slice(0, 10)}… 禁止未经官方 hook 授权的 PoolManager 结算（UnauthorizedPoolSettlement）。` +
+            `当前池若 hooks 为空或不是该币的 floorHook，外人无法组 LP；请换官方 hook 池，或只能交易不能加仓。`,
+        )
+      }
+      if (/bannedvenue/i.test(blob)) {
+        throw new Error(
+          `代币 ${token.slice(0, 10)}… 拒绝当前结算路径（BannedVenue），无法转入 PoolManager 组 LP。`,
+        )
+      }
+      // 余额不足 / 其它普通 revert：不算拦截，留给后面 mint 模拟
+    }
   }
 }
 
@@ -752,6 +848,7 @@ async function writeModifyLiquidities(opts: {
   unlockData: `0x${string}`
   value?: bigint
   action: string
+  fallbackGas?: bigint
   onStatus?: (msg: string) => void
 }) {
   const { walletClient, owner, unlockData, value = 0n, action, onStatus } = opts
@@ -769,21 +866,11 @@ async function writeModifyLiquidities(opts: {
       to: CONTRACTS.v4PositionManager,
       data,
       value,
-      fallback: 1_800_000n,
+      fallback: opts.fallbackGas ?? 1_800_000n,
     })
   } catch (e) {
     const raw = e instanceof Error ? e.message : String(e)
-    if (/MaximumAmountExceeded/i.test(raw)) {
-      throw new Error(
-        `${action} 失败：滑点保护触发（MaximumAmountExceeded）。把顶部滑点调大一点，两边数量按现价重新配平后再试。`,
-      )
-    }
-    if (/STF|transfer|TRANSFER|delta|CurrencyNotSettled|not settled/i.test(raw)) {
-      throw new Error(
-        `${action} 失败：疑似带转账税/到账不足。请在新建仓填写「转账税 bps」（0.25%=25，约 1%=100）后重试。原始：${raw.slice(0, 160)}`,
-      )
-    }
-    throw new Error(`${action} 失败：${raw.slice(0, 220)}`)
+    throw friendlyV4SimError(raw, action)
   }
   onStatus?.(`请在钱包确认 ${action}…`)
   return walletClient.writeContract({
@@ -979,6 +1066,8 @@ export async function mintV4Position(opts: {
    */
   transferTaxBps0?: number
   transferTaxBps1?: number
+  /** DLMM 单边保护：现价进入区间时直接停止，不把单边订单改造成双边仓 */
+  strictSingleSidedToken?: Address
   onStatus?: (msg: string) => void
 }) {
   const { walletClient, owner, onStatus } = opts
@@ -996,6 +1085,7 @@ export async function mintV4Position(opts: {
     tickSpacing: pool.tickSpacing,
     hooks: pool.hooks ?? NATIVE_ETH,
   })
+  const explicitTicks = opts.tickLower != null && opts.tickUpper != null
   let tickLower = opts.tickLower
   let tickUpper = opts.tickUpper
   if (tickLower == null || tickUpper == null) {
@@ -1003,9 +1093,33 @@ export async function mintV4Position(opts: {
     tickLower = r.tickLower
     tickUpper = r.tickUpper
   }
+  // WETH 池切到原生 ETH 同参数池时，address(0) 的排序可能让 token0/token1 对调。
+  // UI 的 ticks 是按源池方向算的；币序翻转必须做 [lo, hi] → [-hi, -lo]，
+  // 否则单边 Bid 会落到 Ask 一侧，甚至形成完全错误的价格带。
+  const sameCurrency = (a: Address, b: Address) =>
+    a.toLowerCase() === b.toLowerCase() || (isEthLikeCurrency(a) && isEthLikeCurrency(b))
+  const orderFlipped =
+    sameCurrency(srcPool.token0.address, live.token1.address) &&
+    sameCurrency(srcPool.token1.address, live.token0.address)
+  if (explicitTicks && orderFlipped) {
+    const sourceLower = tickLower
+    tickLower = -tickUpper
+    tickUpper = -sourceLower
+  }
   tickLower = nearestUsableTick(tickLower, live.tickSpacing)
   tickUpper = nearestUsableTick(tickUpper, live.tickSpacing)
   if (tickLower >= tickUpper) throw new Error('区间无效')
+
+  if (opts.strictSingleSidedToken) {
+    const expected = sameCurrency(live.token0.address, opts.strictSingleSidedToken)
+      ? 0
+      : sameCurrency(live.token1.address, opts.strictSingleSidedToken)
+        ? 1
+        : null
+    if (expected == null || neededMintSide(live.tick, tickLower, tickUpper) !== expected) {
+      throw new Error('价格在确认期间跨入了 Bid / Ask 区间，本次已停止；刷新后重试即可，未发送交易。')
+    }
+  }
 
   // WETH→原生池时 token 顺序可能翻转，先按币种对齐再配平
   const aligned = remapAmountsAcrossPools(
@@ -1102,6 +1216,12 @@ export async function mintV4Position(opts: {
     )
   }
 
+  onStatus?.('检查代币是否允许转入 PoolManager…')
+  await assertCurrenciesAllowPoolManagerTransfer({
+    currencies: [key.currency0, key.currency1],
+    from: owner,
+  })
+
   // 原生 ETH 侧不走 Permit2；税币侧按垫付额度授权
   await ensurePermit2(walletClient, key.currency0, owner, nativeIs0 ? 0n : settle.permit0, onStatus)
   await ensurePermit2(walletClient, key.currency1, owner, nativeIs1 ? 0n : settle.permit1, onStatus)
@@ -1128,6 +1248,217 @@ export async function mintV4Position(opts: {
     action: 'Mint V4',
     onStatus,
   })
+}
+
+/** One modifyLiquidities call that mints several independently managed V4 NFTs. */
+export async function mintV4DlmmPositions(opts: {
+  walletClient: WalletClient
+  owner: Address
+  pool: PoolInfo
+  bands: Array<{ tickLower: number; tickUpper: number; amount0: bigint; amount1: bigint }>
+  useNativeEth?: boolean
+  slippageBps?: number
+  transferTaxBps0?: number
+  transferTaxBps1?: number
+  strictSingleSidedToken: Address
+  onStatus?: (msg: string) => void
+}) {
+  const { walletClient, owner, onStatus } = opts
+  if (opts.pool.version !== 'v4' || !opts.pool.poolId) throw new Error('需要 V4 池')
+  if (opts.bands.length < 2 || opts.bands.length > 12) throw new Error('多档仓位必须为 2–12 档')
+  const slippageBps = opts.slippageBps ?? 300
+  const useNativeEth = Boolean(opts.useNativeEth)
+  const srcPool = opts.pool
+  const selectedPool = await resolvePoolForEthPayment(srcPool, useNativeEth)
+  const live = await loadV4Pool({
+    currency0: selectedPool.token0.address,
+    currency1: selectedPool.token1.address,
+    fee: selectedPool.fee,
+    tickSpacing: selectedPool.tickSpacing,
+    hooks: selectedPool.hooks ?? NATIVE_ETH,
+  })
+  const sameCurrency = (a: Address, b: Address) => (
+    a.toLowerCase() === b.toLowerCase() || (isEthLikeCurrency(a) && isEthLikeCurrency(b))
+  )
+  const orderFlipped =
+    sameCurrency(srcPool.token0.address, live.token1.address)
+    && sameCurrency(srcPool.token1.address, live.token0.address)
+  const expected = sameCurrency(live.token0.address, opts.strictSingleSidedToken)
+    ? 0
+    : sameCurrency(live.token1.address, opts.strictSingleSidedToken)
+      ? 1
+      : null
+  if (expected == null) throw new Error('单边入金币种不属于当前池')
+
+  const key = poolKeyFromPool(live)
+  const nativeIs0 = isNativeCurrency(key.currency0)
+  const nativeIs1 = isNativeCurrency(key.currency1)
+  const wethIs0 = key.currency0.toLowerCase() === CONTRACTS.weth.toLowerCase()
+  const wethIs1 = key.currency1.toLowerCase() === CONTRACTS.weth.toLowerCase()
+  const taxFor = (currency: Address): number => {
+    if (isNativeCurrency(currency) || isEthLikeCurrency(currency)) return 0
+    const lower = currency.toLowerCase()
+    if (lower === srcPool.token0.address.toLowerCase()) return Math.max(0, opts.transferTaxBps0 ?? 0)
+    if (lower === srcPool.token1.address.toLowerCase()) return Math.max(0, opts.transferTaxBps1 ?? 0)
+    if (lower === live.token0.address.toLowerCase()) return Math.max(0, opts.transferTaxBps0 ?? 0)
+    if (lower === live.token1.address.toLowerCase()) return Math.max(0, opts.transferTaxBps1 ?? 0)
+    return 0
+  }
+  const taxBps0 = taxFor(live.token0.address)
+  const taxBps1 = taxFor(live.token1.address)
+
+  let totalUser0 = 0n
+  let totalUser1 = 0n
+  let totalNeed0 = 0n
+  let totalNeed1 = 0n
+  let totalMax0 = 0n
+  let totalMax1 = 0n
+  const mintParams: `0x${string}`[] = []
+  const prepared: Array<{
+    tickLower: number
+    tickUpper: number
+    amount0: bigint
+    amount1: bigint
+    liquidity: bigint
+  }> = []
+
+  onStatus?.(`读取最新池价并生成 ${opts.bands.length} 个 V4 NFT 指令…`)
+  for (let index = 0; index < opts.bands.length; index += 1) {
+    const band = opts.bands[index]!
+    let tickLower = band.tickLower
+    let tickUpper = band.tickUpper
+    if (orderFlipped) {
+      const sourceLower = tickLower
+      tickLower = -tickUpper
+      tickUpper = -sourceLower
+    }
+    tickLower = nearestUsableTick(tickLower, live.tickSpacing)
+    tickUpper = nearestUsableTick(tickUpper, live.tickSpacing)
+    if (tickLower >= tickUpper) throw new Error(`第 ${index + 1} 档 tick 区间无效`)
+    if (neededMintSide(live.tick, tickLower, tickUpper) !== expected) {
+      throw new Error('价格已进入某个 Bin 档位，本次已停止；刷新价格后重试，未发送交易。')
+    }
+
+    const aligned = remapAmountsAcrossPools(
+      srcPool.token0.address,
+      srcPool.token1.address,
+      live.token0.address,
+      live.token1.address,
+      band.amount0,
+      band.amount1,
+    )
+    totalUser0 += aligned.amount0
+    totalUser1 += aligned.amount1
+    const net0 = netAfterTransferTax(aligned.amount0, taxBps0)
+    const net1 = netAfterTransferTax(aligned.amount1, taxBps1)
+    const paired = resolvePairedMintAmounts({
+      sqrtPriceX96: live.sqrtPriceX96,
+      tickLower,
+      tickUpper,
+      amount0: net0,
+      amount1: net1,
+    })
+    if (paired.amount0 <= 0n && paired.amount1 <= 0n) {
+      throw new Error(`第 ${index + 1} 档分配数量过小`)
+    }
+    const liquidity = getLiquidityForAmounts(
+      live.sqrtPriceX96,
+      tickLower,
+      tickUpper,
+      paired.amount0,
+      paired.amount1,
+    )
+    if (liquidity <= 0n) throw new Error(`第 ${index + 1} 档流动性为 0`)
+    const maxed = maxAmountsForLiquidity({
+      sqrtPriceX96: live.sqrtPriceX96,
+      tickLower,
+      tickUpper,
+      liquidity,
+      slippageBps,
+    })
+    // Multi-bin orders are explicitly single-sided. A price cross must revert,
+    // not request approval for the opposite token and silently turn two-sided.
+    let amount0Max = expected === 1 ? 0n : maxed.amount0Max
+    let amount1Max = expected === 0 ? 0n : maxed.amount1Max
+    if (taxBps0 > 0 && !nativeIs0 && amount0Max > net0) amount0Max = net0
+    if (taxBps1 > 0 && !nativeIs1 && amount1Max > net1) amount1Max = net1
+    if (maxed.amount0 > amount0Max || maxed.amount1 > amount1Max) {
+      throw new Error(`第 ${index + 1} 档税后数量不足以覆盖滑点`)
+    }
+    totalNeed0 += maxed.amount0
+    totalNeed1 += maxed.amount1
+    totalMax0 += amount0Max
+    totalMax1 += amount1Max
+    mintParams.push(encodeMintParams(
+      key,
+      tickLower,
+      tickUpper,
+      liquidity,
+      amount0Max,
+      amount1Max,
+      owner,
+    ))
+    prepared.push({
+      tickLower,
+      tickUpper,
+      amount0: paired.amount0,
+      amount1: paired.amount1,
+      liquidity,
+    })
+  }
+
+  if (useNativeEth && (wethIs0 || wethIs1) && !nativeIs0 && !nativeIs1) {
+    await ensureWethBalance({
+      walletClient,
+      owner,
+      currency0: key.currency0,
+      currency1: key.currency1,
+      amount0: totalNeed0,
+      amount1: totalNeed1,
+      useNativeEth: true,
+      onStatus,
+    })
+  }
+  const settle = buildMintSettlePlan({
+    currency0: key.currency0,
+    currency1: key.currency1,
+    amount0Max: totalMax0,
+    amount1Max: totalMax1,
+    taxBps0: nativeIs0 ? 0 : taxBps0,
+    taxBps1: nativeIs1 ? 0 : taxBps1,
+    recipient: owner,
+    pay0: taxBps0 > 0 && !nativeIs0 ? totalUser0 : undefined,
+    pay1: taxBps1 > 0 && !nativeIs1 ? totalUser1 : undefined,
+  })
+  onStatus?.('检查代币转入与 Permit2 授权…')
+  await assertCurrenciesAllowPoolManagerTransfer({
+    currencies: [key.currency0, key.currency1],
+    from: owner,
+  })
+  await ensurePermit2(walletClient, key.currency0, owner, nativeIs0 ? 0n : settle.permit0, onStatus)
+  await ensurePermit2(walletClient, key.currency1, owner, nativeIs1 ? 0n : settle.permit1, onStatus)
+
+  const actions: number[] = mintParams.map(() => V4_ACTIONS.MINT_POSITION)
+  actions.push(...settle.actions)
+  const params = [...mintParams, ...settle.params]
+  let value = 0n
+  if (nativeIs0) value = totalMax0
+  if (nativeIs1) value = totalMax1
+  if (nativeIs0 || nativeIs1) {
+    actions.push(V4_ACTIONS.SWEEP)
+    params.push(encodeSweep(NATIVE_ETH, owner))
+  }
+  const fallbackGas = 900_000n + BigInt(prepared.length) * 750_000n
+  const hash = await writeModifyLiquidities({
+    walletClient,
+    owner,
+    unlockData: encodeUnlockData(actions, params),
+    value,
+    fallbackGas,
+    action: `批量 Mint ${prepared.length} 个 V4 Bin`,
+    onStatus,
+  })
+  return { hash, pool: live, bands: prepared, amount0: totalNeed0, amount1: totalNeed1 }
 }
 
 
@@ -1590,6 +1921,11 @@ export async function increaseV4Liquidity(opts: {
     pay1: taxBps1 > 0 ? user1 : undefined,
   })
 
+  await assertCurrenciesAllowPoolManagerTransfer({
+    currencies: [key.currency0, key.currency1],
+    from: owner,
+  })
+
   await ensurePermit2(walletClient, key.currency0, owner, nativeIs0 ? 0n : settle.permit0, onStatus)
   await ensurePermit2(walletClient, key.currency1, owner, nativeIs1 ? 0n : settle.permit1, onStatus)
 
@@ -1695,5 +2031,103 @@ export async function removeV4Liquidity(opts: {
     owner,
     unlockData: encodeUnlockData(actions, params),
     action: '撤出 V4',
+  })
+}
+
+function validateV4PositionBatch(positions: readonly PositionRow[]): {
+  positions: PositionRow[]
+  key: V4PoolKey
+} {
+  if (positions.length < 2 || positions.length > 12) {
+    throw new Error('DLMM 批量操作需要 2–12 个 V4 仓位')
+  }
+  const unique = new Set(positions.map((position) => position.tokenId.toString()))
+  if (unique.size !== positions.length) throw new Error('DLMM 组合里存在重复的 V4 NFT')
+  if (positions.some((position) => position.version !== 'v4')) {
+    throw new Error('DLMM 组合包含非 V4 仓位')
+  }
+  const first = poolKeyFromPosition(positions[0]!)
+  const samePool = (position: PositionRow) => {
+    const key = poolKeyFromPosition(position)
+    return key.currency0.toLowerCase() === first.currency0.toLowerCase()
+      && key.currency1.toLowerCase() === first.currency1.toLowerCase()
+      && key.fee === first.fee
+      && key.tickSpacing === first.tickSpacing
+      && key.hooks.toLowerCase() === first.hooks.toLowerCase()
+  }
+  if (!positions.every(samePool)) throw new Error('只能批量操作同一个 V4 池的仓位')
+  return { positions: [...positions], key: first }
+}
+
+/** One modifyLiquidities call collects every NFT in a detected DLMM group. */
+export async function claimV4PositionBatch(opts: {
+  walletClient: WalletClient
+  owner: Address
+  positions: readonly PositionRow[]
+  onStatus?: (msg: string) => void
+}) {
+  const { positions, key } = validateV4PositionBatch(opts.positions)
+  const actions: number[] = []
+  const params: `0x${string}`[] = []
+  for (const position of positions) {
+    actions.push(V4_ACTIONS.DECREASE_LIQUIDITY)
+    params.push(encodeModifyLiqParams(position.tokenId, 0n, 0n, 0n))
+  }
+  actions.push(V4_ACTIONS.TAKE_PAIR)
+  params.push(encodeTakePair(key.currency0, key.currency1, opts.owner))
+  if (isNativeCurrency(key.currency0) || isNativeCurrency(key.currency1)) {
+    actions.push(V4_ACTIONS.SWEEP)
+    params.push(encodeSweep(NATIVE_ETH, opts.owner))
+  }
+  return writeModifyLiquidities({
+    walletClient: opts.walletClient,
+    owner: opts.owner,
+    unlockData: encodeUnlockData(actions, params),
+    action: `批量领取 ${positions.length} 档 V4`,
+    fallbackGas: 500_000n + BigInt(positions.length) * 420_000n,
+    onStatus: opts.onStatus,
+  })
+}
+
+function amountMinForExit(amount: bigint, slippageBps: number): bigint {
+  const bps = BigInt(Math.min(5_000, Math.max(0, Math.floor(slippageBps) || 0)))
+  const value = amount - (amount * bps) / 10_000n
+  const maxUint128 = (1n << 128n) - 1n
+  return value > maxUint128 ? maxUint128 : value
+}
+
+/** Atomically burns all NFTs in one V4 DLMM group and takes the combined proceeds. */
+export async function closeV4PositionBatch(opts: {
+  walletClient: WalletClient
+  owner: Address
+  positions: readonly PositionRow[]
+  slippageBps?: number
+  onStatus?: (msg: string) => void
+}) {
+  const { positions, key } = validateV4PositionBatch(opts.positions)
+  const slippageBps = opts.slippageBps ?? 300
+  const actions: number[] = []
+  const params: `0x${string}`[] = []
+  for (const position of positions) {
+    actions.push(V4_ACTIONS.BURN_POSITION)
+    params.push(encodeBurnParams(
+      position.tokenId,
+      amountMinForExit(position.amount0, slippageBps),
+      amountMinForExit(position.amount1, slippageBps),
+    ))
+  }
+  actions.push(V4_ACTIONS.TAKE_PAIR)
+  params.push(encodeTakePair(key.currency0, key.currency1, opts.owner))
+  if (isNativeCurrency(key.currency0) || isNativeCurrency(key.currency1)) {
+    actions.push(V4_ACTIONS.SWEEP)
+    params.push(encodeSweep(NATIVE_ETH, opts.owner))
+  }
+  return writeModifyLiquidities({
+    walletClient: opts.walletClient,
+    owner: opts.owner,
+    unlockData: encodeUnlockData(actions, params),
+    action: `一键退出 ${positions.length} 档 V4`,
+    fallbackGas: 700_000n + BigInt(positions.length) * 600_000n,
+    onStatus: opts.onStatus,
   })
 }

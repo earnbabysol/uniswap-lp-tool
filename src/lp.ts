@@ -1,6 +1,5 @@
 import {
   decodeEventLog,
-  decodeFunctionResult,
   encodeFunctionData,
   encodeAbiParameters,
   encodePacked,
@@ -12,6 +11,7 @@ import {
   isAddress,
   slice,
   zeroAddress,
+  type AbiEvent,
   type Address,
   type WalletClient,
   type Hash,
@@ -46,7 +46,7 @@ import {
   Q128,
   fullRangeTicks,
   nearestUsableTick,
-  pairAmountForRange,
+  neededMintSide,
   resolvePairedMintAmounts,
   priceToClosestTick,
   priceToSqrtPriceX96,
@@ -56,11 +56,15 @@ import {
 } from './math'
 import { fetchJson, withTimeout } from './async'
 import { buildV3AccountingLedger, computePositionPnlUsd } from './pnlAccounting'
+import { mapWithConcurrency, readLogsAdaptive, runRpcTask } from './rpcScheduler'
 import { publicClient } from './wallet'
 import {
   registerV4Deps,
   mintV4Position,
+  mintV4DlmmPositions,
   claimV4,
+  claimV4PositionBatch,
+  closeV4PositionBatch,
   increaseV4Liquidity,
   removeV4Liquidity,
   findV4Pool,
@@ -74,7 +78,10 @@ import {
 
 export {
   mintV4Position,
+  mintV4DlmmPositions,
   claimV4,
+  claimV4PositionBatch,
+  closeV4PositionBatch,
   increaseV4Liquidity,
   removeV4Liquidity,
   findV4Pool,
@@ -738,7 +745,7 @@ export async function findBestV3Pool(
 
 /** BSC Pancake 另有 0.25%（2500）；一并扫，避免漏掉 1% 等池 */
 function v3ScanFeeTiers(): number[] {
-  const base = [...FEE_TIERS]
+  const base: number[] = [...FEE_TIERS]
   if (!base.includes(2500)) base.splice(2, 0, 2500)
   return base
 }
@@ -1136,7 +1143,7 @@ export async function createV3PoolAndSeed(opts: {
       fee,
       initialPriceBPerA,
     })
-    const mintHash = await mintV3Position({
+    const mintResult = await mintV3Position({
       walletClient,
       owner,
       pool: created.pool,
@@ -1150,7 +1157,7 @@ export async function createV3PoolAndSeed(opts: {
     })
     return {
       pool: await loadV3Pool(created.pool.poolAddress!),
-      hash: mintHash,
+      hash: mintResult.hash,
       created: created.created,
       seeded: true,
     }
@@ -1646,6 +1653,7 @@ async function historicalV3Price(
   beforeLogIndex?: number,
 ): Promise<HistoricalPricePoint | null> {
   if (!row.poolAddress) return null
+  const chainId = getActiveChainId()
   const key = historicalPriceKey('v3', row.poolAddress, blockNumber, beforeLogIndex)
   if (historicalPriceMem.has(key)) return historicalPriceMem.get(key) ?? null
   let hasLaterSameBlockSwap = false
@@ -1662,11 +1670,18 @@ async function historicalV3Price(
   }
 
   try {
-    const sameBlock = await publicClient.getLogs({
-      address: row.poolAddress,
-      event: V3_SWAP_PRICE_EVENT,
+    const sameBlock = await readLogsAdaptive({
+      chainId,
       fromBlock: blockNumber,
       toBlock: blockNumber,
+      maxSpan: 1n,
+      label: 'V3 same-block price logs',
+      request: (from, to) => publicClient.getLogs({
+        address: row.poolAddress as Address,
+        event: V3_SWAP_PRICE_EVENT,
+        fromBlock: from,
+        toBlock: to,
+      }),
     })
     const cutoff = beforeLogIndex ?? Number.MAX_SAFE_INTEGER
     hasLaterSameBlockSwap = sameBlock.some(
@@ -1688,11 +1703,16 @@ async function historicalV3Price(
 
   try {
     const archiveBlock = hasLaterSameBlockSwap && blockNumber > 0n ? blockNumber - 1n : blockNumber
-    const slot0 = await publicClient.readContract({
-      address: row.poolAddress,
-      abi: v3PoolAbi,
-      functionName: 'slot0',
-      blockNumber: archiveBlock,
+    const slot0 = await runRpcTask({
+      chainId,
+      lane: 'read',
+      label: 'V3 archive slot0',
+      task: () => publicClient.readContract({
+        address: row.poolAddress as Address,
+        abi: v3PoolAbi,
+        functionName: 'slot0',
+        blockNumber: archiveBlock,
+      }),
     })
     const sqrtPriceX96 = slot0[0]
     const tick = Number(slot0[1])
@@ -1711,11 +1731,18 @@ async function historicalV3Price(
   for (let i = 0; i < 12 && to >= 0n; i += 1) {
     const from = to >= span - 1n ? to - span + 1n : 0n
     try {
-      const logs = await publicClient.getLogs({
-        address: row.poolAddress,
-        event: V3_SWAP_PRICE_EVENT,
+      const logs = await readLogsAdaptive({
+        chainId,
         fromBlock: from,
         toBlock: to,
+        maxSpan: span,
+        label: 'V3 historical price logs',
+        request: (rangeFrom, rangeTo) => publicClient.getLogs({
+          address: row.poolAddress,
+          event: V3_SWAP_PRICE_EVENT,
+          fromBlock: rangeFrom,
+          toBlock: rangeTo,
+        }),
       })
       const last = logs.sort((a, b) => {
         if (a.blockNumber !== b.blockNumber) return a.blockNumber < b.blockNumber ? 1 : -1
@@ -1744,6 +1771,7 @@ async function historicalV4Price(
   beforeLogIndex?: number,
 ): Promise<HistoricalPricePoint | null> {
   if (!row.poolId) return null
+  const chainId = getActiveChainId()
   const key = historicalPriceKey('v4', row.poolId, blockNumber, beforeLogIndex)
   if (historicalPriceMem.has(key)) return historicalPriceMem.get(key) ?? null
   let hasLaterSameBlockSwap = false
@@ -1760,12 +1788,19 @@ async function historicalV4Price(
   }
 
   try {
-    const sameBlock = await publicClient.getLogs({
-      address: CONTRACTS.v4PoolManager,
-      event: V4_SWAP_PRICE_EVENT,
-      args: { id: row.poolId },
+    const sameBlock = await readLogsAdaptive({
+      chainId,
       fromBlock: blockNumber,
       toBlock: blockNumber,
+      maxSpan: 1n,
+      label: 'V4 same-block price logs',
+      request: (from, to) => publicClient.getLogs({
+        address: CONTRACTS.v4PoolManager,
+        event: V4_SWAP_PRICE_EVENT,
+        args: { id: row.poolId },
+        fromBlock: from,
+        toBlock: to,
+      }),
     })
     const cutoff = beforeLogIndex ?? Number.MAX_SAFE_INTEGER
     hasLaterSameBlockSwap = sameBlock.some(
@@ -1787,12 +1822,17 @@ async function historicalV4Price(
 
   try {
     const archiveBlock = hasLaterSameBlockSwap && blockNumber > 0n ? blockNumber - 1n : blockNumber
-    const slot0 = await publicClient.readContract({
-      address: CONTRACTS.v4StateView,
-      abi: v4StateViewAbi,
-      functionName: 'getSlot0',
-      args: [row.poolId],
-      blockNumber: archiveBlock,
+    const slot0 = await runRpcTask({
+      chainId,
+      lane: 'read',
+      label: 'V4 archive slot0',
+      task: () => publicClient.readContract({
+        address: CONTRACTS.v4StateView,
+        abi: v4StateViewAbi,
+        functionName: 'getSlot0',
+        args: [row.poolId as `0x${string}`],
+        blockNumber: archiveBlock,
+      }),
     })
     const sqrtPriceX96 = slot0[0]
     const tick = Number(slot0[1])
@@ -1811,12 +1851,19 @@ async function historicalV4Price(
   for (let i = 0; i < 12 && to >= 0n; i += 1) {
     const from = to >= span - 1n ? to - span + 1n : 0n
     try {
-      const logs = await publicClient.getLogs({
-        address: CONTRACTS.v4PoolManager,
-        event: V4_SWAP_PRICE_EVENT,
-        args: { id: row.poolId },
+      const logs = await readLogsAdaptive({
+        chainId,
         fromBlock: from,
         toBlock: to,
+        maxSpan: span,
+        label: 'V4 historical price logs',
+        request: (rangeFrom, rangeTo) => publicClient.getLogs({
+          address: CONTRACTS.v4PoolManager,
+          event: V4_SWAP_PRICE_EVENT,
+          args: { id: row.poolId },
+          fromBlock: rangeFrom,
+          toBlock: rangeTo,
+        }),
       })
       const last = logs.sort((a, b) => {
         if (a.blockNumber !== b.blockNumber) return a.blockNumber < b.blockNumber ? 1 : -1
@@ -1931,52 +1978,6 @@ function combineValuationQuality(
   if (values.some((v) => v.quality === 'unavailable')) return 'unavailable'
   if (values.some((v) => v.quality === 'estimated')) return 'estimated'
   return 'historical'
-}
-
-/**
- * 未领手续费：先模拟 decreaseLiquidity(0)+collect（最准），
- * 失败再回退 feeGrowth 计算。仅 tokensOwed 不会随交易增长。
- */
-async function _readV3UnclaimedFees(
-  tokenId: bigint,
-  owner: Address,
-  fallback: () => Promise<{ fees0: bigint; fees1: bigint }>,
-): Promise<{ fees0: bigint; fees1: bigint }> {
-  try {
-    const deadline = BigInt(Math.floor(Date.now() / 1000) + 600)
-    const decData = encodeFunctionData({
-      abi: v3NpmAbi,
-      functionName: 'decreaseLiquidity',
-      args: [{ tokenId, liquidity: 0n, amount0Min: 0n, amount1Min: 0n, deadline }],
-    })
-    const colData = encodeFunctionData({
-      abi: v3NpmAbi,
-      functionName: 'collect',
-      args: [{ tokenId, recipient: owner, amount0Max: MAX_UINT128, amount1Max: MAX_UINT128 }],
-    })
-    const { result } = await publicClient.simulateContract({
-      address: CONTRACTS.v3Npm,
-      abi: v3NpmAbi,
-      functionName: 'multicall',
-      args: [[decData, colData]],
-      account: owner,
-    })
-    if (!result?.[1]) throw new Error('empty multicall result')
-    const decoded = decodeFunctionResult({
-      abi: v3NpmAbi,
-      functionName: 'collect',
-      data: result[1],
-    })
-    const fees0 = decoded[0] as bigint
-    const fees1 = decoded[1] as bigint
-    if (fees0 < 0n || fees1 < 0n || fees0 > MAX_UINT128 || fees1 > MAX_UINT128) {
-      throw new Error('insane collect amounts')
-    }
-    return { fees0, fees1 }
-  } catch (e) {
-    console.warn('simulate collect fees failed', tokenId.toString(), e)
-    return fallback()
-  }
 }
 
 async function computeV3Fees(opts: {
@@ -2719,43 +2720,55 @@ export function recordPositionClaim(
 /** 分块拉日志，避免 fromBlock=0 一次扫挂死；BSC 公共节点使用更小窗口。 */
 async function getLogsChunked<T>(opts: {
   address: Address
-  event: ReturnType<typeof parseAbiItem>
+  event: AbiEvent
   args?: Record<string, unknown>
   fromBlock: bigint
   toBlock: bigint
   span?: bigint
 }): Promise<{ logs: T[]; incomplete: boolean }> {
-  const span = opts.span ?? (getActiveChainId() === 56 ? 2_000n : 8_000n)
+  const chainId = getActiveChainId()
+  const span = opts.span ?? (chainId === 56 ? 2_000n : 8_000n)
   const out: T[] = []
   let incomplete = false
   for (let from = opts.fromBlock; from <= opts.toBlock; from += span) {
     const to = from + span - 1n > opts.toBlock ? opts.toBlock : from + span - 1n
-    const req = {
-      address: opts.address,
-      event: opts.event,
-      args: opts.args as never,
-      fromBlock: from,
-      toBlock: to,
-    }
     try {
-      const logs = await publicClient.getLogs(req)
-      out.push(...(logs as T[]))
-    } catch (e) {
-      console.warn('getLogsChunked fail', from.toString(), e)
-      try {
-        await new Promise((r) => setTimeout(r, 400))
-        const logs = await publicClient.getLogs(req)
-        out.push(...(logs as T[]))
-      } catch (e2) {
-        console.warn('getLogsChunked retry fail', from.toString(), e2)
-        incomplete = true
-      }
+      const logs = await readLogsAdaptive<T>({
+        chainId,
+        fromBlock: from,
+        toBlock: to,
+        maxSpan: span,
+        label: 'position history logs',
+        request: async (rangeFrom, rangeTo) => {
+          const logs = await publicClient.getLogs({
+            address: opts.address,
+            event: opts.event,
+            args: opts.args,
+            fromBlock: rangeFrom,
+            toBlock: rangeTo,
+          })
+          return logs as unknown as T[]
+        },
+      })
+      out.push(...logs)
+    } catch (error) {
+      console.warn('getLogsChunked exhausted retries', from.toString(), error)
+      incomplete = true
     }
   }
   return { logs: out, incomplete }
 }
 
 const V3_NFT_MINT = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)')
+const V3_NPM_INCREASE = parseAbiItem(
+  'event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
+)
+const V3_NPM_DECREASE = parseAbiItem(
+  'event DecreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
+)
+const V3_NPM_COLLECT = parseAbiItem(
+  'event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)',
+)
 
 async function v3MintBlock(
   tokenId: bigint,
@@ -2841,18 +2854,17 @@ function dedupeNpmLogs(logs: NpmAmountLog[]): NpmAmountLog[] {
 }
 
 async function fetchNpmLogsBlockscout(
-  event: ReturnType<typeof parseAbiItem>,
   eventName: 'Collect' | 'IncreaseLiquidity' | 'DecreaseLiquidity',
   tokenId: bigint,
   fromBlock: bigint,
   npm: Address = CONTRACTS.v3Npm,
 ): Promise<{ logs: NpmAmountLog[]; complete: boolean }> {
   try {
-    const topics = encodeEventTopics({
-      abi: [event as never],
-      eventName,
-      args: { tokenId },
-    })
+    const topics = eventName === 'Collect'
+      ? encodeEventTopics({ abi: [V3_NPM_COLLECT], eventName: 'Collect', args: { tokenId } })
+      : eventName === 'IncreaseLiquidity'
+        ? encodeEventTopics({ abi: [V3_NPM_INCREASE], eventName: 'IncreaseLiquidity', args: { tokenId } })
+        : encodeEventTopics({ abi: [V3_NPM_DECREASE], eventName: 'DecreaseLiquidity', args: { tokenId } })
     const t0 = topics[0]
     const t1 = topics[1]
     if (!t0 || !t1) return { logs: [], complete: false }
@@ -2867,7 +2879,6 @@ async function fetchNpmLogsBlockscout(
       message?: string
       result?: Array<{
         data: `0x${string}`
-        topics: `0x${string}`[]
         transactionHash: Hash
         blockNumber?: string
         logIndex?: string
@@ -2883,15 +2894,25 @@ async function fetchNpmLogsBlockscout(
     const out: NpmAmountLog[] = []
     for (const log of json.result) {
       try {
-        const decoded = decodeEventLog({
-          abi: [event as never],
-          data: log.data,
-          topics: log.topics,
-        })
+        const args = eventName === 'Collect'
+          ? (() => {
+              const decoded = decodeAbiParameters(
+                [{ type: 'address' }, { type: 'uint256' }, { type: 'uint256' }],
+                log.data,
+              )
+              return { amount0: decoded[1], amount1: decoded[2] }
+            })()
+          : (() => {
+              const decoded = decodeAbiParameters(
+                [{ type: 'uint128' }, { type: 'uint256' }, { type: 'uint256' }],
+                log.data,
+              )
+              return { liquidity: decoded[0], amount0: decoded[1], amount1: decoded[2] }
+            })()
         const li = log.logIndex != null ? Number(log.logIndex) : undefined
         const bn = log.blockNumber != null ? BigInt(log.blockNumber) : fromBlock
         out.push({
-          args: decoded.args as { amount0?: bigint; amount1?: bigint; liquidity?: bigint },
+          args,
           transactionHash: log.transactionHash,
           blockNumber: bn,
           logIndex: Number.isFinite(li) ? li : undefined,
@@ -2908,7 +2929,7 @@ async function fetchNpmLogsBlockscout(
 }
 
 async function loadV3NpmLogs(
-  event: ReturnType<typeof parseAbiItem>,
+  event: AbiEvent,
   eventName: 'Collect' | 'IncreaseLiquidity' | 'DecreaseLiquidity',
   tokenId: bigint,
   fromBlock: bigint,
@@ -2917,7 +2938,7 @@ async function loadV3NpmLogs(
 ): Promise<{ logs: NpmAmountLog[]; incomplete: boolean }> {
   // BSC / Robinhood 的 Blockscout 对 indexed tokenId 查询远快于从铸造块逐段扫 RPC。
   if (getActiveChainId() === 56 || getActiveChainId() === 4663) {
-    const explorer = await fetchNpmLogsBlockscout(event, eventName, tokenId, fromBlock, npm)
+    const explorer = await fetchNpmLogsBlockscout(eventName, tokenId, fromBlock, npm)
     if (explorer.complete) {
       return { logs: dedupeNpmLogs(explorer.logs), incomplete: false }
     }
@@ -2931,7 +2952,7 @@ async function loadV3NpmLogs(
   })
   // RPC 完整扫完（含 0 条）直接用，避免 Blockscout 缺页把「无 Collect」误成有领取
   if (!rpc.incomplete) return { logs: dedupeNpmLogs(rpc.logs), incomplete: false }
-  const bs = await fetchNpmLogsBlockscout(event, eventName, tokenId, fromBlock, npm)
+  const bs = await fetchNpmLogsBlockscout(eventName, tokenId, fromBlock, npm)
   if (bs.logs.length === 0) return { logs: dedupeNpmLogs(rpc.logs), incomplete: true }
   // 合并后严格去重；缺 chunk 仍标 incomplete，成本腿禁止上调
   return { logs: dedupeNpmLogs([...rpc.logs, ...bs.logs]), incomplete: true }
@@ -2958,14 +2979,10 @@ export async function loadPositionCashflow(
     const mintBlock = await v3MintBlock(tokenId, npm)
     const mintKnown = mintBlock != null
     const fromBlock = mintBlock ?? (latest > 3_000_000n ? latest - 3_000_000n : 0n)
-    const incEvent = parseAbiItem('event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)')
-    const decEvent = parseAbiItem('event DecreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)')
-    const colEvent = parseAbiItem('event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)')
-
     const [incRes, decRes, colRes] = await Promise.all([
-      loadV3NpmLogs(incEvent, 'IncreaseLiquidity', tokenId, fromBlock, latest, npm),
-      loadV3NpmLogs(decEvent, 'DecreaseLiquidity', tokenId, fromBlock, latest, npm),
-      loadV3NpmLogs(colEvent, 'Collect', tokenId, fromBlock, latest, npm),
+      loadV3NpmLogs(V3_NPM_INCREASE, 'IncreaseLiquidity', tokenId, fromBlock, latest, npm),
+      loadV3NpmLogs(V3_NPM_DECREASE, 'DecreaseLiquidity', tokenId, fromBlock, latest, npm),
+      loadV3NpmLogs(V3_NPM_COLLECT, 'Collect', tokenId, fromBlock, latest, npm),
     ])
     const inc = incRes.logs
     const dec = decRes.logs
@@ -3407,13 +3424,13 @@ async function listV4TokenIds(
       let url: string | null =
         `${getExplorerApi()}/api/v2/tokens/${CONTRACTS.v4PositionManager}/instances?holder_address_hash=${owner}`
       for (let page = 0; page < (deep ? 20 : 8) && url; page++) {
-        const json = await fetchJson<{
+        const json: {
           items?: Array<{ id?: string; token_id?: string }>
           next_page_params?: Record<string, string | number>
-        }>(url, deep ? 12_000 : 5_000)
+        } = await fetchJson(url, deep ? 12_000 : 5_000)
         for (const it of json.items ?? []) add(it.id ?? it.token_id)
         if (json.next_page_params) {
-          const q = new URLSearchParams(
+          const q: string = new URLSearchParams(
             Object.entries(json.next_page_params).map(([k, v]) => [k, String(v)]),
           ).toString()
           url = `${getExplorerApi()}/api/v2/tokens/${CONTRACTS.v4PositionManager}/instances?holder_address_hash=${owner}&${q}`
@@ -3445,16 +3462,16 @@ async function listV4TokenIds(
       let url: string | null =
         `${getExplorerApi()}/api/v2/addresses/${owner}/nft?type=ERC-721`
       for (let page = 0; page < (deep ? 12 : 4) && url; page++) {
-        const json = await fetchJson<{
+        const json: {
           items?: Array<{ id?: string; token?: { address_hash?: string; address?: string } }>
           next_page_params?: Record<string, string>
-        }>(url, 4_000)
+        } = await fetchJson(url, 4_000)
         for (const it of json.items ?? []) {
           const addr = (it.token?.address_hash || it.token?.address || '').toLowerCase()
           if (addr === npm && it.id) add(it.id)
         }
         if (json.next_page_params) {
-          const q = new URLSearchParams(json.next_page_params as Record<string, string>).toString()
+          const q: string = new URLSearchParams(json.next_page_params).toString()
           url = `${getExplorerApi()}/api/v2/addresses/${owner}/nft?type=ERC-721&${q}`
         } else {
           url = null
@@ -3563,34 +3580,47 @@ async function scanV4TokenIdsByLogs(owner: Address, lookbackBlocks: bigint): Pro
   )
   const latest = await publicClient.getBlockNumber()
   const owned = new Set<string>()
+  const chainId = getActiveChainId()
   // Base / BSC / 多数公共 RPC 对 eth_getLogs 窗口很严
   const span =
-    getActiveChainId() === 1
-    || getActiveChainId() === 196
-    || getActiveChainId() === 8453
-    || getActiveChainId() === 56
+    chainId === 1
+    || chainId === 196
+    || chainId === 8453
+    || chainId === 56
       ? 2_000n
       : 8_000n
   const start = latest > lookbackBlocks ? latest - lookbackBlocks : 0n
   for (let from = start; from <= latest; from += span) {
     const to = from + span - 1n > latest ? latest : from + span - 1n
     try {
-      const [ins, outs] = await Promise.all([
-        publicClient.getLogs({
+      const ins = await readLogsAdaptive({
+        chainId,
+        fromBlock: from,
+        toBlock: to,
+        maxSpan: span,
+        label: 'V4 incoming NFT Transfer logs',
+        request: (rangeFrom, rangeTo) => publicClient.getLogs({
           address: CONTRACTS.v4PositionManager,
           event: transfer,
           args: { to: owner },
-          fromBlock: from,
-          toBlock: to,
+          fromBlock: rangeFrom,
+          toBlock: rangeTo,
         }),
-        publicClient.getLogs({
+      })
+      const outs = await readLogsAdaptive({
+        chainId,
+        fromBlock: from,
+        toBlock: to,
+        maxSpan: span,
+        label: 'V4 outgoing NFT Transfer logs',
+        request: (rangeFrom, rangeTo) => publicClient.getLogs({
           address: CONTRACTS.v4PositionManager,
           event: transfer,
           args: { from: owner },
-          fromBlock: from,
-          toBlock: to,
+          fromBlock: rangeFrom,
+          toBlock: rangeTo,
         }),
-      ])
+      })
       for (const l of ins) if (l.args.tokenId != null) owned.add(l.args.tokenId.toString())
       for (const l of outs) if (l.args.tokenId != null) owned.delete(l.args.tokenId.toString())
     } catch (e) {
@@ -3647,11 +3677,12 @@ async function collectV4ModifyLogs(opts: {
   const { poolId, tokenId, fromBlock } = opts
   const salt = v4Salt(tokenId).toLowerCase()
   const latest = await publicClient.getBlockNumber()
+  const chainId = getActiveChainId()
   const span =
-    getActiveChainId() === 1
-    || getActiveChainId() === 196
-    || getActiveChainId() === 8453
-    || getActiveChainId() === 56
+    chainId === 1
+    || chainId === 196
+    || chainId === 8453
+    || chainId === 56
       ? 2_000n
       : 8_000n
   const out: Array<{
@@ -3666,12 +3697,19 @@ async function collectV4ModifyLogs(opts: {
   for (let from = fromBlock; from <= latest; from += span) {
     const to = from + span - 1n > latest ? latest : from + span - 1n
     try {
-      const logs = await publicClient.getLogs({
-        address: CONTRACTS.v4PoolManager,
-        event: V4_MODIFY_LIQUIDITY,
-        args: { id: poolId, sender: CONTRACTS.v4PositionManager },
+      const logs = await readLogsAdaptive({
+        chainId,
         fromBlock: from,
         toBlock: to,
+        maxSpan: span,
+        label: 'V4 position ModifyLiquidity logs',
+        request: (rangeFrom, rangeTo) => publicClient.getLogs({
+          address: CONTRACTS.v4PoolManager,
+          event: V4_MODIFY_LIQUIDITY,
+          args: { id: poolId, sender: CONTRACTS.v4PositionManager },
+          fromBlock: rangeFrom,
+          toBlock: rangeTo,
+        }),
       })
       for (const l of logs) {
         if ((l.args.salt || '').toLowerCase() !== salt) continue
@@ -3975,8 +4013,10 @@ export async function enrichPositionsLifetimeFees(
   const wethUsd = await getWethUsdPrice()
   const out = [...rows]
 
-  await Promise.all(
-    rows.map(async (row, idx) => {
+  await mapWithConcurrency(
+    rows,
+    getActiveChainId() === 56 ? 1 : 2,
+    async (row, idx) => {
       const unclaimedFeesUsd = row.fees0Usd + row.fees1Usd
       // 首屏先显示缓存 high-water，不在这里用未领抖动灌已领
       let next = mergeCachedLifetimeFees(row, unclaimedFeesUsd, wethUsd)
@@ -4037,7 +4077,7 @@ export async function enrichPositionsLifetimeFees(
       persistLifetimeFees(next, { allowDown })
       out[idx] = next
       opts?.onRow?.(next)
-    }),
+    },
   )
   return out
 }
@@ -4046,7 +4086,6 @@ export async function loadV4Positions(
   owner: Address,
   opts?: { deep?: boolean; skipPnl?: boolean; onStatus?: (msg: string) => void },
 ): Promise<PositionRow[]> {
-  const skipPnl = opts?.skipPnl !== false // 默认跳过慢速 PnL，避免整批超时漏仓
   const wethUsd = await getWethUsdPrice()
   const tokenIds = await listV4TokenIds(owner, { deep: opts?.deep, onStatus: opts?.onStatus })
 
@@ -4102,7 +4141,6 @@ export async function loadV4Positions(
           : { fees0: 0n, fees1: 0n }
         const usd = enrichUsd(amount0, amount1, fees0, fees1, pool, wethUsd)
         const unclaimedFeesUsd = usd.fees0Usd + usd.fees1Usd
-        const principalUsd = usd.amount0Usd + usd.amount1Usd
         const pnlFields = {
           claimed0: 0n,
           claimed1: 0n,
@@ -4490,6 +4528,8 @@ export async function mintV3Position(opts: {
   slippageBps?: number
   /** 用原生 ETH 代替 WETH（Uniswap 同款：msg.value） */
   useNativeEth?: boolean
+  /** DLMM 单边保护：若发送前现价已使区间不再只需要该币，停止而不是悄悄变双边 */
+  strictSingleSidedToken?: Address
   onStatus?: (msg: string) => void
 }) {
   const { walletClient, owner, pool, amount0, amount1, onStatus } = opts
@@ -4533,6 +4573,17 @@ export async function mintV3Position(opts: {
       sqrtPriceX96 > 0n
         ? tickToPrice(tick, pool.token0.decimals, pool.token1.decimals)
         : 0,
+  }
+
+  if (opts.strictSingleSidedToken) {
+    const expected = usePool.token0.address.toLowerCase() === opts.strictSingleSidedToken.toLowerCase()
+      ? 0
+      : usePool.token1.address.toLowerCase() === opts.strictSingleSidedToken.toLowerCase()
+        ? 1
+        : null
+    if (expected == null || neededMintSide(usePool.tick, tickLower, tickUpper) !== expected) {
+      throw new Error('价格在确认期间跨入了 Bid / Ask 区间，本次已停止；刷新后重试即可，未发送交易。')
+    }
   }
 
   // 提交前用现价按单边锚点重算两边，避免 UI 截断 / 单边 from1 零结果盖住 from0
@@ -4594,6 +4645,152 @@ export async function mintV3Position(opts: {
     if (e instanceof Error && e.message.startsWith('Mint')) throw e
     throw new Error(friendlyTxError(e, 'Mint'))
   }
+}
+
+export type DlmmMintBand = {
+  tickLower: number
+  tickUpper: number
+  amount0: bigint
+  amount1: bigint
+}
+
+/**
+ * Mint several independent V3 NFT bands in one PositionManager multicall.
+ * This is the closest practical EVM equivalent to a DLMM distribution while
+ * keeping every band independently removable and claimable.
+ */
+export async function mintV3DlmmPositions(opts: {
+  walletClient: WalletClient
+  owner: Address
+  pool: PoolInfo
+  bands: DlmmMintBand[]
+  slippageBps?: number
+  useNativeEth?: boolean
+  strictSingleSidedToken: Address
+  onStatus?: (msg: string) => void
+}) {
+  const { walletClient, owner, pool, onStatus } = opts
+  if (pool.version !== 'v3' || !pool.poolAddress) throw new Error('需要 V3 池')
+  if (opts.bands.length < 2 || opts.bands.length > 12) throw new Error('多档仓位必须为 2–12 档')
+  const npm = resolveV3Npm(pool)
+  const slippageBps = opts.slippageBps ?? 300
+  const useNative = Boolean(opts.useNativeEth) && pairHasWeth(pool.token0.address, pool.token1.address)
+  const wethIs0 = isWeth(pool.token0.address)
+  const wethIs1 = isWeth(pool.token1.address)
+
+  onStatus?.(`读取最新池价并校验 ${opts.bands.length} 档单边区间…`)
+  const [slot0, ethBal] = await Promise.all([
+    publicClient.readContract({
+      address: pool.poolAddress,
+      abi: v3PoolAbi,
+      functionName: 'slot0',
+    }),
+    useNative ? publicClient.getBalance({ address: owner }) : Promise.resolve(0n),
+  ])
+  const sqrtPriceX96 = slot0[0]
+  const liveTick = slot0[1]
+  const expected = pool.token0.address.toLowerCase() === opts.strictSingleSidedToken.toLowerCase()
+    ? 0
+    : pool.token1.address.toLowerCase() === opts.strictSingleSidedToken.toLowerCase()
+      ? 1
+      : null
+  if (expected == null) throw new Error('单边入金币种不属于当前池')
+
+  const prepared = opts.bands.map((band, index) => {
+    if (
+      band.tickLower >= band.tickUpper
+      || band.tickLower % pool.tickSpacing !== 0
+      || band.tickUpper % pool.tickSpacing !== 0
+    ) throw new Error(`第 ${index + 1} 档 tick 区间无效`)
+    if (neededMintSide(liveTick, band.tickLower, band.tickUpper) !== expected) {
+      throw new Error('价格已进入某个 Bin 档位，本次已停止；刷新价格后重试，未发送交易。')
+    }
+    const paired = resolvePairedMintAmounts({
+      sqrtPriceX96,
+      tickLower: band.tickLower,
+      tickUpper: band.tickUpper,
+      amount0: band.amount0,
+      amount1: band.amount1,
+    })
+    if (paired.amount0 <= 0n && paired.amount1 <= 0n) {
+      throw new Error(`第 ${index + 1} 档分配数量过小`)
+    }
+    return { ...band, amount0: paired.amount0, amount1: paired.amount1 }
+  })
+  const total0 = prepared.reduce((sum, band) => sum + band.amount0, 0n)
+  const total1 = prepared.reduce((sum, band) => sum + band.amount1, 0n)
+  const nativeValue = useNative ? (wethIs0 ? total0 : wethIs1 ? total1 : 0n) : 0n
+  if (nativeValue > 0n && ethBal < nativeValue + 10n ** 15n) {
+    throw new Error(`原生币不足：需要约 ${formatAmountExact(nativeValue, 18)} + gas`)
+  }
+
+  if (!(useNative && wethIs0) && total0 > 0n) {
+    await ensureAllowance(walletClient, pool.token0.address, owner, npm, total0, onStatus)
+  }
+  if (!(useNative && wethIs1) && total1 > 0n) {
+    await ensureAllowance(walletClient, pool.token1.address, owner, npm, total1, onStatus)
+  }
+
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200)
+  const calls = prepared.map((band) => {
+    const mins = amountMinsForSlippage(band.amount0, band.amount1, slippageBps)
+    return encodeFunctionData({
+      abi: v3NpmAbi,
+      functionName: 'mint',
+      args: [{
+        token0: pool.token0.address,
+        token1: pool.token1.address,
+        fee: pool.fee,
+        tickLower: band.tickLower,
+        tickUpper: band.tickUpper,
+        amount0Desired: band.amount0,
+        amount1Desired: band.amount1,
+        amount0Min: mins.amount0Min,
+        amount1Min: mins.amount1Min,
+        recipient: owner,
+        deadline,
+      }],
+    })
+  })
+  if (nativeValue > 0n) {
+    calls.push(encodeFunctionData({ abi: v3NpmAbi, functionName: 'refundETH' }))
+  }
+  const data = encodeFunctionData({
+    abi: v3NpmAbi,
+    functionName: 'multicall',
+    args: [calls],
+  })
+  const fallbackGas = 500_000n + BigInt(prepared.length) * 550_000n
+  let gas = fallbackGas
+  onStatus?.(`准备一笔交易创建 ${prepared.length} 个 V3 NFT…`)
+  try {
+    gas = await Promise.race([
+      publicClient.estimateGas({
+        account: owner,
+        to: npm,
+        data,
+        value: nativeValue > 0n ? nativeValue : undefined,
+      }).then((value) => (value * 130n) / 100n),
+      new Promise<bigint>((resolve) => setTimeout(() => resolve(fallbackGas), 4_000)),
+    ])
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (/revert|stf|insufficient|allowance|balance/i.test(message)) {
+      throw new Error(friendlyTxError(error, '批量 Mint'))
+    }
+  }
+  onStatus?.(`请在钱包确认：一笔创建 ${prepared.length} 档 V3 仓位…`)
+  const hash = await walletClient.writeContract({
+    address: npm,
+    abi: v3NpmAbi,
+    functionName: 'multicall',
+    args: [calls],
+    value: nativeValue > 0n ? nativeValue : undefined,
+    gas,
+    chain: walletClient.chain,
+    account: owner,
+  })
+  return { hash, pool, bands: prepared, amount0: total0, amount1: total1 }
 }
 
 export async function increaseV3Liquidity(opts: {
@@ -4875,6 +5072,142 @@ export async function removeV3Liquidity(opts: {
   return hash
 }
 
+function validateV3PositionBatch(positions: readonly PositionRow[]): {
+  positions: PositionRow[]
+  npm: Address
+} {
+  if (positions.length < 2 || positions.length > 12) {
+    throw new Error('DLMM 批量操作需要 2–12 个 V3 仓位')
+  }
+  if (positions.some((position) => position.version !== 'v3')) {
+    throw new Error('DLMM 组合包含非 V3 仓位')
+  }
+  const unique = new Set(positions.map((position) => position.tokenId.toString()))
+  if (unique.size !== positions.length) throw new Error('DLMM 组合里存在重复的 V3 NFT')
+  const first = positions[0]!
+  const npm = resolveV3Npm(first)
+  const poolKey = positionPoolKey(first)
+  const samePool = positions.every((position) => (
+    resolveV3Npm(position).toLowerCase() === npm.toLowerCase()
+    && positionPoolKey(position) === poolKey
+  ))
+  if (!samePool) throw new Error('只能批量操作同一个 V3 池和 PositionManager 的仓位')
+  return { positions: [...positions], npm }
+}
+
+function appendV3NativePayout(
+  calls: `0x${string}`[],
+  position: PositionRow,
+  owner: Address,
+): void {
+  const other = isWeth(position.token0.address) ? position.token1.address : position.token0.address
+  calls.push(
+    encodeFunctionData({
+      abi: v3NpmAbi,
+      functionName: 'unwrapWETH9',
+      args: [0n, owner],
+    }),
+    encodeFunctionData({
+      abi: v3NpmAbi,
+      functionName: 'sweepToken',
+      args: [other, 0n, owner],
+    }),
+  )
+}
+
+/** One NPM multicall collects all fee balances in a V3 DLMM group. */
+export async function claimV3PositionBatch(opts: {
+  walletClient: WalletClient
+  owner: Address
+  positions: readonly PositionRow[]
+  unwrapEth?: boolean
+}) {
+  const { positions, npm } = validateV3PositionBatch(opts.positions)
+  const wantEth = Boolean(opts.unwrapEth)
+    && pairHasWeth(positions[0]!.token0.address, positions[0]!.token1.address)
+  const recipient = wantEth ? npm : opts.owner
+  const calls: `0x${string}`[] = positions.map((position) => encodeFunctionData({
+    abi: v3NpmAbi,
+    functionName: 'collect',
+    args: [{
+      tokenId: position.tokenId,
+      recipient,
+      amount0Max: MAX_UINT128,
+      amount1Max: MAX_UINT128,
+    }],
+  }))
+  if (wantEth) appendV3NativePayout(calls, positions[0]!, opts.owner)
+  return opts.walletClient.writeContract({
+    address: npm,
+    abi: v3NpmAbi,
+    functionName: 'multicall',
+    args: [calls],
+    chain: opts.walletClient.chain,
+    account: opts.owner,
+  })
+}
+
+/** Atomically decreases, collects and burns every V3 NFT in one DLMM group. */
+export async function closeV3PositionBatch(opts: {
+  walletClient: WalletClient
+  owner: Address
+  positions: readonly PositionRow[]
+  slippageBps?: number
+  unwrapEth?: boolean
+}) {
+  const { positions, npm } = validateV3PositionBatch(opts.positions)
+  const slippageBps = Math.min(5_000, Math.max(0, Math.floor(opts.slippageBps ?? 300)))
+  const wantEth = Boolean(opts.unwrapEth)
+    && pairHasWeth(positions[0]!.token0.address, positions[0]!.token1.address)
+  const recipient = wantEth ? npm : opts.owner
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200)
+  const calls: `0x${string}`[] = []
+
+  for (const position of positions) {
+    if (position.liquidity > 0n) {
+      const amount0Min = position.amount0 - (position.amount0 * BigInt(slippageBps)) / 10_000n
+      const amount1Min = position.amount1 - (position.amount1 * BigInt(slippageBps)) / 10_000n
+      calls.push(encodeFunctionData({
+        abi: v3NpmAbi,
+        functionName: 'decreaseLiquidity',
+        args: [{
+          tokenId: position.tokenId,
+          liquidity: position.liquidity,
+          amount0Min,
+          amount1Min,
+          deadline,
+        }],
+      }))
+    }
+    calls.push(
+      encodeFunctionData({
+        abi: v3NpmAbi,
+        functionName: 'collect',
+        args: [{
+          tokenId: position.tokenId,
+          recipient,
+          amount0Max: MAX_UINT128,
+          amount1Max: MAX_UINT128,
+        }],
+      }),
+      encodeFunctionData({
+        abi: v3NpmAbi,
+        functionName: 'burn',
+        args: [position.tokenId],
+      }),
+    )
+  }
+  if (wantEth) appendV3NativePayout(calls, positions[0]!, opts.owner)
+  return opts.walletClient.writeContract({
+    address: npm,
+    abi: v3NpmAbi,
+    functionName: 'multicall',
+    args: [calls],
+    chain: opts.walletClient.chain,
+    account: opts.owner,
+  })
+}
+
 export async function wrapEth(opts: {
   walletClient: WalletClient
   owner: Address
@@ -5023,7 +5356,7 @@ export async function claimAndCompoundV3(opts: {
         abi: v3PoolAbi,
         functionName: 'slot0',
       })
-      sqrt = (slot0 as readonly [bigint])[0]
+      sqrt = slot0[0]
     } catch {
       /* 用仓位缓存价 */
     }
