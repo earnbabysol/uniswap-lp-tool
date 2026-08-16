@@ -6,7 +6,7 @@
  * same chain from three independent call sites.
  */
 
-export type RpcLane = 'logs' | 'read'
+export type RpcLane = 'logs' | 'read' | 'indexer'
 
 export type RpcErrorKind =
   | 'rate-limit'
@@ -66,6 +66,8 @@ export function classifyRpcError(error: unknown): RpcErrorKind {
     || text.includes('networkerror')
     || text.includes('socket hang up')
     || text.includes('econnreset')
+    || text.includes('http 500')
+    || text.includes('http 501')
     || text.includes('502')
     || text.includes('503')
     || text.includes('504')
@@ -95,11 +97,19 @@ export function rpcBackoffMs(
   kind: RpcErrorKind,
   jitter = Math.random(),
 ): number {
-  const base = chainId === 56 ? 650 : 350
-  const kindMultiplier = kind === 'rate-limit' ? 1.7 : 1
+  // Robinhood's official public endpoint is intentionally rate limited. A
+  // short retry only creates another 429, so give it a materially longer
+  // cooldown while keeping range/network recovery reasonably quick.
+  const base = chainId === 4663
+    ? (kind === 'rate-limit' ? 1_500 : 500)
+    : chainId === 56 ? 650 : 350
+  const kindMultiplier = kind === 'rate-limit'
+    ? (chainId === 4663 ? 1.5 : 1.7)
+    : 1
   const cappedAttempt = Math.max(0, Math.min(attempt, 5))
   const exponential = base * (2 ** cappedAttempt) * kindMultiplier
-  return Math.round(Math.min(8_000, exponential) + Math.max(0, Math.min(jitter, 1)) * 250)
+  const cap = chainId === 4663 ? 15_000 : 8_000
+  return Math.round(Math.min(cap, exponential) + Math.max(0, Math.min(jitter, 1)) * 250)
 }
 
 function laneConfig(chainId: number, lane: RpcLane): { concurrency: number; intervalMs: number } {
@@ -108,19 +118,32 @@ function laneConfig(chainId: number, lane: RpcLane): { concurrency: number; inte
       ? { concurrency: 1, intervalMs: 220 }
       : { concurrency: 2, intervalMs: 70 }
   }
+  if (chainId === 4663) {
+    if (lane === 'indexer') return { concurrency: 3, intervalMs: 250 }
+    // All Robinhood reads share one public quota. Serializing logs and calls
+    // together prevents V3, V4 and APR refreshes from stampeding the endpoint.
+    return { concurrency: 1, intervalMs: 350 }
+  }
   return lane === 'logs'
     ? { concurrency: 2, intervalMs: 35 }
     : { concurrency: 4, intervalMs: 15 }
 }
 
 function getLane(chainId: number, lane: RpcLane): LaneState {
-  const key = `${chainId}:${lane}`
+  const key = chainId === 4663 && lane !== 'indexer'
+    ? `${chainId}:shared`
+    : `${chainId}:${lane}`
   let state = laneStates.get(key)
   if (!state) {
     state = { active: 0, nextStartAt: 0, waiters: [] }
     laneStates.set(key, state)
   }
   return state
+}
+
+function deferLane(chainId: number, lane: RpcLane, delayMs: number): void {
+  const state = getLane(chainId, lane)
+  state.nextStartAt = Math.max(state.nextStartAt, Date.now() + delayMs)
 }
 
 async function acquireLane(chainId: number, lane: RpcLane): Promise<() => void> {
@@ -152,7 +175,7 @@ export async function runRpcTask<T>(opts: {
   task: () => Promise<T>
 }): Promise<T> {
   const lane = opts.lane ?? 'read'
-  const retries = opts.retries ?? (opts.chainId === 56 ? 2 : 1)
+  const retries = opts.retries ?? (opts.chainId === 4663 ? 3 : opts.chainId === 56 ? 2 : 1)
   let lastError: unknown
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
@@ -161,6 +184,12 @@ export async function runRpcTask<T>(opts: {
       return await opts.task()
     } catch (error) {
       lastError = error
+      const kind = classifyRpcError(error)
+      if (kind === 'rate-limit') {
+        // Cool down the shared lane before waking queued work. This protects
+        // unrelated V3/V4 tasks as well as the request that was rejected.
+        deferLane(opts.chainId, lane, rpcBackoffMs(opts.chainId, attempt, kind, 0))
+      }
     } finally {
       release()
     }

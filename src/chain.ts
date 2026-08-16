@@ -336,7 +336,6 @@ export const CHAIN_CONFIGS: Record<SupportedChainId, AppChainConfig> = {
     chain: robinhood,
     defaultRpcUrls: [
       'https://rpc.mainnet.chain.robinhood.com',
-      'https://robinhoodchain.blockscout.com/api/eth-rpc',
     ],
     explorerUrl: 'https://robinhoodchain.blockscout.com',
     explorerApi: 'https://robinhoodchain.blockscout.com',

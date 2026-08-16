@@ -15,7 +15,8 @@ assert.equal(classifyRpcError(new Error('plain revert')), 'other')
 assert.equal(shouldSplitLogRange(new Error('Request exceeds defined limit')), true)
 assert.equal(shouldSplitLogRange(new Error('HTTP 429')), false)
 assert.equal(rpcBackoffMs(56, 0, 'rate-limit', 0), 1105)
-assert.equal(rpcBackoffMs(4663, 1, 'network', 0), 700)
+assert.equal(rpcBackoffMs(4663, 1, 'network', 0), 1000)
+assert.equal(rpcBackoffMs(4663, 0, 'rate-limit', 0), 2250)
 
 resetRpcScheduler()
 const requested = []

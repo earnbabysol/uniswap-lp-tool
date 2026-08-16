@@ -8,11 +8,15 @@ import {
   decodeEventLog,
   fallback,
   http,
+  pad,
   parseAbiItem,
   slice,
+  toEventSelector,
   zeroAddress,
+  type AbiEvent,
   type Address,
   type Hash,
+  type Hex,
   type PublicClient,
   type TransactionReceipt,
 } from 'viem'
@@ -512,11 +516,13 @@ async function readBatch(
   if (contracts.length === 0) return []
   // Robinhood 的公共 RPC 对超大 eth_call / batch 很容易 429。Multicall3 仍然
   // 批量读，但按固定大小拆包；mapPool 保持原顺序，调用方可继续按下标配对。
+  const isRobinhood = client.chain?.id === 4663
+  const chunkSize = isRobinhood ? 60 : 160
   const chunks: Array<readonly unknown[]> = []
-  for (let i = 0; i < contracts.length; i += 160) {
-    chunks.push(contracts.slice(i, i + 160))
+  for (let i = 0; i < contracts.length; i += chunkSize) {
+    chunks.push(contracts.slice(i, i + chunkSize))
   }
-  const nested = await mapPool(chunks, 2, async (chunk) => (
+  const nested = await mapPool(chunks, isRobinhood ? 1 : 2, async (chunk) => (
     client.multicall({
       allowFailure: true,
       contracts: chunk as never,
@@ -608,6 +614,430 @@ function friendlyErrorText(error: unknown): string {
   if (lower.includes('failed to fetch') || lower.includes('http request failed')) return 'RPC 网络请求失败'
   const firstLine = full.split(/\r?\n/, 1)[0]?.trim() || '未知错误'
   return firstLine.length > 220 ? `${firstLine.slice(0, 217)}…` : firstLine
+}
+
+type IndexedTopicPosition = 1 | 2 | 3
+
+type FlowDecodedLog<TArgs> = {
+  address: Address
+  args: TArgs
+  transactionHash: Hash
+  logIndex: number
+  blockNumber: bigint
+}
+
+type BlockscoutV2Log = {
+  address?: string | { hash?: string }
+  block_number?: number
+  data?: string
+  index?: number
+  topics?: Array<string | null>
+  transaction_hash?: string
+}
+
+type BlockscoutV2LogsResponse = {
+  items?: BlockscoutV2Log[]
+  next_page_params?: Record<string, string | number | null> | null
+}
+
+function addressTopic(address: Address): Hex {
+  return pad(address, { size: 32 })
+}
+
+/**
+ * Robinhood's public RPC is rate limited and explicitly not intended for a
+ * production log indexer. Blockscout exposes the already-indexed logs via its
+ * paginated v2 API, so historical V3/V4 scans do not need eth_getLogs at all.
+ */
+async function readRobinhoodV2Logs<TArgs>(opts: {
+  event: AbiEvent
+  address: Address
+  indexedTopics?: Partial<Record<IndexedTopicPosition, Hex>>
+  fromBlock: bigint
+  toBlock: bigint
+  label: string
+}): Promise<FlowDecodedLog<TArgs>[]> {
+  const cfg = CHAIN_CONFIGS[4663]
+  const topic0 = toEventSelector(opts.event)
+  // The v2 endpoint can match a topic in any indexed position. Prefer the
+  // most selective indexed filter (pool id / sender); otherwise use topic0.
+  const queryTopic = ([3, 2, 1] as const)
+    .map((position) => opts.indexedTopics?.[position])
+    .find((topic): topic is Hex => Boolean(topic)) ?? topic0
+  const output: FlowDecodedLog<TArgs>[] = []
+  let pageParams: Record<string, string | number | null> = { topic: queryTopic }
+
+  for (let page = 0; page < 250; page += 1) {
+    const url = new URL(`${cfg.explorerApi}/api/v2/addresses/${opts.address}/logs`)
+    for (const [key, value] of Object.entries(pageParams)) {
+      if (value != null) url.searchParams.set(key, String(value))
+    }
+    const payload = await runRpcTask({
+      chainId: 4663,
+      lane: 'indexer',
+      label: `${opts.label} (Blockscout)`,
+      task: () => fetchJson<BlockscoutV2LogsResponse>(url.toString(), 15_000),
+    })
+    if (!Array.isArray(payload.items)) throw new Error('Blockscout 日志响应格式异常')
+    let reachedWindowStart = false
+    for (const raw of payload.items) {
+      const blockNumber = BigInt(raw.block_number ?? 0)
+      if (blockNumber > opts.toBlock) continue
+      if (blockNumber < opts.fromBlock) {
+        reachedWindowStart = true
+        continue
+      }
+      const topics = (raw.topics ?? [])
+        .filter((topic): topic is Hex => typeof topic === 'string' && topic.startsWith('0x'))
+      if (topics[0]?.toLowerCase() !== topic0.toLowerCase()) continue
+      const indexedMatch = ([1, 2, 3] as const).every((position) => {
+        const expected = opts.indexedTopics?.[position]
+        return !expected || topics[position]?.toLowerCase() === expected.toLowerCase()
+      })
+      if (!indexedMatch) continue
+      const address = typeof raw.address === 'string' ? raw.address : raw.address?.hash
+      if (topics.length === 0 || !raw.data || !address || !raw.transaction_hash) {
+        throw new Error('Blockscout 返回了不完整的日志')
+      }
+      const decoded = decodeEventLog({
+        abi: [opts.event],
+        data: raw.data as Hex,
+        topics: topics as [Hex, ...Hex[]],
+        strict: false,
+      })
+      output.push({
+        address: address as Address,
+        args: decoded.args as TArgs,
+        transactionHash: raw.transaction_hash as Hash,
+        logIndex: raw.index ?? 0,
+        blockNumber,
+      })
+    }
+    if (
+      reachedWindowStart
+      || !payload.next_page_params
+      || Object.keys(payload.next_page_params).length === 0
+    ) return output
+    pageParams = payload.next_page_params
+  }
+  throw new Error(`Blockscout ${opts.label} 分页超过安全上限`)
+}
+
+type RobinhoodBulkLogSnapshot = {
+  fromBlock: bigint
+  toBlock: bigint
+  logs: BlockscoutV2Log[]
+}
+
+type RobinhoodBulkLogCache = {
+  entry?: RobinhoodBulkLogSnapshot
+  promise?: Promise<RobinhoodBulkLogSnapshot>
+}
+
+type RobinhoodEventLogCache = {
+  fromBlock: bigint
+  toBlock: bigint
+  logs: FlowDecodedLog<unknown>[]
+}
+
+const robinhoodBulkLogCaches = new Map<string, RobinhoodBulkLogCache>()
+const robinhoodEventLogCaches = new Map<string, RobinhoodEventLogCache>()
+let robinhoodCsvBlockedUntil = 0
+
+async function fetchText(url: string, timeoutMs: number): Promise<string> {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    const response = await fetch(url, { signal: ctrl.signal })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    return await response.text()
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function parseBlockscoutCsv(text: string): BlockscoutV2Log[] {
+  const lines = text.split(/\r?\n/)
+  if (!lines[0]?.startsWith('TxHash,Index,BlockNumber,')) {
+    throw new Error('Blockscout CSV 日志格式异常')
+  }
+  const logs: BlockscoutV2Log[] = []
+  for (let i = 1; i < lines.length; i += 1) {
+    const line = lines[i]
+    if (!line) continue
+    // All exported log columns are numeric or hex, so commas cannot occur in
+    // field values and a small parser is both safer and faster than a CSV lib.
+    const columns = line.split(',')
+    if (columns.length < 10) continue
+    const blockNumber = Number(columns[2])
+    if (!Number.isSafeInteger(blockNumber)) continue
+    logs.push({
+      transaction_hash: columns[0],
+      index: Number(columns[1]) || 0,
+      block_number: blockNumber,
+      address: columns[4],
+      data: columns[5],
+      topics: columns.slice(6, 10).map((topic) => topic || null),
+    })
+  }
+  return logs
+}
+
+async function fetchRobinhoodCsvSnapshot(opts: {
+  address: Address
+  fromBlock: bigint
+  toBlock: bigint
+  label: string
+}): Promise<RobinhoodBulkLogSnapshot> {
+  if (Date.now() < robinhoodCsvBlockedUntil) {
+    throw new Error('Blockscout CSV 429（本轮改用分页接口）')
+  }
+  const cfg = CHAIN_CONFIGS[4663]
+  // Build the first snapshot for the whole monitor window even when the
+  // persisted movement cursor only asks for the newest reorg overlap. APR
+  // runs immediately afterwards and can then reuse the same PoolManager data
+  // instead of downloading a second, much larger snapshot.
+  const lookback = LOG_SCAN[4663].lookback
+  const snapshotFromBlock = opts.toBlock > lookback ? opts.toBlock - lookback : 0n
+  const blockCount = Number(opts.toBlock - snapshotFromBlock + 1n)
+  // The chain currently produces roughly 30k blocks per 45 minutes. Add a
+  // generous clock/indexing margin, then filter by exact block below.
+  const estimatedWindowMs = Number.isFinite(blockCount)
+    ? (blockCount / 30_000) * 50 * 60_000 + 3 * 60_000
+    : 55 * 60_000
+  const durationMs = Math.min(55 * 60_000, Math.max(5 * 60_000, estimatedWindowMs))
+  const toPeriod = Date.now() + 90_000
+  const fromPeriod = toPeriod - durationMs
+  const poolManager = cfg.contracts.v4PoolManager.toLowerCase()
+  // PoolManager emits dense Swap logs. Keep each export well below its 10k
+  // row cap; normal NPM and per-pool exports fit in one request.
+  const maxWindowMs = opts.address.toLowerCase() === poolManager ? 25 * 60_000 : durationMs
+
+  const fetchPeriod = async (fromMs: number, toMs: number): Promise<BlockscoutV2Log[]> => {
+    const url = new URL(`${cfg.explorerApi}/api/v2/addresses/${opts.address}/logs/csv`)
+    url.searchParams.set('from_period', new Date(fromMs).toISOString())
+    url.searchParams.set('to_period', new Date(toMs).toISOString())
+    let text: string
+    try {
+      text = await runRpcTask({
+        chainId: 4663,
+        lane: 'indexer',
+        label: `${opts.label} (Blockscout CSV)`,
+        // CSV exports have an hourly quota. Retrying seconds later cannot
+        // restore it; fall back to the higher-quota paginated API immediately.
+        retries: 0,
+        task: () => fetchText(url.toString(), 30_000),
+      })
+    } catch (error) {
+      if (classifyRpcError(error) === 'rate-limit') {
+        robinhoodCsvBlockedUntil = Date.now() + 60 * 60_000
+      }
+      throw error
+    }
+    const logs = parseBlockscoutCsv(text)
+    if (logs.length >= 9_999 && toMs - fromMs > 60_000) {
+      const middle = Math.floor(fromMs + (toMs - fromMs) / 2)
+      const left = await fetchPeriod(fromMs, middle)
+      const right = await fetchPeriod(middle + 1, toMs)
+      return [...left, ...right]
+    }
+    return logs
+  }
+
+  const periods: Array<{ from: number; to: number }> = []
+  for (let from = fromPeriod; from < toPeriod; from += maxWindowMs) {
+    periods.push({ from, to: Math.min(toPeriod, from + maxWindowMs) })
+  }
+  const rawLogs = (await mapPool(periods, 3, (period) =>
+    fetchPeriod(period.from, period.to))).flat()
+  const unique = new Map<string, BlockscoutV2Log>()
+  for (const log of rawLogs) {
+    const key = `${log.transaction_hash ?? ''}:${log.index ?? 0}`
+    unique.set(key, log)
+  }
+  return {
+    fromBlock: snapshotFromBlock,
+    toBlock: opts.toBlock,
+    logs: [...unique.values()],
+  }
+}
+
+async function getRobinhoodBulkSnapshot(opts: {
+  address: Address
+  fromBlock: bigint
+  toBlock: bigint
+  label: string
+}): Promise<RobinhoodBulkLogSnapshot> {
+  const addressKey = opts.address.toLowerCase()
+  let cache = robinhoodBulkLogCaches.get(addressKey)
+  if (!cache) {
+    cache = {}
+    robinhoodBulkLogCaches.set(addressKey, cache)
+  }
+  if (cache.entry && opts.fromBlock >= cache.entry.fromBlock) return cache.entry
+  if (cache.promise) return cache.promise
+
+  const pending = fetchRobinhoodCsvSnapshot(opts)
+  cache.promise = pending
+  try {
+    const entry = await pending
+    cache.entry = entry
+    for (const key of robinhoodEventLogCaches.keys()) {
+      if (key.startsWith(`${addressKey}:`)) robinhoodEventLogCaches.delete(key)
+    }
+    if (robinhoodBulkLogCaches.size > 80) {
+      const oldest = robinhoodBulkLogCaches.keys().next().value as string | undefined
+      if (oldest) robinhoodBulkLogCaches.delete(oldest)
+    }
+    return entry
+  } finally {
+    if (cache.promise === pending) cache.promise = undefined
+  }
+}
+
+function decodeRobinhoodLogs<TArgs>(opts: {
+  logs: BlockscoutV2Log[]
+  event: AbiEvent
+  indexedTopics?: Partial<Record<IndexedTopicPosition, Hex>>
+  fromBlock: bigint
+  toBlock: bigint
+}): FlowDecodedLog<TArgs>[] {
+  const topic0 = toEventSelector(opts.event).toLowerCase()
+  const output: FlowDecodedLog<TArgs>[] = []
+  for (const raw of opts.logs) {
+    const blockNumber = BigInt(raw.block_number ?? 0)
+    if (blockNumber < opts.fromBlock || blockNumber > opts.toBlock) continue
+    const topics = (raw.topics ?? [])
+      .filter((topic): topic is Hex => typeof topic === 'string' && topic.startsWith('0x'))
+    if (topics[0]?.toLowerCase() !== topic0) continue
+    const indexedMatch = ([1, 2, 3] as const).every((position) => {
+      const expected = opts.indexedTopics?.[position]
+      return !expected || topics[position]?.toLowerCase() === expected.toLowerCase()
+    })
+    if (!indexedMatch) continue
+    const address = typeof raw.address === 'string' ? raw.address : raw.address?.hash
+    if (!raw.data || !address || !raw.transaction_hash) continue
+    const decoded = decodeEventLog({
+      abi: [opts.event],
+      data: raw.data as Hex,
+      topics: topics as [Hex, ...Hex[]],
+      strict: false,
+    })
+    output.push({
+      address: address as Address,
+      args: decoded.args as TArgs,
+      transactionHash: raw.transaction_hash as Hash,
+      logIndex: raw.index ?? 0,
+      blockNumber,
+    })
+  }
+  return output
+}
+
+async function readRobinhoodIndexedLogs<TArgs>(opts: {
+  event: AbiEvent
+  address: Address
+  indexedTopics?: Partial<Record<IndexedTopicPosition, Hex>>
+  fromBlock: bigint
+  toBlock: bigint
+  label: string
+}): Promise<FlowDecodedLog<TArgs>[]> {
+  const addressKey = opts.address.toLowerCase()
+  const topicKey = ([1, 2, 3] as const)
+    .map((position) => opts.indexedTopics?.[position]?.toLowerCase() ?? '')
+    .join(':')
+  const cacheKey = `${addressKey}:${toEventSelector(opts.event).toLowerCase()}:${topicKey}`
+
+  let eventCache = robinhoodEventLogCaches.get(cacheKey)
+  if (!eventCache || opts.fromBlock < eventCache.fromBlock) {
+    try {
+      const bulk = await getRobinhoodBulkSnapshot(opts)
+      const logs = decodeRobinhoodLogs<TArgs>({
+        logs: bulk.logs,
+        event: opts.event,
+        indexedTopics: opts.indexedTopics,
+        fromBlock: bulk.fromBlock,
+        toBlock: bulk.toBlock,
+      })
+      eventCache = {
+        fromBlock: bulk.fromBlock,
+        toBlock: bulk.toBlock,
+        logs: logs as FlowDecodedLog<unknown>[],
+      }
+      robinhoodEventLogCaches.set(cacheKey, eventCache)
+    } catch (error) {
+      if (import.meta.env.DEV) {
+        console.debug(`[flow] ${opts.label} CSV 降级到分页：${friendlyErrorText(error)}`)
+      }
+      return readRobinhoodV2Logs<TArgs>(opts)
+    }
+  }
+
+  if (opts.toBlock > eventCache.toBlock) {
+    const deltaFrom = eventCache.toBlock + 1n
+    const delta = await readRobinhoodV2Logs<TArgs>({
+      ...opts,
+      fromBlock: deltaFrom,
+    })
+    const merged = new Map<string, FlowDecodedLog<unknown>>()
+    for (const log of eventCache.logs) {
+      merged.set(`${log.transactionHash}:${log.logIndex}`, log)
+    }
+    for (const log of delta) {
+      merged.set(`${log.transactionHash}:${log.logIndex}`, log as FlowDecodedLog<unknown>)
+    }
+    eventCache.logs = [...merged.values()]
+    eventCache.toBlock = opts.toBlock
+  }
+
+  return eventCache.logs
+    .filter((log) => log.blockNumber >= opts.fromBlock && log.blockNumber <= opts.toBlock)
+    .map((log) => log as FlowDecodedLog<TArgs>)
+}
+
+/** Prefer Robinhood's indexed API, with RPC as a compatibility fallback. */
+async function readFlowLogs<TArgs>(opts: {
+  chainId: FlowChainId
+  event: AbiEvent
+  explorerAddress?: Address
+  explorerIndexedTopics?: Partial<Record<IndexedTopicPosition, Hex>>
+  fromBlock: bigint
+  toBlock: bigint
+  maxSpan: bigint
+  label: string
+  request: (fromBlock: bigint, toBlock: bigint) => Promise<readonly FlowDecodedLog<TArgs>[]>
+}): Promise<FlowDecodedLog<TArgs>[]> {
+  if (opts.chainId === 4663 && opts.explorerAddress) {
+    try {
+      return await readRobinhoodIndexedLogs<TArgs>({
+        event: opts.event,
+        address: opts.explorerAddress,
+        indexedTopics: opts.explorerIndexedTopics,
+        fromBlock: opts.fromBlock,
+        toBlock: opts.toBlock,
+        label: opts.label,
+      })
+    } catch (error) {
+      const customRpc = loadCustomRpcUrl(4663)
+      if (import.meta.env.DEV) {
+        const target = customRpc ? '自定义 RPC' : '缓存保护'
+        console.debug(`[flow] ${opts.label} Blockscout 转入${target}：${friendlyErrorText(error)}`)
+      }
+      // Never send a heavy historical query to Robinhood's rate-limited
+      // public RPC. A user-provided Alchemy/QuickNode URL may opt into that
+      // compatibility fallback; otherwise preserve cached data and surface
+      // the indexer error instead of recreating the original 429 storm.
+      if (!customRpc) throw error
+    }
+  }
+  return readLogsAdaptive({
+    chainId: opts.chainId,
+    fromBlock: opts.fromBlock,
+    toBlock: opts.toBlock,
+    maxSpan: opts.maxSpan,
+    label: opts.label,
+    request: opts.request,
+  })
 }
 
 async function timedSource<T>(label: string, promise: Promise<T>): Promise<T> {
@@ -728,25 +1158,43 @@ async function fetchWethUsdOnChain(client: PublicClient, chainId: FlowChainId): 
   const fees = [100, 500, 2_500, 3_000, 10_000]
   const jobs = factories.flatMap((factory) =>
     fees.flatMap((fee) => stables.map((stable) => ({ factory, fee, stable }))))
+  const poolResults = await readBatch(client, jobs.map((job) => ({
+    address: job.factory,
+    abi: v3FactoryAbi,
+    functionName: 'getPool',
+    args: [weth, job.stable, job.fee],
+  })))
   const seenPools = new Set<string>()
-  const results = await mapPool(jobs, chainId === 56 ? 5 : 8, async (job) => {
+  const pools: Address[] = []
+  for (const result of poolResults) {
+    if (result?.status !== 'success') continue
+    const pool = result.result as Address
+    if (!pool || pool === zeroAddress || seenPools.has(pool.toLowerCase())) continue
+    seenPools.add(pool.toLowerCase())
+    pools.push(pool)
+  }
+  const results = await mapPool(pools, chainId === 4663 ? 1 : chainId === 56 ? 3 : 5, async (pool) => {
     try {
-      const pool = await client.readContract({
-        address: job.factory,
-        abi: v3FactoryAbi,
-        functionName: 'getPool',
-        args: [weth, job.stable, job.fee],
-      })
-      if (!pool || pool === zeroAddress) return null
-      const poolKey = pool.toLowerCase()
-      if (seenPools.has(poolKey)) return null
-      seenPools.add(poolKey)
-      const [slot0, token0, token1, liquidity] = await Promise.all([
-        client.readContract({ address: pool, abi: v3PoolAbi, functionName: 'slot0' }),
-        client.readContract({ address: pool, abi: v3PoolAbi, functionName: 'token0' }),
-        client.readContract({ address: pool, abi: v3PoolAbi, functionName: 'token1' }),
-        client.readContract({ address: pool, abi: v3PoolAbi, functionName: 'liquidity' }),
+      const detailResults = await readBatch(client, [
+        { address: pool, abi: v3PoolAbi, functionName: 'slot0' },
+        { address: pool, abi: v3PoolAbi, functionName: 'token0' },
+        { address: pool, abi: v3PoolAbi, functionName: 'token1' },
+        { address: pool, abi: v3PoolAbi, functionName: 'liquidity' },
       ])
+      const slotResult = detailResults[0]
+      const token0Result = detailResults[1]
+      const token1Result = detailResults[2]
+      const liquidityResult = detailResults[3]
+      if (
+        slotResult?.status !== 'success'
+        || token0Result?.status !== 'success'
+        || token1Result?.status !== 'success'
+        || liquidityResult?.status !== 'success'
+      ) return null
+      const slot0 = slotResult.result as readonly unknown[]
+      const token0 = token0Result.result as Address
+      const token1 = token1Result.result as Address
+      const liquidity = BigInt(liquidityResult.result as bigint)
       const [m0, m1] = await Promise.all([
         tokenMeta(client, chainId, token0),
         tokenMeta(client, chainId, token1),
@@ -1004,8 +1452,10 @@ async function fetchNpmLogsRange(
   try {
     // Read the two event streams in sequence. The shared scheduler still lets
     // other chains progress, while avoiding a BSC burst at every chunk edge.
-    const incs = await readLogsAdaptive({
+    const incs = await readFlowLogs<{ tokenId?: bigint; amount0?: bigint; amount1?: bigint }>({
       chainId,
+      event: INC_EVENT,
+      explorerAddress: npm,
       fromBlock,
       toBlock,
       maxSpan: span,
@@ -1017,8 +1467,10 @@ async function fetchNpmLogsRange(
         toBlock: to,
       }),
     })
-    const decs = await readLogsAdaptive({
+    const decs = await readFlowLogs<{ tokenId?: bigint; amount0?: bigint; amount1?: bigint }>({
       chainId,
+      event: DEC_EVENT,
+      explorerAddress: npm,
       fromBlock,
       toBlock,
       maxSpan: span,
@@ -1076,9 +1528,15 @@ async function fetchV3PoolLogsRange(
   span: bigint,
 ): Promise<RawV3PoolLog[]> {
   if (fromBlock > toBlock) return []
+  // Blockscout v2 requires an address and pool addresses are not known yet.
+  // This index is optional; position/receipt resolution below remains the
+  // authoritative path without an address-less Robinhood eth_getLogs call.
+  if (chainId === 4663) return []
   try {
-    const mints = await readLogsAdaptive({
+    const mints = await readFlowLogs<{ amount0?: bigint; amount1?: bigint }>({
       chainId,
+      event: V3_POOL_MINT,
+      explorerIndexedTopics: { 1: addressTopic(npm) },
       fromBlock,
       toBlock,
       maxSpan: span,
@@ -1090,8 +1548,10 @@ async function fetchV3PoolLogsRange(
         toBlock: to,
       }),
     })
-    const burns = await readLogsAdaptive({
+    const burns = await readFlowLogs<{ amount0?: bigint; amount1?: bigint }>({
       chainId,
+      event: V3_POOL_BURN,
+      explorerIndexedTopics: { 1: addressTopic(npm) },
       fromBlock,
       toBlock,
       maxSpan: span,
@@ -1557,7 +2017,7 @@ async function resolvePositionsBatch(
     out.set(candidate.ref.id, row)
   }
 
-  await mapPool([...fallbackRefs.values()], chainId === 56 ? 3 : 4, async (ref) => {
+  await mapPool([...fallbackRefs.values()], chainId === 4663 ? 1 : chainId === 56 ? 3 : 4, async (ref) => {
     if (out.has(ref.id)) return
     const tokenId = BigInt(ref.id)
     const current = invalidIds.has(ref.id) ? null : await resolvePos(client, chainId, tokenId)
@@ -1577,7 +2037,7 @@ async function fetchNpmFlowLogs(
   const cache = logCaches[chainId]
   const scan = LOG_SCAN[chainId]
   try {
-    const head = await getScanHead(client, chainId)
+    const head = await retryRateLimited(chainId, () => getScanHead(client, chainId))
     const { latest, windowStart } = head
 
     let from: bigint
@@ -1607,7 +2067,8 @@ async function fetchNpmFlowLogs(
     // 完整处理 45 分钟窗口；上限只用于防御异常节点返回无限量垃圾日志。
     const useful = rawLogs.slice(0, 10_000)
     try {
-      await seedV3PositionsFromPoolLogs(client, chainId, useful, poolLogs)
+      await retryRateLimited(chainId, () =>
+        seedV3PositionsFromPoolLogs(client, chainId, useful, poolLogs))
     } catch (error) {
       if (import.meta.env.DEV) {
         console.debug(`[flow] V3 pool 批量解析降级：${friendlyErrorText(error)}`)
@@ -1622,10 +2083,9 @@ async function fetchNpmFlowLogs(
         tokenRefs.set(id, { id, log })
       }
     }
-    const [wethUsd, positions] = await Promise.all([
-      wethUsdOnChain(client, chainId),
-      resolvePositionsBatch(client, chainId, [...tokenRefs.values()]),
-    ])
+    const wethUsd = await retryRateLimited(chainId, () => wethUsdOnChain(client, chainId))
+    const positions = await retryRateLimited(chainId, () =>
+      resolvePositionsBatch(client, chainId, [...tokenRefs.values()]))
     const parsed = useful.map((l) => {
       const tokenId = l.args.tokenId
       if (tokenId == null) return null
@@ -1881,7 +2341,7 @@ async function resolveV4PoolsBatch(
     out.set(candidate.poolId.toLowerCase(), row)
   }
 
-  await mapPool([...fallbackIds], chainId === 56 ? 3 : 4, async (poolId) => {
+  await mapPool([...fallbackIds], chainId === 4663 ? 1 : chainId === 56 ? 3 : 4, async (poolId) => {
     if (out.has(poolId.toLowerCase())) return
     out.set(poolId.toLowerCase(), await resolveV4Pool(client, chainId, poolId))
   })
@@ -1908,8 +2368,17 @@ async function fetchV4ModifyRange(
 }>> {
   if (fromBlock > toBlock) return []
   try {
-    const logs = await readLogsAdaptive({
+    const logs = await readFlowLogs<{
+      id?: Hex
+      tickLower?: number
+      tickUpper?: number
+      liquidityDelta?: bigint
+      salt?: Hex
+    }>({
       chainId,
+      event: V4_MODIFY,
+      explorerAddress: poolManager,
+      explorerIndexedTopics: { 2: addressTopic(positionManager) },
       fromBlock,
       toBlock,
       maxSpan: span,
@@ -1950,7 +2419,7 @@ async function fetchV4FlowLogs(
   const cache = v4Caches[chainId]
   const scan = LOG_SCAN[chainId]
   try {
-    const head = await getScanHead(client, chainId)
+    const head = await retryRateLimited(chainId, () => getScanHead(client, chainId))
     const { latest, windowStart } = head
 
     let from: bigint
@@ -1987,10 +2456,9 @@ async function fetchV4FlowLogs(
       .sort((a, b) => Number(b.blockNumber - a.blockNumber))
       .slice(0, 10_000)
     const poolIds = [...new Map(useful.map((log) => [log.poolId.toLowerCase(), log.poolId])).values()]
-    const [wethUsd, pools] = await Promise.all([
-      wethUsdOnChain(client, chainId),
-      resolveV4PoolsBatch(client, chainId, poolIds),
-    ])
+    const wethUsd = await retryRateLimited(chainId, () => wethUsdOnChain(client, chainId))
+    const pools = await retryRateLimited(chainId, () =>
+      resolveV4PoolsBatch(client, chainId, poolIds))
     const parsed = useful.map((l) => {
       const info = pools.get(l.poolId.toLowerCase())
       if (!info) return null
@@ -2240,14 +2708,22 @@ async function fetchV3AprSwaps(
 ): Promise<V3AprSwap[]> {
   if (pools.length === 0) return []
   const addressChunks: Address[][] = []
-  for (let i = 0; i < pools.length; i += 6) addressChunks.push(pools.slice(i, i + 6))
+  const addressChunkSize = chainId === 4663 ? 1 : 6
+  for (let i = 0; i < pools.length; i += addressChunkSize) {
+    addressChunks.push(pools.slice(i, i + addressChunkSize))
+  }
+  const ranges = chainId === 4663
+    ? [{ from: head.windowStart, to: head.latest }]
+    : blockRanges(head, APR_LOG_SPAN[chainId])
   const jobs = addressChunks.flatMap((addresses) =>
-    blockRanges(head, APR_LOG_SPAN[chainId]).map((range) => ({ addresses, ...range })))
+    ranges.map((range) => ({ addresses, ...range })))
   const nested = await mapPool(jobs, 2, async (job) => {
     const address = job.addresses.length === 1 ? job.addresses[0]! : job.addresses
     try {
-      const logs = await readLogsAdaptive({
+      const logs = await readFlowLogs<{ amount0?: bigint; amount1?: bigint }>({
         chainId,
+        event: V3_SWAP,
+        explorerAddress: job.addresses.length === 1 ? job.addresses[0] : undefined,
         fromBlock: job.from,
         toBlock: job.to,
         maxSpan: APR_LOG_SPAN[chainId],
@@ -2312,14 +2788,28 @@ async function fetchV4AprSwaps(
   if (poolIds.length === 0) return []
   const cfg = CHAIN_CONFIGS[chainId]
   const idChunks: Array<`0x${string}`[]> = []
-  for (let i = 0; i < poolIds.length; i += 10) idChunks.push(poolIds.slice(i, i + 10))
+  const idChunkSize = chainId === 4663 ? 1 : 10
+  for (let i = 0; i < poolIds.length; i += idChunkSize) {
+    idChunks.push(poolIds.slice(i, i + idChunkSize))
+  }
+  const ranges = chainId === 4663
+    ? [{ from: head.windowStart, to: head.latest }]
+    : blockRanges(head, APR_LOG_SPAN[chainId])
   const jobs = idChunks.flatMap((ids) =>
-    blockRanges(head, APR_LOG_SPAN[chainId]).map((range) => ({ ids, ...range })))
+    ranges.map((range) => ({ ids, ...range })))
   const nested = await mapPool(jobs, 2, async (job) => {
     const id = job.ids.length === 1 ? job.ids[0]! : job.ids
     try {
-      const logs = await readLogsAdaptive({
+      const logs = await readFlowLogs<{
+        id?: Hex
+        amount0?: bigint
+        amount1?: bigint
+        fee?: number
+      }>({
         chainId,
+        event: V4_SWAP,
+        explorerAddress: cfg.contracts.v4PoolManager,
+        explorerIndexedTopics: job.ids.length === 1 ? { 1: job.ids[0] } : undefined,
         fromBlock: job.from,
         toBlock: job.to,
         maxSpan: APR_LOG_SPAN[chainId],
@@ -2488,11 +2978,12 @@ async function fetchV4AprMetrics(
   const poolIds = [...new Map(events.flatMap((event) => event.poolId
     ? [[event.poolId.toLowerCase(), event.poolId] as const]
     : [])).values()]
-  const [head, wethUsd, poolRows] = await Promise.all([
-    retryRateLimited(chainId, () => getScanHead(client, chainId)),
-    retryRateLimited(chainId, () => wethUsdOnChain(client, chainId)),
-    retryRateLimited(chainId, () => resolveV4PoolsBatch(client, chainId, poolIds)),
-  ])
+  // Keep state reads behind the same lane as V3. Robinhood's quota is shared,
+  // so three individually-retried promises in parallel still form a burst.
+  const head = await retryRateLimited(chainId, () => getScanHead(client, chainId))
+  const wethUsd = await retryRateLimited(chainId, () => wethUsdOnChain(client, chainId))
+  const poolRows = await retryRateLimited(chainId, () =>
+    resolveV4PoolsBatch(client, chainId, poolIds))
   const candidates = poolIds.flatMap((poolId) => {
     const row = poolRows.get(poolId.toLowerCase())
     return row ? [{ poolId, row }] : []
@@ -2858,15 +3349,15 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
   }
   if (opts.chainIds.includes(4663)) {
     jobs.push(
-      timedSource('Robinhood V3', fetchNpmFlowLogs(4663, { minUsd, limit })).then((r) => {
-        if (r.error) notices.push({ level: 'error', message: `Robinhood V3：${r.error}` })
-        parts.push(...r.events)
+      timedSource('Robinhood V3', fetchNpmFlowLogs(4663, { minUsd, limit })).then((result) => {
+        if (result.error) notices.push({ level: 'error', message: `Robinhood V3：${result.error}` })
+        parts.push(...result.events)
       }),
     )
     jobs.push(
-      timedSource('Robinhood V4', fetchV4FlowLogs(4663, { minUsd, limit })).then((r) => {
-        if (r.error) notices.push({ level: 'error', message: `Robinhood V4：${r.error}` })
-        parts.push(...r.events)
+      timedSource('Robinhood V4', fetchV4FlowLogs(4663, { minUsd, limit })).then((result) => {
+        if (result.error) notices.push({ level: 'error', message: `Robinhood V4：${result.error}` })
+        parts.push(...result.events)
       }),
     )
   }
