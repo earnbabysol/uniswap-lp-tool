@@ -2957,18 +2957,78 @@ input:focus-visible, select:focus-visible, select:focus {
 .page-mint .mint-amounts { background: var(--card); }
 .page-mint .mint-amounts .grid2 { gap: 8px; }
 .page-mint .mint-native-setting {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: auto minmax(260px, 1fr) auto;
   align-items: center;
-  gap: 6px 9px;
+  gap: 7px 10px;
   margin: 0 0 10px;
-  font-size: 13.5px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--card);
+  font-size: 14px;
 }
-.page-mint .mint-native-wallet {
-  margin-left: auto;
+.page-mint .mint-payment-label {
+  color: var(--muted);
+  font-weight: 650;
+  white-space: nowrap;
+}
+.page-mint .mint-payment-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+}
+.page-mint .mint-payment-option {
+  min-width: 0;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--muted);
+  background: var(--card-2);
+  font: inherit;
+  cursor: pointer;
+}
+.page-mint .mint-payment-option:hover { border-color: var(--accent); }
+.page-mint .mint-payment-option.active {
+  border-color: var(--accent);
   color: var(--ink);
-  font-size: 13.5px;
-  font-weight: 600;
+  background: color-mix(in srgb, var(--accent) 10%, var(--card));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+.page-mint .mint-payment-option b {
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.page-mint .mint-balance-refresh { white-space: nowrap; }
+.page-mint .mint-payment-note {
+  grid-column: 2 / -1;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.page-mint .mint-native-setting.native-only {
+  grid-template-columns: auto 1fr auto;
+}
+.page-mint .mint-native-only-value {
+  color: var(--ink);
+  font-weight: 650;
+}
+@media (max-width: 700px) {
+  .page-mint .mint-native-setting {
+    display: flex;
+    flex-wrap: wrap;
+  }
+  .page-mint .mint-payment-label,
+  .page-mint .mint-payment-options,
+  .page-mint .mint-payment-note { width: 100%; }
+  .page-mint .mint-balance-refresh { margin-left: auto; }
 }
 .page-mint label.amt { padding: 7px 9px; gap: 3px; }
 .page-mint label.amt input { font-size: 16px; padding: 1px 0 0; }

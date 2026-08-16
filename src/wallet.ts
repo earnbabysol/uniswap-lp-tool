@@ -17,6 +17,7 @@ import {
 } from './chain'
 import { loadCustomRpcUrl } from './rpcSettings'
 import { getActiveAccount, type LocalAccount } from './signer'
+import { withTimeout } from './async'
 
 /**
  * 只读 transport。
@@ -82,6 +83,40 @@ export const publicClient: PublicClient = new Proxy({} as PublicClient, {
     return typeof value === 'function' ? value.bind(clientBox.current) : value
   },
 })
+
+/**
+ * 直接向插件钱包当前使用的节点读取原生币余额。
+ *
+ * 公共 RPC 偶尔会返回过期的 0，但这不是 transport error，viem fallback 不会继续尝试
+ * 钱包节点。这里只在钱包确实位于应用当前链时读取，供余额逻辑做交叉校验。
+ */
+export async function getInjectedNativeBalance(
+  owner: Address,
+  expectedChainId: SupportedChainId,
+): Promise<bigint | null> {
+  if (typeof window === 'undefined' || !window.ethereum) return null
+  try {
+    const rawChainId = await withTimeout(
+      window.ethereum.request({ method: 'eth_chainId' }),
+      1_500,
+      '钱包网络读取',
+    )
+    if (typeof rawChainId !== 'string' || Number(BigInt(rawChainId)) !== expectedChainId) return null
+    const rawBalance = await withTimeout(
+      window.ethereum.request({
+        method: 'eth_getBalance',
+        params: [owner, 'latest'],
+      }),
+      2_500,
+      '钱包余额读取',
+    )
+    if (typeof rawBalance !== 'string' || !/^0x[0-9a-f]+$/i.test(rawBalance)) return null
+    return BigInt(rawBalance)
+  } catch {
+    // 未授权、钱包锁定或节点异常时继续使用应用只读 RPC。
+    return null
+  }
+}
 
 /** 切换链或自定义 RPC 后重建只读客户端 */
 export function refreshPublicClient() {

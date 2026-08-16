@@ -11,7 +11,8 @@
     "test:flow": "node scripts/flow-events.test.mjs",
     "test:dlmm": "node scripts/dlmm-distribution.test.mjs",
     "test:dlmm-groups": "node scripts/dlmm-groups.test.mjs",
-    "test": "npm run test:pnl && npm run test:rpc && npm run test:flow && npm run test:dlmm && npm run test:dlmm-groups",
+    "test:mint-payment": "node scripts/mint-payment.test.mjs",
+    "test": "npm run test:pnl && npm run test:rpc && npm run test:flow && npm run test:dlmm && npm run test:dlmm-groups && npm run test:mint-payment",
     "typecheck": "tsc -b",
     "lint": "oxlint",
     "preview": "vite preview"

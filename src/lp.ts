@@ -57,7 +57,7 @@ import {
 import { fetchJson, withTimeout } from './async'
 import { buildV3AccountingLedger, computePositionPnlUsd } from './pnlAccounting'
 import { mapWithConcurrency, readLogsAdaptive, runRpcTask } from './rpcScheduler'
-import { publicClient } from './wallet'
+import { getInjectedNativeBalance, publicClient } from './wallet'
 import {
   registerV4Deps,
   mintV4Position,
@@ -379,12 +379,20 @@ export async function getErc20Balance(token: Address, owner: Address): Promise<b
 
 export async function getNativeBalance(owner: Address): Promise<bigint> {
   const chainId = getActiveChainId()
-  return runRpcTask({
+  const rpcBalance = runRpcTask({
     chainId,
     lane: 'read',
     label: '读取原生币余额',
     task: () => publicClient.getBalance({ address: owner }),
   })
+  const walletBalance = await getInjectedNativeBalance(owner, chainId)
+
+  // 钱包节点与当前链一致时，以钱包读数为准；不要再等待可能限流的公共 RPC。
+  if (walletBalance != null) {
+    void rpcBalance.catch(() => undefined)
+    return walletBalance
+  }
+  return rpcBalance
 }
 
 /**
