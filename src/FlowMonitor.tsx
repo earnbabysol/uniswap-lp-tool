@@ -4,6 +4,7 @@ import {
   FLOW_WINDOW_MINUTES,
   FLOW_CHAIN_IDS,
   fetchFlowEvents,
+  flowChainCompact,
   flowChainLabel,
   flowExplorerTx,
   flowPoolRef,
@@ -748,6 +749,12 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
                     <div className="flow-pool-cell">
                       <div className="flow-pair-line">
                         <span className="flow-rank" aria-label={`列表第 ${index + 1} 名`}>#{index + 1}</span>
+                        <span
+                          className={`flow-chain-badge chain-${e.chainId}`}
+                          title={flowChainLabel(e.chainId)}
+                        >
+                          {flowChainCompact(e.chainId)}
+                        </span>
                         <strong className="flow-pair-name" title={pairLabel}>{pairLabel}</strong>
                       </div>
                       <div className="flow-pool-meta">
@@ -755,7 +762,6 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
                           {row.net > 0 ? '净流入' : row.net < 0 ? '净流出' : '持平'}
                         </span>
                         <span className={`flow-ver ${e.version}`}>{e.version.toUpperCase()}</span>
-                        <span className="flow-chain">{flowChainLabel(e.chainId)}</span>
                         <span className="muted">{formatFee(e, row.effectiveFeePips)}</span>
                         <span
                           className="flow-mcap"

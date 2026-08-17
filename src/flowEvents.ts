@@ -488,8 +488,8 @@ function makeClient(chainId: FlowChainId): PublicClient {
     ? ['https://bsc.publicnode.com', ...cfg.defaultRpcUrls]
     : chainId === 8453
       // Base PublicNode 对约 45 分钟前的 getLogs 要求付费 Archive token。
-      // 动向历史扫描改用官方节点 + dRPC；选择性日志优先走 Blockscout。
-      ? ['https://mainnet.base.org', 'https://base.drpc.org']
+      // 动向日志优先 Blockscout；RPC 只做元数据 / 回退，关闭 HTTP batch 防 429。
+      ? ['https://mainnet.base.org', 'https://base.drpc.org', 'https://base-rpc.publicnode.com']
     : [...cfg.defaultRpcUrls]
   const urls = [...new Set([...(custom ? [custom] : []), ...defaults])]
   return createPublicClient({
@@ -497,9 +497,9 @@ function makeClient(chainId: FlowChainId): PublicClient {
     transport: fallback(
       urls.map((url, i) =>
         http(url, {
-          // BSC PublicNode 批量调用稳定；Robinhood 公共节点对 batch 很容易
+          // BSC PublicNode 批量调用稳定；Base / Robinhood 公共节点对 batch 很容易
           // 429，逐请求配合下方并发上限反而更快。
-          batch: chainId === 56 || chainId === 8453 ? { batchSize: 20, wait: 12 } : false,
+          batch: chainId === 56 ? { batchSize: 20, wait: 12 } : false,
           timeout: chainId === 56 || chainId === 8453
             ? (i === 0 ? 8_000 : 7_000)
             : i === 0 ? 8_000 : 10_000,
@@ -551,15 +551,16 @@ async function readBatch(
   contracts: readonly unknown[],
 ): Promise<UnknownCallResult[]> {
   if (contracts.length === 0) return []
-  // Robinhood 的公共 RPC 对超大 eth_call / batch 很容易 429。Multicall3 仍然
-  // 批量读，但按固定大小拆包；mapPool 保持原顺序，调用方可继续按下标配对。
-  const isRobinhood = client.chain?.id === 4663
-  const chunkSize = isRobinhood ? 60 : 160
+  // Robinhood / Base 的公共 RPC 对超大 eth_call / batch 很容易 429。Multicall3
+  // 仍然批量读，但按固定大小拆包；mapPool 保持原顺序，调用方可继续按下标配对。
+  const chainId = client.chain?.id
+  const isTight = chainId === 4663 || chainId === 8453
+  const chunkSize = chainId === 8453 ? 40 : chainId === 4663 ? 60 : 160
   const chunks: Array<readonly unknown[]> = []
   for (let i = 0; i < contracts.length; i += chunkSize) {
     chunks.push(contracts.slice(i, i + chunkSize))
   }
-  const nested = await mapPool(chunks, isRobinhood ? 1 : 2, async (chunk) => (
+  const nested = await mapPool(chunks, isTight ? 1 : 2, async (chunk) => (
     client.multicall({
       allowFailure: true,
       contracts: chunk as never,
@@ -1008,10 +1009,9 @@ async function readFlowLogs<TArgs>(opts: {
   })
 
   if (opts.chainId === 8453) {
-    try {
-      return await readRpc()
-    } catch (rpcError) {
-      if (!opts.explorerAddress || opts.preferIndexer === false) throw rpcError
+    // Base 官方公共 RPC 对 V3+V4 并行扫描很容易 429；有 explorer 地址时
+    // 优先 Blockscout，失败再退回 RPC（与 Robinhood 同思路）。
+    if (opts.explorerAddress && opts.preferIndexer !== false) {
       try {
         return await readIndexedLogs<TArgs>({
           chainId: 8453,
@@ -1025,12 +1025,12 @@ async function readFlowLogs<TArgs>(opts: {
       } catch (indexerError) {
         if (import.meta.env.DEV) {
           console.debug(
-            `[flow] ${opts.label} Base RPC 与 Blockscout 均不可用：${friendlyErrorText(indexerError)}`,
+            `[flow] ${opts.label} Base Blockscout 转入 RPC：${friendlyErrorText(indexerError)}`,
           )
         }
-        throw rpcError
       }
     }
+    return readRpc()
   }
 
   if (opts.chainId === 4663 && opts.explorerAddress && opts.preferIndexer !== false) {
@@ -2109,7 +2109,9 @@ async function fetchNpmFlowLogs(
     // same handful of pools. Resolving every NFT before showing 60 pools made
     // first paint wait ~25s. Keep the newest bounded candidate set; all events
     // for those tokenIds are still parsed below, so their net flow stays exact.
-    const maxPositionRefs = Math.min(600, Math.max(240, opts.limit * 4))
+    const maxPositionRefs = chainId === 8453
+      ? Math.min(160, Math.max(60, opts.limit * 2))
+      : Math.min(600, Math.max(240, opts.limit * 4))
     for (const log of useful) {
       const id = log.args.tokenId?.toString()
       if (!id) continue
@@ -3193,7 +3195,8 @@ async function enrichFlowApr(events: FlowEvent[]): Promise<{
     groups.sort((a, b) => a.version.localeCompare(b.version))
     for (const { version, rows } of groups) {
       try {
-        const canUseOnchain = chainId === 56 || chainId === 8453 || Boolean(loadCustomRpcUrl(chainId))
+        // Base 公共 RPC 配额留给动向发现；年化优先 DexScreener，只有配了自定义 RPC 才回退链上。
+        const canUseOnchain = chainId === 56 || Boolean(loadCustomRpcUrl(chainId))
         const fetchOnchain = () => version === 'v3'
           ? timedSource(`${flowChainLabel(chainId)} V3 on-chain APR`, fetchV3AprMetrics(chainId, rows))
           : timedSource(`${flowChainLabel(chainId)} V4 on-chain APR`, fetchV4AprMetrics(chainId, rows))
@@ -3205,9 +3208,8 @@ async function enrichFlowApr(events: FlowEvent[]): Promise<{
           )
           if (next.size === 0 && canUseOnchain) next = await fetchOnchain()
         } catch (dexError) {
-          // Robinhood's public RPC is intentionally not an APR fallback: its
-          // log quota is needed for movement discovery. A configured private
-          // RPC (or BSC) may still use the exact on-chain calculation.
+          // Robinhood / Base 公共 RPC 不是 APR 回退：配额留给动向发现。
+          // 配了私有 RPC（或 BSC）才走精确链上计算。
           if (!canUseOnchain) throw dexError
           next = await fetchOnchain()
         }
@@ -3515,20 +3517,17 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
     )
   }
   if (opts.chainIds.includes(8453)) {
-    jobs.push(
-      timedSource('Base V4', fetchV4FlowLogs(8453, { minUsd, limit })).then((result) => {
-        if (result.error) notices.push({ level: 'error', message: `Base V4：${result.error}` })
-        parts.push(...result.events)
-        publishCollectedParts()
-      }),
-    )
-    jobs.push(
-      timedSource('Base V3', fetchNpmFlowLogs(8453, { minUsd, limit })).then((result) => {
-        if (result.error) notices.push({ level: 'error', message: `Base V3：${result.error}` })
-        parts.push(...result.events)
-        publishCollectedParts()
-      }),
-    )
+    // Base 公共配额很紧：V4 与 V3 绝不能并行抢同一 RPC，否则必 429 且拖到几分钟。
+    jobs.push((async () => {
+      const v4 = await timedSource('Base V4', fetchV4FlowLogs(8453, { minUsd, limit }))
+      if (v4.error) notices.push({ level: 'error', message: `Base V4：${v4.error}` })
+      parts.push(...v4.events)
+      publishCollectedParts()
+      const v3 = await timedSource('Base V3', fetchNpmFlowLogs(8453, { minUsd, limit }))
+      if (v3.error) notices.push({ level: 'error', message: `Base V3：${v3.error}` })
+      parts.push(...v3.events)
+      publishCollectedParts()
+    })())
   }
   await Promise.all(jobs)
 
@@ -3588,4 +3587,11 @@ export function flowExplorerTx(chainId: FlowChainId, hash: Hash): string {
 
 export function flowChainLabel(chainId: FlowChainId): string {
   return CHAIN_CONFIGS[chainId].shortLabel
+}
+
+/** 动向卡片用的短链名，缩放时也不容易被挤没 */
+export function flowChainCompact(chainId: FlowChainId): string {
+  if (chainId === 56) return 'BSC'
+  if (chainId === 4663) return 'RH'
+  return 'Base'
 }

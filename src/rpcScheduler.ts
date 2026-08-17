@@ -100,15 +100,15 @@ export function rpcBackoffMs(
   // Robinhood's official public endpoint is intentionally rate limited. A
   // short retry only creates another 429, so give it a materially longer
   // cooldown while keeping range/network recovery reasonably quick.
-  const base = chainId === 4663
+  const base = chainId === 4663 || chainId === 8453
     ? (kind === 'rate-limit' ? 1_500 : 500)
     : chainId === 56 ? 650 : 350
   const kindMultiplier = kind === 'rate-limit'
-    ? (chainId === 4663 ? 1.5 : 1.7)
+    ? (chainId === 4663 || chainId === 8453 ? 1.5 : 1.7)
     : 1
   const cappedAttempt = Math.max(0, Math.min(attempt, 5))
   const exponential = base * (2 ** cappedAttempt) * kindMultiplier
-  const cap = chainId === 4663 ? 15_000 : 8_000
+  const cap = chainId === 4663 || chainId === 8453 ? 12_000 : 8_000
   return Math.round(Math.min(cap, exponential) + Math.max(0, Math.min(jitter, 1)) * 250)
 }
 
@@ -128,13 +128,10 @@ function laneConfig(chainId: number, lane: RpcLane): { concurrency: number; inte
     return { concurrency: 1, intervalMs: 350 }
   }
   if (chainId === 8453) {
-    // Base's official endpoint handles these bounded ranges well, but V3 and
-    // V4 starting together plus metadata multicalls can still trip burst
-    // limits in a browser. Keep logs serial and leave reads modestly parallel.
-    if (lane === 'indexer') return { concurrency: 1, intervalMs: 200 }
-    return lane === 'logs'
-      ? { concurrency: 1, intervalMs: 120 }
-      : { concurrency: 2, intervalMs: 60 }
+    // Base official RPC + Blockscout both choke on V3/V4 parallel bursts.
+    // Share one lane for logs/reads; keep indexer slightly paced.
+    if (lane === 'indexer') return { concurrency: 1, intervalMs: 280 }
+    return { concurrency: 1, intervalMs: 260 }
   }
   return lane === 'logs'
     ? { concurrency: 2, intervalMs: 35 }
@@ -142,7 +139,7 @@ function laneConfig(chainId: number, lane: RpcLane): { concurrency: number; inte
 }
 
 function getLane(chainId: number, lane: RpcLane): LaneState {
-  const key = chainId === 4663 && lane !== 'indexer'
+  const key = (chainId === 4663 || chainId === 8453) && lane !== 'indexer'
     ? `${chainId}:shared`
     : `${chainId}:${lane}`
   let state = laneStates.get(key)
