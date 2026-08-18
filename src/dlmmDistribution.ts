@@ -3,15 +3,21 @@ import type { DlmmShape } from './dlmm'
 export function dlmmShapeWeight(
   shape: DlmmShape,
   distanceFromSpot: number,
-  count: number,
+  maxDistance: number,
 ): number {
-  if (shape === 'spot') return 1
+  const scale = 1_000_000
+  const floor = 20_000
+  const distance = Math.max(0, Number.isFinite(distanceFromSpot) ? distanceFromSpot : 0)
+  const edge = Math.max(1, Number.isFinite(maxDistance) ? maxDistance : 1)
+
+  if (shape === 'spot') return scale
   if (shape === 'curve') {
-    const near = count - distanceFromSpot
-    return near * near
+    // Delta-style linear curve: closest-to-market bands receive the most,
+    // while even the furthest band keeps a small non-zero allocation.
+    return Math.max(floor, Math.round(scale * (1 - distance / (edge + 1))))
   }
-  const far = distanceFromSpot + 1
-  return far * far
+  // Bid-Ask is the inverse linear curve: the two outer edges receive more.
+  return Math.max(floor, Math.round(scale * (distance / edge)))
 }
 
 /** Proportional bigint allocation with no lost remainder. */

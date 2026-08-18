@@ -4698,7 +4698,8 @@ export async function mintV3DlmmPositions(opts: {
   bands: DlmmMintBand[]
   slippageBps?: number
   useNativeEth?: boolean
-  strictSingleSidedToken: Address
+  /** Present for Bid/Ask ladders; omitted for a deliberate two-token range. */
+  strictSingleSidedToken?: Address
   onStatus?: (msg: string) => void
 }) {
   const { walletClient, owner, pool, onStatus } = opts
@@ -4710,7 +4711,7 @@ export async function mintV3DlmmPositions(opts: {
   const wethIs0 = isWeth(pool.token0.address)
   const wethIs1 = isWeth(pool.token1.address)
 
-  onStatus?.(`读取最新池价并校验 ${opts.bands.length} 档单边区间…`)
+  onStatus?.(`读取最新池价并校验 ${opts.bands.length} 档价格区间…`)
   const [slot0, ethBal] = await Promise.all([
     publicClient.readContract({
       address: pool.poolAddress,
@@ -4721,12 +4722,14 @@ export async function mintV3DlmmPositions(opts: {
   ])
   const sqrtPriceX96 = slot0[0]
   const liveTick = slot0[1]
-  const expected = pool.token0.address.toLowerCase() === opts.strictSingleSidedToken.toLowerCase()
-    ? 0
-    : pool.token1.address.toLowerCase() === opts.strictSingleSidedToken.toLowerCase()
-      ? 1
-      : null
-  if (expected == null) throw new Error('单边入金币种不属于当前池')
+  const expected = opts.strictSingleSidedToken == null
+    ? null
+    : pool.token0.address.toLowerCase() === opts.strictSingleSidedToken.toLowerCase()
+      ? 0
+      : pool.token1.address.toLowerCase() === opts.strictSingleSidedToken.toLowerCase()
+        ? 1
+        : undefined
+  if (expected === undefined) throw new Error('单边入金币种不属于当前池')
 
   const prepared = opts.bands.map((band, index) => {
     if (
@@ -4734,16 +4737,45 @@ export async function mintV3DlmmPositions(opts: {
       || band.tickLower % pool.tickSpacing !== 0
       || band.tickUpper % pool.tickSpacing !== 0
     ) throw new Error(`第 ${index + 1} 档 tick 区间无效`)
-    if (neededMintSide(liveTick, band.tickLower, band.tickUpper) !== expected) {
+    const liveSide = neededMintSide(liveTick, band.tickLower, band.tickUpper)
+    if (expected != null && liveSide !== expected) {
       throw new Error('价格已进入某个 Bin 档位，本次已停止；刷新价格后重试，未发送交易。')
     }
-    const paired = resolvePairedMintAmounts({
-      sqrtPriceX96,
-      tickLower: band.tickLower,
-      tickUpper: band.tickUpper,
-      amount0: band.amount0,
-      amount1: band.amount1,
-    })
+    let paired: { amount0: bigint; amount1: bigint }
+    if (expected != null) {
+      paired = resolvePairedMintAmounts({
+        sqrtPriceX96,
+        tickLower: band.tickLower,
+        tickUpper: band.tickUpper,
+        amount0: band.amount0,
+        amount1: band.amount1,
+      })
+    } else if (liveSide === 0) {
+      paired = { amount0: band.amount0, amount1: 0n }
+    } else if (liveSide === 1) {
+      paired = { amount0: 0n, amount1: band.amount1 }
+    } else {
+      if (band.amount0 <= 0n || band.amount1 <= 0n) {
+        throw new Error('价格已跨入相邻档位，双边资金不再匹配；请刷新预览后重试，未发送交易。')
+      }
+      const liquidity = getLiquidityForAmounts(
+        sqrtPriceX96,
+        band.tickLower,
+        band.tickUpper,
+        band.amount0,
+        band.amount1,
+      )
+      const needed = getAmountsForPosition(
+        sqrtPriceX96,
+        band.tickLower,
+        band.tickUpper,
+        liquidity,
+      )
+      paired = {
+        amount0: needed.amount0 > band.amount0 ? band.amount0 : needed.amount0,
+        amount1: needed.amount1 > band.amount1 ? band.amount1 : needed.amount1,
+      }
+    }
     if (paired.amount0 <= 0n && paired.amount1 <= 0n) {
       throw new Error(`第 ${index + 1} 档分配数量过小`)
     }

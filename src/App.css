@@ -4889,6 +4889,290 @@ input:focus-visible, select:focus-visible, select:focus {
   .dlmm-easy-order > .dlmm-submit { width: calc(100% - 22px); margin-inline: 11px; }
 }
 
+/* ── Delta 风格 DLMM 操作台 ── */
+.dlmm-delta-terminal {
+  grid-template-columns: minmax(0, 1fr) minmax(420px, 470px);
+  gap: 12px;
+}
+.dlmm-delta-market { padding: 16px; }
+.dlmm-delta-order {
+  padding: 0;
+  overflow: hidden;
+}
+.dlmm-delta-order-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.dlmm-delta-order-head > div { display: grid; gap: 2px; min-width: 0; }
+.dlmm-delta-order-head > div > span { color: var(--muted); font-size: 13px; }
+.dlmm-delta-order-head > div > strong { font-size: 18px; }
+.dlmm-intent-badge.both {
+  background: color-mix(in srgb, var(--ok) 15%, transparent);
+  color: color-mix(in srgb, var(--ok) 78%, var(--ink));
+}
+.dlmm-intent-icon.both { background: linear-gradient(145deg, #29bca8, #6a62e8); }
+.dlmm-submit.both { background: linear-gradient(120deg, #159d91, #6e55dc); }
+
+.dlmm-range-unit {
+  display: inline-flex;
+  padding: 3px;
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  background: var(--card-2);
+}
+.dlmm-range-unit button {
+  min-height: 31px;
+  padding: 5px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: 650 13px var(--sans);
+  cursor: pointer;
+}
+.dlmm-range-unit button.active { background: var(--accent-soft); color: var(--accent); }
+.dlmm-range-unit button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.dlmm-delta-chart {
+  padding: 13px 14px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--card-2) 70%, transparent), transparent),
+    repeating-linear-gradient(90deg, transparent 0, transparent calc(10% - 1px), var(--hairline) calc(10% - 1px), var(--hairline) 10%);
+}
+.dlmm-chart-scale,
+.dlmm-chart-legend {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.dlmm-chart-scale span { font-family: var(--mono); }
+.dlmm-chart-scale strong { color: var(--ink); font-size: 13px; }
+.dlmm-chart-bars {
+  position: relative;
+  display: flex;
+  align-items: end;
+  gap: clamp(3px, 0.65vw, 9px);
+  height: clamp(210px, 28vw, 310px);
+  margin: 10px 0 9px;
+  padding: 18px 7px 0;
+  border-bottom: 1px solid var(--line);
+}
+.dlmm-chart-bar {
+  flex: 1 1 0;
+  min-width: 7px;
+  max-width: 54px;
+  border-radius: 6px 6px 2px 2px;
+  opacity: 0.82;
+  transition: filter 140ms ease, opacity 140ms ease, transform 140ms ease;
+  transform-origin: bottom;
+}
+.dlmm-chart-bar:hover { filter: brightness(1.14); opacity: 1; transform: scaleY(1.025); }
+.dlmm-chart-bar.bid { background: linear-gradient(180deg, #48d9e7, #277fd1); }
+.dlmm-chart-bar.ask { background: linear-gradient(180deg, #c172ff, #7652e4); }
+.dlmm-chart-bar.both { background: linear-gradient(180deg, #49d7bc, #7565e8); }
+.dlmm-chart-spot {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  bottom: -1px;
+  width: 2px;
+  border-radius: 999px;
+  background: var(--ink);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--ink) 55%, transparent);
+  pointer-events: none;
+}
+.dlmm-chart-spot b {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: var(--ink);
+  color: var(--card);
+  font: 700 10px var(--sans);
+  white-space: nowrap;
+  transform: translate(-50%, -55%);
+}
+.dlmm-chart-legend { justify-content: center; gap: 18px; }
+.dlmm-chart-legend > span { display: inline-flex; align-items: center; gap: 5px; }
+.dlmm-chart-legend i { width: 9px; height: 9px; border-radius: 3px; }
+.dlmm-chart-legend i.bid { background: #36a8dc; }
+.dlmm-chart-legend i.ask { background: #955ce8; }
+.dlmm-chart-legend i.both { background: #41baa9; }
+.dlmm-delta-summary { margin: 11px 0 0; }
+.dlmm-delta-facts { margin-top: 11px; }
+.dlmm-delta-facts > div:nth-child(2) { text-align: center; background: color-mix(in srgb, var(--accent-soft) 34%, transparent); }
+.dlmm-delta-facts > div:last-child { text-align: right; }
+
+.dlmm-delta-section {
+  padding: 14px;
+  border-bottom: 1px solid var(--hairline);
+}
+.dlmm-delta-section .dlmm-section-title { margin-bottom: 9px; font-size: 15px; }
+.dlmm-delta-section .dlmm-section-title small { color: var(--muted); font-size: 12.5px; font-weight: 500; }
+.dlmm-dual-amounts { display: grid; gap: 8px; }
+.dlmm-token-amount {
+  padding: 10px 11px 8px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--field);
+  box-shadow: inset 0 1px 2px var(--field-notch);
+}
+.dlmm-token-amount:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
+.dlmm-token-amount.short { border-color: var(--out); }
+.dlmm-token-amount-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.dlmm-token-amount-head strong { font-size: 15px; }
+.dlmm-token-amount-head span {
+  overflow: hidden;
+  color: var(--muted);
+  font: 12.5px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dlmm-token-amount > input,
+.dlmm-token-amount > input:focus-visible {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 0 4px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--ink);
+  font: 650 25px var(--mono);
+  letter-spacing: -0.03em;
+}
+.dlmm-mini-pcts { display: flex; justify-content: flex-end; gap: 5px; }
+.dlmm-mini-pcts button {
+  min-height: 27px;
+  padding: 3px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--card-2);
+  color: var(--muted);
+  font: 650 11.5px var(--sans);
+  cursor: pointer;
+}
+.dlmm-mini-pcts button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.dlmm-mini-pcts button:disabled { opacity: 0.4; cursor: not-allowed; }
+.dlmm-auto-rules {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-top: 8px;
+}
+.dlmm-auto-rules button {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  padding: 7px 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--card-2);
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+.dlmm-auto-rules b { color: var(--ink); font-size: 13px; }
+.dlmm-auto-rules span { overflow: hidden; font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; }
+.dlmm-auto-rules button.active.bid { border-color: #38c8e8; background: color-mix(in srgb, #38c8e8 12%, var(--card)); }
+.dlmm-auto-rules button.active.ask { border-color: #a56aff; background: color-mix(in srgb, #a56aff 12%, var(--card)); }
+.dlmm-auto-rules button.active.both { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, var(--card)); }
+
+.dlmm-delta-strategies > button { padding: 8px 5px; }
+.dlmm-delta-strategies .dlmm-strategy-bars.curve i:nth-child(1),
+.dlmm-delta-strategies .dlmm-strategy-bars.curve i:nth-child(5) { height: 38%; }
+.dlmm-delta-strategies .dlmm-strategy-bars.curve i:nth-child(2),
+.dlmm-delta-strategies .dlmm-strategy-bars.curve i:nth-child(4) { height: 68%; }
+.dlmm-delta-strategies .dlmm-strategy-bars.curve i:nth-child(3) { height: 100%; }
+.dlmm-delta-strategies .dlmm-strategy-bars.bid-ask i:nth-child(1),
+.dlmm-delta-strategies .dlmm-strategy-bars.bid-ask i:nth-child(5) { height: 100%; }
+.dlmm-delta-strategies .dlmm-strategy-bars.bid-ask i:nth-child(2),
+.dlmm-delta-strategies .dlmm-strategy-bars.bid-ask i:nth-child(4) { height: 58%; }
+.dlmm-delta-strategies .dlmm-strategy-bars.bid-ask i:nth-child(3) { height: 24%; }
+.dlmm-delta-presets { grid-template-columns: repeat(4, 1fr); }
+.dlmm-delta-presets button { padding: 7px 6px; text-align: center; }
+.dlmm-range-inputs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  margin-top: 9px;
+}
+.dlmm-range-inputs > i { color: var(--muted); font-style: normal; }
+.dlmm-range-inputs label {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 3px 7px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.dlmm-range-inputs input {
+  grid-column: 1 / -1;
+  width: 100%;
+  min-width: 0;
+  padding: 8px 9px;
+  font: 650 14px var(--mono);
+}
+.dlmm-range-inputs small { font: 11.5px var(--mono); }
+.dlmm-range-sliders { display: grid; gap: 7px; margin-top: 10px; }
+.dlmm-range-sliders label { display: grid; grid-template-columns: 34px 1fr; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+.dlmm-range-sliders input { width: 100%; margin: 0; accent-color: var(--accent); }
+.dlmm-delta-advanced { margin-top: 10px; }
+.dlmm-delta-safety { margin-top: 10px; }
+.dlmm-delta-order > .dlmm-submit { width: calc(100% - 28px); margin: 10px 14px 0; min-height: 48px; font-size: 16px; }
+.dlmm-delta-order > .dlmm-error.submit { margin: 8px 14px -3px; }
+.dlmm-delta-order > .dlmm-submit-note { margin: 7px 16px 14px; }
+.dlmm-tranche-head-dual,
+.dlmm-tranche-row-dual { grid-template-columns: 90px minmax(170px, 1fr) minmax(80px, 0.55fr) minmax(80px, 0.55fr); }
+.dlmm-tranche-head-dual > span,
+.dlmm-tranche-row-dual > span { text-align: right; }
+
+@media (max-width: 1120px) {
+  .dlmm-delta-terminal { grid-template-columns: minmax(0, 1fr) 410px; }
+  .dlmm-chart-bars { height: 230px; }
+}
+@media (max-width: 930px) {
+  .dlmm-delta-terminal { grid-template-columns: 1fr; }
+  .dlmm-delta-order { position: static; }
+  .dlmm-chart-bars { height: 260px; }
+}
+@media (max-width: 640px) {
+  .dlmm-delta-market { padding: 10px; }
+  .dlmm-delta-market-head { flex-direction: row; align-items: center; }
+  .dlmm-chart-bars { height: 190px; gap: 3px; padding-inline: 2px; }
+  .dlmm-chart-legend { gap: 9px; font-size: 11.5px; }
+  .dlmm-delta-summary { grid-template-columns: 1fr; }
+  .dlmm-delta-summary .dlmm-intent-icon,
+  .dlmm-delta-summary .dlmm-intent-count { display: none; }
+  .dlmm-delta-facts { grid-template-columns: repeat(3, 1fr); }
+  .dlmm-delta-facts > div + div { border-top: 0; border-left: 1px solid var(--line-soft); }
+  .dlmm-delta-facts > div { padding: 8px; }
+  .dlmm-delta-facts span { font-size: 11.5px; }
+  .dlmm-delta-facts strong { font-size: 13px; }
+  .dlmm-delta-presets { grid-template-columns: 1fr 1fr; }
+  .dlmm-tranche-row-dual { grid-template-columns: 70px minmax(120px, 1fr) 70px; }
+  .dlmm-tranche-row-dual > span:last-child { grid-column: 2 / -1; text-align: right; }
+}
+@media (max-width: 430px) {
+  .dlmm-delta-page .dlmm-easy-head p { display: block; font-size: 12.5px; }
+  .dlmm-delta-order-head > div > strong { font-size: 16px; }
+  .dlmm-token-amount > input { font-size: 22px; }
+  .dlmm-auto-rules span { font-size: 10.5px; }
+  .dlmm-delta-section { padding: 12px 11px; }
+  .dlmm-delta-advanced,
+  .dlmm-delta-safety { margin-inline: 11px; }
+  .dlmm-delta-order > .dlmm-submit { width: calc(100% - 22px); margin-inline: 11px; }
+}
+
 /* ── DLMM 组合仓位管理 ── */
 .dlmm-groups {
   margin: 12px 0 14px;

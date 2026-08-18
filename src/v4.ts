@@ -1260,7 +1260,8 @@ export async function mintV4DlmmPositions(opts: {
   slippageBps?: number
   transferTaxBps0?: number
   transferTaxBps1?: number
-  strictSingleSidedToken: Address
+  /** Present for Bid/Ask ladders; omitted for a deliberate two-token range. */
+  strictSingleSidedToken?: Address
   onStatus?: (msg: string) => void
 }) {
   const { walletClient, owner, onStatus } = opts
@@ -1283,12 +1284,14 @@ export async function mintV4DlmmPositions(opts: {
   const orderFlipped =
     sameCurrency(srcPool.token0.address, live.token1.address)
     && sameCurrency(srcPool.token1.address, live.token0.address)
-  const expected = sameCurrency(live.token0.address, opts.strictSingleSidedToken)
-    ? 0
-    : sameCurrency(live.token1.address, opts.strictSingleSidedToken)
-      ? 1
-      : null
-  if (expected == null) throw new Error('单边入金币种不属于当前池')
+  const expected = opts.strictSingleSidedToken == null
+    ? null
+    : sameCurrency(live.token0.address, opts.strictSingleSidedToken)
+      ? 0
+      : sameCurrency(live.token1.address, opts.strictSingleSidedToken)
+        ? 1
+        : undefined
+  if (expected === undefined) throw new Error('单边入金币种不属于当前池')
 
   const key = poolKeyFromPool(live)
   const nativeIs0 = isNativeCurrency(key.currency0)
@@ -1335,7 +1338,8 @@ export async function mintV4DlmmPositions(opts: {
     tickLower = nearestUsableTick(tickLower, live.tickSpacing)
     tickUpper = nearestUsableTick(tickUpper, live.tickSpacing)
     if (tickLower >= tickUpper) throw new Error(`第 ${index + 1} 档 tick 区间无效`)
-    if (neededMintSide(live.tick, tickLower, tickUpper) !== expected) {
+    const liveSide = neededMintSide(live.tick, tickLower, tickUpper)
+    if (expected != null && liveSide !== expected) {
       throw new Error('价格已进入某个 Bin 档位，本次已停止；刷新价格后重试，未发送交易。')
     }
 
@@ -1351,23 +1355,48 @@ export async function mintV4DlmmPositions(opts: {
     totalUser1 += aligned.amount1
     const net0 = netAfterTransferTax(aligned.amount0, taxBps0)
     const net1 = netAfterTransferTax(aligned.amount1, taxBps1)
-    const paired = resolvePairedMintAmounts({
-      sqrtPriceX96: live.sqrtPriceX96,
-      tickLower,
-      tickUpper,
-      amount0: net0,
-      amount1: net1,
-    })
+    let paired: { amount0: bigint; amount1: bigint }
+    let liquidity: bigint
+    if (expected != null) {
+      paired = resolvePairedMintAmounts({
+        sqrtPriceX96: live.sqrtPriceX96,
+        tickLower,
+        tickUpper,
+        amount0: net0,
+        amount1: net1,
+      })
+      liquidity = getLiquidityForAmounts(
+        live.sqrtPriceX96,
+        tickLower,
+        tickUpper,
+        paired.amount0,
+        paired.amount1,
+      )
+    } else {
+      if (
+        (liveSide === 0 && net0 <= 0n)
+        || (liveSide === 1 && net1 <= 0n)
+        || (liveSide === 'both' && (net0 <= 0n || net1 <= 0n))
+      ) {
+        throw new Error('价格已跨入相邻档位，双边资金不再匹配；请刷新预览后重试，未发送交易。')
+      }
+      const capacity = getLiquidityForAmounts(
+        live.sqrtPriceX96,
+        tickLower,
+        tickUpper,
+        net0,
+        net1,
+      )
+      // Keep the user's typed amounts as hard caps. The small liquidity buffer
+      // leaves room for V4 amountMax slippage without approving extra tokens.
+      const maxBps = BigInt(Math.max(300, Math.min(Math.floor(slippageBps) || 300, 5_000)))
+      liquidity = (capacity * 9_990n) / (10_000n + maxBps)
+      const needed = getAmountsForPosition(live.sqrtPriceX96, tickLower, tickUpper, liquidity)
+      paired = { amount0: needed.amount0, amount1: needed.amount1 }
+    }
     if (paired.amount0 <= 0n && paired.amount1 <= 0n) {
       throw new Error(`第 ${index + 1} 档分配数量过小`)
     }
-    const liquidity = getLiquidityForAmounts(
-      live.sqrtPriceX96,
-      tickLower,
-      tickUpper,
-      paired.amount0,
-      paired.amount1,
-    )
     if (liquidity <= 0n) throw new Error(`第 ${index + 1} 档流动性为 0`)
     const maxed = maxAmountsForLiquidity({
       sqrtPriceX96: live.sqrtPriceX96,
@@ -1376,10 +1405,14 @@ export async function mintV4DlmmPositions(opts: {
       liquidity,
       slippageBps,
     })
-    // Multi-bin orders are explicitly single-sided. A price cross must revert,
-    // not request approval for the opposite token and silently turn two-sided.
-    let amount0Max = expected === 1 ? 0n : maxed.amount0Max
-    let amount1Max = expected === 0 ? 0n : maxed.amount1Max
+    // A strict Bid/Ask never requests the opposite token. In deliberate
+    // two-token mode each band's typed allocation remains the hard cap.
+    let amount0Max = expected === 1 || liveSide === 1 ? 0n : maxed.amount0Max
+    let amount1Max = expected === 0 || liveSide === 0 ? 0n : maxed.amount1Max
+    if (expected == null) {
+      if (amount0Max > net0) amount0Max = net0
+      if (amount1Max > net1) amount1Max = net1
+    }
     if (taxBps0 > 0 && !nativeIs0 && amount0Max > net0) amount0Max = net0
     if (taxBps1 > 0 && !nativeIs1 && amount1Max > net1) amount1Max = net1
     if (maxed.amount0 > amount0Max || maxed.amount1 > amount1Max) {

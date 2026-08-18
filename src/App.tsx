@@ -141,10 +141,11 @@ import FlowMonitor from './FlowMonitor'
 import DlmmMode, { type DlmmMintRequest } from './DlmmMode'
 import DlmmPositionsPanel from './DlmmPositionsPanel'
 import {
-  allocateDlmmAmount,
-  buildEvmDlmmPlan,
+  allocateDlmmAmounts,
   buildEvmDlmmTranches,
+  refreshEvmDlmmPlan,
   type DlmmSide,
+  type EvmDlmmPlan,
 } from './dlmm'
 import {
   attachDlmmGroupTokenIds,
@@ -2989,10 +2990,7 @@ export default function App() {
     input1: string
     actionLabel: string
     dlmm?: {
-      side: DlmmSide
-      binCount: number
-      gapBins: number
-      depositTokenIndex: 0 | 1
+      plan: EvmDlmmPlan
     }
     afterSuccess?: () => void
   }) => {
@@ -3041,18 +3039,15 @@ export default function App() {
       let mint1 = parseAmount(input1 || '0', live.token1.decimals)
 
       if (dlmm) {
-        // DLMM 模式的范围语义是「相对最新 active tick 的 N 个 bins」。
-        // 每次提交都重新生成，而不是等价格真的闯进旧区间才处理，确保 Bid/Ask 永远保持单边。
-        const freshPlan = buildEvmDlmmPlan(live, dlmm.side, dlmm.binCount, dlmm.gapBins)
-        if (freshPlan.depositTokenIndex !== dlmm.depositTokenIndex) {
-          throw new Error('池子币种方向已变化，请刷新页面后重新确认 Bid / Ask')
-        }
+        // 固定用户确认过的绝对价格范围，再用最新池价校验方向。
+        // 单边越界直接停止；双边范围仍覆盖现价时继续使用两种明确输入的币。
+        const freshPlan = refreshEvmDlmmPlan(live, dlmm.plan)
         useLower = freshPlan.tickLower
         useUpper = freshPlan.tickUpper
         if (freshPlan.depositTokenIndex === 0) mint1 = 0n
-        else mint0 = 0n
+        if (freshPlan.depositTokenIndex === 1) mint0 = 0n
         setStatus(
-          `已按最新池价锁定 ${dlmm.side === 'bid' ? 'Bid' : 'Ask'}：${formatPrice(freshPlan.coinPriceLower)} – ${formatPrice(freshPlan.coinPriceUpper)}，继续创建…`,
+          `最新池价校验通过，${freshPlan.side === 'both' ? '双边' : freshPlan.side === 'bid' ? 'Bid' : 'Ask'} 范围 ${formatPrice(freshPlan.coinPriceLower)} – ${formatPrice(freshPlan.coinPriceUpper)}，继续创建…`,
         )
       } else if (isOneSidedRangeStale({
         plannedTick,
@@ -3106,8 +3101,8 @@ export default function App() {
           slippageBps,
           transferTaxBps0: mintTransferTax.tax0,
           transferTaxBps1: mintTransferTax.tax1,
-          strictSingleSidedToken: dlmm
-            ? targetPool[dlmm.depositTokenIndex === 0 ? 'token0' : 'token1'].address
+          strictSingleSidedToken: dlmm && dlmm.plan.depositTokenIndex !== 'both'
+            ? targetPool[dlmm.plan.depositTokenIndex === 0 ? 'token0' : 'token1'].address
             : undefined,
           onStatus: setStatus,
         })
@@ -3122,8 +3117,8 @@ export default function App() {
         tickUpper: useUpper,
         useNativeEth: mintUseEth,
         slippageBps,
-        strictSingleSidedToken: dlmm
-          ? targetPool[dlmm.depositTokenIndex === 0 ? 'token0' : 'token1'].address
+        strictSingleSidedToken: dlmm && dlmm.plan.depositTokenIndex !== 'both'
+          ? targetPool[dlmm.plan.depositTokenIndex === 0 ? 'token0' : 'token1'].address
           : undefined,
         onStatus: setStatus,
       })
@@ -3132,12 +3127,11 @@ export default function App() {
 
   const startDlmmMint = (request: DlmmMintRequest) => {
     if (!pool) return
-    const sideLabel = request.side === 'bid' ? 'Bid' : 'Ask'
+    const sideLabel = request.side === 'bid' ? 'Bid' : request.side === 'ask' ? 'Ask' : '双边'
     if (request.executionMode === 'multi') {
       const sourcePool = pool
       const sourceAmount0 = parseAmount(request.amount0 || '0', sourcePool.token0.decimals)
       const sourceAmount1 = parseAmount(request.amount1 || '0', sourcePool.token1.decimals)
-      const totalAmount = request.plan.depositTokenIndex === 0 ? sourceAmount0 : sourceAmount1
       void run(
         `批量创建 ${request.trancheCount} 档 ${sideLabel} · ${sourcePool.version.toUpperCase()}`,
         async () => {
@@ -3160,15 +3154,7 @@ export default function App() {
                 }))
             : await loadV3Pool(sourcePool.poolAddress!)
           setPool(live)
-          const freshPlan = buildEvmDlmmPlan(
-            live,
-            request.side,
-            request.plan.binCount,
-            request.plan.gapBins,
-          )
-          if (freshPlan.depositTokenIndex !== request.plan.depositTokenIndex) {
-            throw new Error('池子币种方向已变化，请刷新后重新确认 Bid / Ask')
-          }
+          const freshPlan = refreshEvmDlmmPlan(live, request.plan)
           const tranches = buildEvmDlmmTranches(
             live,
             freshPlan,
@@ -3176,22 +3162,28 @@ export default function App() {
             request.trancheCount,
           )
           if (tranches.length < 2) throw new Error('当前范围不足以拆成多档，请增加 Bin 数')
-          const allocations = allocateDlmmAmount(totalAmount, tranches)
-          if (allocations.some((amount) => amount <= 0n)) {
+          const allocations = allocateDlmmAmounts(sourceAmount0, sourceAmount1, tranches)
+          const allocationsReady = allocations.every((amount, index) => {
+            const required = tranches[index]?.liquiditySide
+            if (required === 0) return amount.amount0 > 0n
+            if (required === 1) return amount.amount1 > 0n
+            return amount.amount0 > 0n && amount.amount1 > 0n
+          })
+          if (!allocationsReady) {
             throw new Error('数量太小，无法分配到全部档位；请增加数量或减少档位')
           }
           const bands = tranches.map((tranche, index) => ({
             tickLower: tranche.tickLower,
             tickUpper: tranche.tickUpper,
-            amount0: freshPlan.depositTokenIndex === 0 ? allocations[index]! : 0n,
-            amount1: freshPlan.depositTokenIndex === 1 ? allocations[index]! : 0n,
+            amount0: allocations[index]?.amount0 ?? 0n,
+            amount1: allocations[index]?.amount1 ?? 0n,
           }))
           setStatus(
             `已按最新价格重建 ${bands.length} 档 ${sideLabel}，准备一笔原子批量 Mint…`,
           )
-          const strictToken = sourcePool[
-            request.plan.depositTokenIndex === 0 ? 'token0' : 'token1'
-          ].address
+          const strictToken = freshPlan.depositTokenIndex === 'both'
+            ? undefined
+            : live[freshPlan.depositTokenIndex === 0 ? 'token0' : 'token1'].address
           const result = live.version === 'v4'
             ? await mintV4DlmmPositions({
               walletClient: wallet!,
@@ -3250,10 +3242,7 @@ export default function App() {
       input1: request.amount1,
       actionLabel: `创建 ${sideLabel} · ${pool.version.toUpperCase()}`,
       dlmm: {
-        side: request.side,
-        binCount: request.plan.binCount,
-        gapBins: request.plan.gapBins,
-        depositTokenIndex: request.plan.depositTokenIndex,
+        plan: request.plan,
       },
       afterSuccess: () => {
         setAmount0('')
@@ -3393,15 +3382,20 @@ export default function App() {
         const prices = group.positions.map(getPositionCoinPrices)
         const lower = Math.min(...prices.map((price) => price.coinPriceLower))
         const upper = Math.max(...prices.map((price) => price.coinPriceUpper))
-        const midpoint = (lower + upper) / 2
-        const side: DlmmSide = group.record?.side ?? (midpoint <= prices[0]!.coinPrice ? 'bid' : 'ask')
+        const spot = prices[0]!.coinPrice
+        const side: DlmmSide = group.record?.side
+          ?? (lower < spot && upper > spot ? 'both' : upper <= spot ? 'bid' : 'ask')
+        const lowerPct = spot > 0 ? ((lower / spot) - 1) * 100 : -30
+        const upperPct = spot > 0 ? ((upper / spot) - 1) * 100 : 40
         const derivedBins = Math.max(
           1,
           Math.round((Math.max(...group.positions.map((position) => position.tickUpper))
             - Math.min(...group.positions.map((position) => position.tickLower))) / info.tickSpacing),
         )
-    writePref('dlmmSide', side)
-    writePref('dlmmRangePreset', 'custom')
+        writePref('dlmmSide', side)
+        writePref('dlmmRangePreset', 'custom')
+        writePref('dlmmRangeLowerPct', lowerPct)
+        writePref('dlmmRangeUpperPct', upperPct)
         writePref('dlmmExecutionMode', 'multi')
         writePref('dlmmShape', group.record?.shape ?? 'bid-ask')
         writePref('dlmmTrancheCount', Math.min(12, Math.max(2, group.plannedBandCount)))
@@ -3416,7 +3410,7 @@ export default function App() {
         if (info.version === 'v4') setV4TickSpacing(info.tickSpacing)
         setTab('dlmm')
         setStatus(
-          `已按最新价格生成 ${side === 'bid' ? 'Bid' : 'Ask'} 重挂预览；原组合尚未撤出，不会自动重复投入。`,
+          `已按最新价格生成 ${side === 'both' ? '双边' : side === 'bid' ? 'Bid' : 'Ask'} 重挂预览；原组合尚未撤出，不会自动重复投入。`,
         )
       } catch (error) {
         setStatus(error instanceof Error ? error.message : String(error))
@@ -4065,11 +4059,18 @@ export default function App() {
                 const risk = riskLevel(p)
                 const near = rangeProximityPct(p)
                 return (
-                  <button
-                    type="button"
+                  <article
+                    role="button"
+                    tabIndex={0}
+                    aria-pressed={selectedRow}
                     key={id}
                     className={`pos-card ${selectedRow ? 'selected' : ''} ${risk === 'high' ? 'risk-high' : risk === 'warn' ? 'risk-warn' : ''}`}
                     onClick={() => setSelectedId(id)}
+                    onKeyDown={(event) => {
+                      if (event.key !== 'Enter' && event.key !== ' ') return
+                      event.preventDefault()
+                      setSelectedId(id)
+                    }}
                   >
                     <div className="pc-top">
                       <span className="pc-meta-line mono">
@@ -4175,7 +4176,7 @@ export default function App() {
                         </div>
                       )}
                     </div>
-                  </button>
+                  </article>
                 )
               })}
             </div>

@@ -14,7 +14,7 @@ type Props = {
 }
 
 function groupSide(group: DlmmPositionGroup): 'bid' | 'ask' | 'mixed' {
-  if (group.record) return group.record.side
+  if (group.record) return group.record.side === 'both' ? 'mixed' : group.record.side
   const prices = group.positions.map(getPositionCoinPrices)
   if (prices.length === 0) return 'mixed'
   const spot = prices[0]!.coinPrice
