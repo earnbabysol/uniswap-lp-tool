@@ -155,6 +155,12 @@ function sideShort(side: DlmmSide): string {
   return '双边'
 }
 
+function rangeEdgeLabel(side: DlmmSide, which: 'lower' | 'upper'): string {
+  if (side === 'bid') return which === 'lower' ? '最低买价' : '最高买价'
+  if (side === 'ask') return which === 'lower' ? '最低卖价' : '最高卖价'
+  return which === 'lower' ? '范围下限' : '范围上限'
+}
+
 export default function DlmmMode(props: Props) {
   const {
     pool,
@@ -417,21 +423,26 @@ export default function DlmmMode(props: Props) {
     ? `${quote?.quote.symbol ?? ''} FDV`
     : `${quote?.quote.symbol ?? ''}/${quote?.coin.symbol ?? ''}`
 
+  const setPctBoundary = (which: 'lower' | 'upper', value: number) => {
+    if (!Number.isFinite(value)) return
+    setRangePreset('custom')
+    if (which === 'lower') {
+      const floor = inferredSide === 'ask' ? 0.05 : -99.5
+      const sideCeiling = inferredSide === 'ask' ? 1_000_000 : -0.05
+      setLowerPct(clamp(value, floor, Math.min(sideCeiling, upperPct - 0.05), lowerPct))
+      return
+    }
+    const sideFloor = inferredSide === 'bid' ? -99.5 : 0.05
+    const ceiling = inferredSide === 'bid' ? -0.05 : 1_000_000
+    setUpperPct(clamp(value, Math.max(sideFloor, lowerPct + 0.05), ceiling, upperPct))
+  }
+
   const setPriceBoundary = (which: 'lower' | 'upper', raw: string) => {
     if (!quote) return
     const value = Number(raw)
     const price = valueToPrice(value)
     if (!(price > 0) || !Number.isFinite(price)) return
-    const pct = ((price / quote.spot) - 1) * 100
-    setRangePreset('custom')
-    if (which === 'lower') setLowerPct(clamp(pct, -99.9, upperPct - 0.01, lowerPct))
-    else setUpperPct(clamp(pct, lowerPct + 0.01, 1_000_000, upperPct))
-  }
-
-  const setPctBoundary = (which: 'lower' | 'upper', value: number) => {
-    setRangePreset('custom')
-    if (which === 'lower') setLowerPct(Math.min(value, upperPct - 0.1))
-    else setUpperPct(Math.max(value, lowerPct + 0.1))
+    setPctBoundary(which, ((price / quote.spot) - 1) * 100)
   }
 
   const fillAmount = (kind: 'coin' | 'quote', pct: number) => {
@@ -477,10 +488,13 @@ export default function DlmmMode(props: Props) {
     })
   }
 
-  const lowerSlider = inferredSide === 'ask' ? 0.1 : -95
-  const lowerSliderMax = inferredSide === 'ask' ? 250 : inferredSide === 'bid' ? -0.1 : -0.1
-  const upperSliderMin = inferredSide === 'bid' ? -94.9 : 0.1
-  const upperSliderMax = 300
+  const lowerEdgeLabel = rangeEdgeLabel(inferredSide, 'lower')
+  const upperEdgeLabel = rangeEdgeLabel(inferredSide, 'upper')
+  const rangeExplanation = inferredSide === 'bid'
+    ? `当 ${quote?.coin.symbol ?? '标的币'} 跌进这个区间，${displaySymbol(quote?.quote ?? null)} 会按 ${visualTranches.length} 个价格档分批换成 ${quote?.coin.symbol ?? '标的币'}。价格没跌到区间时不会成交。`
+    : inferredSide === 'ask'
+      ? `当 ${quote?.coin.symbol ?? '标的币'} 涨进这个区间，${quote?.coin.symbol ?? '标的币'} 会按 ${visualTranches.length} 个价格档分批换成 ${displaySymbol(quote?.quote ?? null)}。价格没涨到区间时不会成交。`
+      : `当前价格在区间内，两种币会同时做市；价格向任一侧移动时，资产会沿 ${visualTranches.length} 个价格档逐步转换。`
 
   return (
     <section className="page-dlmm dlmm-easy-page dlmm-delta-page">
@@ -567,6 +581,22 @@ export default function DlmmMode(props: Props) {
         </div>
       ) : (
         <div className="dlmm-terminal dlmm-delta-terminal">
+          <div className="dlmm-quick-guide" aria-label="三步创建 DLMM 仓位">
+            <div className={hasAmount ? 'done' : 'active'}>
+              <b>1</b>
+              <span><strong>填投入金额</strong><small>填一边是单边，填两边是双边</small></span>
+            </div>
+            <i aria-hidden>→</i>
+            <div className={hasAmount ? 'active' : ''}>
+              <b>2</b>
+              <span><strong>选成交范围</strong><small>不确定就用“均衡”，不用拖图</small></span>
+            </div>
+            <i aria-hidden>→</i>
+            <div>
+              <b>3</b>
+              <span><strong>确认并创建</strong><small>{tranches.length || '—'} 个链上仓位 · {visualTranches.length || '—'} 个价格档</small></span>
+            </div>
+          </div>
           <div className="dlmm-market dlmm-delta-market">
             <div className="dlmm-market-head dlmm-delta-market-head">
               <div>
@@ -665,7 +695,7 @@ export default function DlmmMode(props: Props) {
 
             <section className="dlmm-delta-section">
               <div className="dlmm-section-title">
-                <span>投入金额</span>
+                <span><b className="dlmm-section-step">1</b>投入金额</span>
                 <InfoHint text={`只填 ${displaySymbol(quote.quote)} 自动变成 Bid；只填 ${displaySymbol(quote.coin)} 自动变成 Ask；两边都填自动变成双边做市。`} />
               </div>
               <div className="dlmm-dual-amounts">
@@ -714,8 +744,99 @@ export default function DlmmMode(props: Props) {
               </div>
             </section>
 
+            <section className="dlmm-delta-section dlmm-range-section">
+              <div className="dlmm-section-title">
+                <span><b className="dlmm-section-step">2</b>成交价格范围</span>
+                <small>{rangeUnitLabel}</small>
+              </div>
+              <p className={`dlmm-range-explanation ${inferredSide}`}>{rangeExplanation}</p>
+              <div className="dlmm-friendly-presets dlmm-delta-presets" role="group" aria-label="价格范围预设">
+                {RANGE_PRESETS.map((preset) => {
+                  const [presetLower, presetUpper] = preset.ranges[inferredSide]
+                  return (
+                    <button
+                      key={preset.key}
+                      type="button"
+                      className={rangePreset === preset.key ? 'active' : ''}
+                      onClick={() => applyPreset(inferredSide, preset.key)}
+                    >
+                      <strong>{preset.label}</strong>
+                      <span>{preset.note}</span>
+                      <em>{presetLower}% ～ {presetUpper >= 0 ? '+' : ''}{presetUpper}%</em>
+                    </button>
+                  )
+                })}
+              </div>
+              <div className="dlmm-range-inputs dlmm-range-endpoints">
+                <div className={`dlmm-range-endpoint ${inferredSide}`}>
+                  <div className="dlmm-range-endpoint-head">
+                    <span className="dlmm-range-edge-dot">A</span>
+                    <div><strong>{lowerEdgeLabel}</strong><small>{inferredSide === 'bid' ? '最深的一档买单' : inferredSide === 'ask' ? '最先开始卖出' : '做市区间底部'}</small></div>
+                  </div>
+                  <label>
+                    <span>{rangeUnit === 'market-cap' ? '市值' : '价格'}</span>
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      aria-label={lowerEdgeLabel}
+                      value={inputNumber(rangeValue(quote.spot * (1 + lowerPct / 100)))}
+                      onFocus={(event) => event.currentTarget.select()}
+                      onChange={(event) => setPriceBoundary('lower', event.target.value)}
+                    />
+                  </label>
+                  <label className="dlmm-range-pct-input">
+                    <span>距离现价</span>
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      step="0.1"
+                      aria-label={`${lowerEdgeLabel}相对现价百分比`}
+                      value={Number(lowerPct.toFixed(2))}
+                      onFocus={(event) => event.currentTarget.select()}
+                      onChange={(event) => setPctBoundary('lower', Number(event.target.value))}
+                    />
+                    <b>%</b>
+                  </label>
+                </div>
+                <div className={`dlmm-range-endpoint ${inferredSide}`}>
+                  <div className="dlmm-range-endpoint-head">
+                    <span className="dlmm-range-edge-dot">B</span>
+                    <div><strong>{upperEdgeLabel}</strong><small>{inferredSide === 'bid' ? '最接近现价的买单' : inferredSide === 'ask' ? '最远的一档卖单' : '做市区间顶部'}</small></div>
+                  </div>
+                  <label>
+                    <span>{rangeUnit === 'market-cap' ? '市值' : '价格'}</span>
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      aria-label={upperEdgeLabel}
+                      value={inputNumber(rangeValue(quote.spot * (1 + upperPct / 100)))}
+                      onFocus={(event) => event.currentTarget.select()}
+                      onChange={(event) => setPriceBoundary('upper', event.target.value)}
+                    />
+                  </label>
+                  <label className="dlmm-range-pct-input">
+                    <span>距离现价</span>
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      step="0.1"
+                      aria-label={`${upperEdgeLabel}相对现价百分比`}
+                      value={Number(upperPct.toFixed(2))}
+                      onFocus={(event) => event.currentTarget.select()}
+                      onChange={(event) => setPctBoundary('upper', Number(event.target.value))}
+                    />
+                    <b>%</b>
+                  </label>
+                </div>
+              </div>
+              <div className="dlmm-range-simple-help">
+                <span>① 先点预设</span><span>② 需要时再改价格或百分比</span><span>③ 图上的横线会同步</span>
+              </div>
+              {planState.error && <p className="dlmm-error">{planState.error}</p>}
+            </section>
+
             <section className="dlmm-delta-section">
-              <div className="dlmm-section-title"><span>资金分布</span><small>每个价格档的权重</small></div>
+              <div className="dlmm-section-title"><span><b className="dlmm-section-step">3</b>资金分布</span><small>默认可不改</small></div>
               <div className="dlmm-friendly-strategies dlmm-delta-strategies" role="group" aria-label="资金分配策略">
                 {([
                   ['spot', 'Spot', '平均'],
@@ -733,57 +854,6 @@ export default function DlmmMode(props: Props) {
                   </button>
                 ))}
               </div>
-            </section>
-
-            <section className="dlmm-delta-section">
-              <div className="dlmm-section-title">
-                <span>价格范围</span>
-                <small>{rangeUnitLabel}</small>
-              </div>
-              <div className="dlmm-friendly-presets dlmm-delta-presets" role="group" aria-label="价格范围预设">
-                {RANGE_PRESETS.map((preset) => (
-                  <button
-                    key={preset.key}
-                    type="button"
-                    className={rangePreset === preset.key ? 'active' : ''}
-                    onClick={() => applyPreset(inferredSide, preset.key)}
-                  ><strong>{preset.label}</strong><span>{preset.note}</span></button>
-                ))}
-              </div>
-              <div className="dlmm-range-inputs">
-                <label>
-                  <span>最低</span>
-                  <input
-                    type="number"
-                    inputMode="decimal"
-                    value={inputNumber(rangeValue(quote.spot * (1 + lowerPct / 100)))}
-                    onChange={(event) => setPriceBoundary('lower', event.target.value)}
-                  />
-                  <small>{lowerPct >= 0 ? '+' : ''}{lowerPct.toFixed(2)}%</small>
-                </label>
-                <i>—</i>
-                <label>
-                  <span>最高</span>
-                  <input
-                    type="number"
-                    inputMode="decimal"
-                    value={inputNumber(rangeValue(quote.spot * (1 + upperPct / 100)))}
-                    onChange={(event) => setPriceBoundary('upper', event.target.value)}
-                  />
-                  <small>{upperPct >= 0 ? '+' : ''}{upperPct.toFixed(2)}%</small>
-                </label>
-              </div>
-              <div className="dlmm-range-sliders">
-                <label>
-                  <span>下限</span>
-                  <input type="range" min={lowerSlider} max={lowerSliderMax} step={0.1} value={lowerPct} onChange={(event) => setPctBoundary('lower', Number(event.target.value))} />
-                </label>
-                <label>
-                  <span>上限</span>
-                  <input type="range" min={upperSliderMin} max={upperSliderMax} step={0.1} value={upperPct} onChange={(event) => setPctBoundary('upper', Number(event.target.value))} />
-                </label>
-              </div>
-              {planState.error && <p className="dlmm-error">{planState.error}</p>}
             </section>
 
             <details className="dlmm-advanced dlmm-delta-advanced">

@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { getActiveChainId } from './chain'
@@ -30,6 +31,16 @@ function clamp(value: number, min: number, max: number): number {
 
 function formatAxis(value: number, marketCap: boolean): string {
   return marketCap ? formatUsd(value) : formatPrice(value)
+}
+
+function edgeLabel(side: DlmmSide, which: DragSide): string {
+  if (side === 'bid') return which === 'lower' ? '最低买价' : '最高买价'
+  if (side === 'ask') return which === 'lower' ? '最低卖价' : '最高卖价'
+  return which === 'lower' ? '范围下限' : '范围上限'
+}
+
+function signedPct(value: number): string {
+  return `${value >= 0 ? '+' : ''}${value.toFixed(Math.abs(value) >= 100 ? 0 : 1)}%`
 }
 
 export function DlmmRangeChart({
@@ -75,19 +86,20 @@ export function DlmmRangeChart({
   }, [plan.coin.address, poolRef])
 
   const W = 760
-  const H = 250
-  const padL = 12
-  const padR = 12
-  const padT = 20
-  const candleBottom = 164
-  const binBottom = 226
+  const H = 310
+  const padL = 14
+  const padR = 128
+  const padT = 24
+  const plotBottom = 264
   const plotW = W - padL - padR
+  const plotH = plotBottom - padT
   const marketCap = rangeUnit === 'market-cap' && Boolean(coinSupply)
   const shown = (price: number) => marketCap ? price * (coinSupply ?? 1) : price
+  const visibleCandles = candles.slice(-96)
 
   const computedDomain = useMemo(() => {
     const prices = [plan.coinSpot, plan.coinPriceLower, plan.coinPriceUpper]
-    for (const candle of candles.slice(-96)) prices.push(candle.low, candle.high)
+    for (const candle of visibleCandles) prices.push(candle.low, candle.high)
     const safe = prices.filter((value) => value > 0 && Number.isFinite(value))
     let min = Math.min(...safe)
     let max = Math.max(...safe)
@@ -97,53 +109,55 @@ export function DlmmRangeChart({
     }
     const logMin = Math.log(Math.max(min, 1e-30))
     const logMax = Math.log(Math.max(max, min * 1.000001))
-    const pad = Math.max((logMax - logMin) * 0.09, 0.025)
+    const pad = Math.max((logMax - logMin) * 0.08, 0.02)
     return { min: Math.exp(logMin - pad), max: Math.exp(logMax + pad) }
-  }, [candles, plan.coinPriceLower, plan.coinPriceUpper, plan.coinSpot])
+  }, [plan.coinPriceLower, plan.coinPriceUpper, plan.coinSpot, visibleCandles])
   const domain = dragDomain ?? computedDomain
 
-  const xOf = useCallback((price: number) => {
+  const yOf = useCallback((price: number) => {
     const min = Math.log(Math.max(domain.min, 1e-30))
     const max = Math.log(Math.max(domain.max, domain.min * 1.000001))
     const value = Math.log(Math.max(price, 1e-30))
-    return padL + clamp((value - min) / (max - min), 0, 1) * plotW
-  }, [domain, plotW])
+    return padT + (1 - clamp((value - min) / (max - min), 0, 1)) * plotH
+  }, [domain, plotH])
 
-  const priceOf = useCallback((x: number) => {
-    const t = clamp((x - padL) / plotW, 0, 1)
+  const priceOf = useCallback((y: number) => {
+    const t = 1 - clamp((y - padT) / plotH, 0, 1)
     const min = Math.log(Math.max(domain.min, 1e-30))
     const max = Math.log(Math.max(domain.max, domain.min * 1.000001))
     return Math.exp(min + t * (max - min))
-  }, [domain, plotW])
+  }, [domain, plotH])
 
-  const pointerToPrice = useCallback((clientX: number) => {
+  const clampBoundaryPct = useCallback((which: DragSide, rawPct: number) => {
+    if (which === 'lower') {
+      const floor = side === 'ask' ? 0.05 : -99.5
+      const sideCeiling = side === 'ask' ? 1_000_000 : -0.05
+      return clamp(rawPct, floor, Math.min(sideCeiling, plan.rangeUpperPct - 0.05))
+    }
+    const sideFloor = side === 'bid' ? -99.5 : 0.05
+    const ceiling = side === 'bid' ? -0.05 : 1_000_000
+    return clamp(rawPct, Math.max(sideFloor, plan.rangeLowerPct + 0.05), ceiling)
+  }, [plan.rangeLowerPct, plan.rangeUpperPct, side])
+
+  const pointerToPrice = useCallback((clientY: number) => {
     const svg = svgRef.current
     if (!svg) return null
     const rect = svg.getBoundingClientRect()
-    if (!(rect.width > 0)) return null
-    return priceOf(((clientX - rect.left) / rect.width) * W)
+    if (!(rect.height > 0)) return null
+    return priceOf(((clientY - rect.top) / rect.height) * H)
   }, [priceOf])
 
-  const applyDrag = useCallback((which: DragSide, clientX: number) => {
-    const price = pointerToPrice(clientX)
+  const applyDrag = useCallback((which: DragSide, clientY: number) => {
+    const price = pointerToPrice(clientY)
     if (price == null || !(price > 0) || !(plan.coinSpot > 0)) return
-    let pct = ((price / plan.coinSpot) - 1) * 100
-    if (which === 'lower') {
-      const ceiling = side === 'both' ? -0.05 : side === 'bid' ? plan.rangeUpperPct - 0.05 : plan.rangeUpperPct - 0.05
-      const floor = side === 'ask' ? 0.05 : -99.5
-      pct = clamp(pct, floor, ceiling)
-    } else {
-      const floor = side === 'both' ? 0.05 : side === 'ask' ? plan.rangeLowerPct + 0.05 : plan.rangeLowerPct + 0.05
-      const ceiling = side === 'bid' ? -0.05 : 1_000_000
-      pct = clamp(pct, floor, ceiling)
-    }
-    onBoundaryPct(which, pct)
-  }, [onBoundaryPct, plan.coinSpot, plan.rangeLowerPct, plan.rangeUpperPct, pointerToPrice, side])
+    const pct = ((price / plan.coinSpot) - 1) * 100
+    onBoundaryPct(which, clampBoundaryPct(which, pct))
+  }, [clampBoundaryPct, onBoundaryPct, plan.coinSpot, pointerToPrice])
 
   useEffect(() => {
     if (!drag) return
     const onMove = (event: PointerEvent) => {
-      if (dragRef.current) applyDrag(dragRef.current, event.clientX)
+      if (dragRef.current) applyDrag(dragRef.current, event.clientY)
     }
     const onUp = () => {
       dragRef.current = null
@@ -160,7 +174,7 @@ export function DlmmRangeChart({
     }
   }, [applyDrag, drag])
 
-  const startDrag = (which: DragSide, event: ReactPointerEvent) => {
+  const startDrag = (which: DragSide, event: ReactPointerEvent<SVGGElement>) => {
     event.preventDefault()
     event.stopPropagation()
     setDragDomain(computedDomain)
@@ -168,65 +182,83 @@ export function DlmmRangeChart({
     setDrag(which)
   }
 
-  const candleDomain = useMemo(() => {
-    const visible = candles.filter((row) => row.high >= domain.min && row.low <= domain.max)
-    if (visible.length === 0) return { min: plan.coinSpot * 0.98, max: plan.coinSpot * 1.02 }
-    let min = Math.min(...visible.map((row) => row.low))
-    let max = Math.max(...visible.map((row) => row.high))
-    if (!(max > min)) {
-      min *= 0.99
-      max *= 1.01
-    }
-    const pad = (max - min) * 0.08
-    return { min: Math.max(1e-30, min - pad), max: max + pad }
-  }, [candles, domain, plan.coinSpot])
-  const yOf = (price: number) => (
-    padT + (1 - clamp(
-      (price - candleDomain.min) / (candleDomain.max - candleDomain.min || 1),
-      0,
-      1,
-    )) * (candleBottom - padT)
-  )
+  const nudgeBoundary = (which: DragSide, event: ReactKeyboardEvent<SVGGElement>) => {
+    const direction = event.key === 'ArrowUp' || event.key === 'PageUp'
+      ? 1
+      : event.key === 'ArrowDown' || event.key === 'PageDown'
+        ? -1
+        : 0
+    if (direction === 0) return
+    event.preventDefault()
+    const step = event.shiftKey || event.key.startsWith('Page') ? 5 : 0.5
+    const current = which === 'lower' ? plan.rangeLowerPct : plan.rangeUpperPct
+    onBoundaryPct(which, clampBoundaryPct(which, current + direction * step))
+  }
 
-  const visibleCandles = candles.filter((row) => row.high >= domain.min && row.low <= domain.max).slice(-96)
-  const candleW = Math.max(2, Math.min(8, plotW / Math.max(1, visibleCandles.length) * 0.62))
+  const candleW = Math.max(2, Math.min(7, plotW / Math.max(1, visibleCandles.length) * 0.64))
+  const xForCandle = (index: number) => (
+    padL + (visibleCandles.length <= 1 ? 0.5 : index / (visibleCandles.length - 1)) * plotW
+  )
   const maxWeight = Math.max(1, ...visualTranches.map((row) => row.weightUnits))
-  const lowerX = xOf(plan.coinPriceLower)
-  const upperX = xOf(plan.coinPriceUpper)
-  const spotX = xOf(plan.coinSpot)
+  const lowerY = yOf(plan.coinPriceLower)
+  const upperY = yOf(plan.coinPriceUpper)
+  const spotY = yOf(plan.coinSpot)
+  const gridPrices = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+    const min = Math.log(Math.max(domain.min, 1e-30))
+    const max = Math.log(Math.max(domain.max, domain.min * 1.000001))
+    return Math.exp(max - ratio * (max - min))
+  })
 
   const status = candleState === 'loading'
     ? 'K 线载入中…'
     : candleState === 'error'
-      ? 'K 线暂不可用，Bin 与拖拽仍可使用'
+      ? 'K 线暂不可用，范围设置仍可使用'
       : candleState === 'empty'
-        ? '该池暂无 K 线，Bin 与拖拽仍可使用'
+        ? '该池暂无 K 线，范围设置仍可使用'
         : `${visibleCandles.length} 根 1h K 线`
 
   return (
-    <div className="dlmm-range-chart">
+    <div className={`dlmm-range-chart ${drag ? 'is-dragging' : ''}`}>
       <div className="dlmm-range-chart-meta">
-        <strong>价格 / 市值与资金分布</strong>
+        <div>
+          <strong>价格走势与建仓范围</strong>
+          <small>彩色区域就是资金会工作的价格区间</small>
+        </div>
         <span>{status}</span>
+      </div>
+      <div className="dlmm-range-chart-tip">
+        <b>不用拖也能设置：</b>
+        <span>直接选“近价 / 均衡 / 深度”，或在价格框里输入；拖横线只用于微调。</span>
       </div>
       <svg
         ref={svgRef}
         className="dlmm-range-chart-svg"
         viewBox={`0 0 ${W} ${H}`}
         role="img"
-        aria-label="价格 K 线、视觉 Bin 和可拖动建仓范围"
+        aria-label="时间价格 K 线、视觉 Bin 和可上下拖动的建仓范围"
       >
         <rect className="dlmm-range-chart-bg" x="0" y="0" width={W} height={H} rx="12" />
+
+        {gridPrices.map((price) => {
+          const y = yOf(price)
+          return (
+            <g className="dlmm-chart-grid" key={price}>
+              <line x1={padL} x2={W - padL} y1={y} y2={y} />
+              <text x={padL + 5} y={clamp(y - 4, 11, H - 7)}>{formatAxis(shown(price), marketCap)}</text>
+            </g>
+          )
+        })}
+
         <rect
-          className="dlmm-range-selected"
-          x={lowerX}
-          y={padT}
-          width={Math.max(1, upperX - lowerX)}
-          height={binBottom - padT}
+          className={`dlmm-range-selected ${side}`}
+          x={padL}
+          y={upperY}
+          width={W - padL * 2}
+          height={Math.max(1, lowerY - upperY)}
         />
 
-        {visibleCandles.map((candle) => {
-          const x = xOf(candle.close)
+        {visibleCandles.map((candle, index) => {
+          const x = xForCandle(index)
           const up = candle.close >= candle.open
           const top = yOf(Math.max(candle.open, candle.close))
           const bottom = yOf(Math.min(candle.open, candle.close))
@@ -238,61 +270,78 @@ export function DlmmRangeChart({
           )
         })}
 
-        <line className="dlmm-chart-spot-line" x1={spotX} x2={spotX} y1={padT} y2={binBottom} />
-        <text className="dlmm-chart-spot-text" x={clamp(spotX + 5, 8, W - 78)} y={padT + 12}>现价</text>
+        <g className="dlmm-bin-profile" aria-label={`${visualTranches.length} 个视觉 Bin`}>
+          <text x={W - 16} y={15} textAnchor="end">资金权重</text>
+          {visualTranches.map((row) => {
+            const y0 = yOf(row.coinPriceUpper)
+            const y1 = yOf(row.coinPriceLower)
+            const width = 12 + (row.weightUnits / maxWeight) * 82
+            const visualSide = row.coinPriceUpper <= plan.coinSpot
+              ? 'bid'
+              : row.coinPriceLower >= plan.coinSpot
+                ? 'ask'
+                : 'both'
+            return (
+              <rect
+                key={`${row.tickLower}:${row.tickUpper}`}
+                className={`dlmm-visual-bin ${visualSide}`}
+                x={W - 16 - width}
+                y={y0 + 0.45}
+                width={width}
+                height={Math.max(1.2, y1 - y0 - 0.9)}
+                rx="1.5"
+              >
+                <title>{formatAxis(shown(row.coinPriceLower), marketCap)} – {formatAxis(shown(row.coinPriceUpper), marketCap)} · {row.weightPct.toFixed(1)}%</title>
+              </rect>
+            )
+          })}
+        </g>
 
-        {visualTranches.map((row) => {
-          const x0 = xOf(row.coinPriceLower)
-          const x1 = xOf(row.coinPriceUpper)
-          const height = 12 + (row.weightUnits / maxWeight) * 48
-          const visualSide = row.coinPriceUpper <= plan.coinSpot
-            ? 'bid'
-            : row.coinPriceLower >= plan.coinSpot
-              ? 'ask'
-              : 'both'
-          return (
-            <rect
-              key={`${row.tickLower}:${row.tickUpper}`}
-              className={`dlmm-visual-bin ${visualSide}`}
-              x={x0 + 0.6}
-              y={binBottom - height}
-              width={Math.max(1.2, x1 - x0 - 1.2)}
-              height={height}
-              rx="1.5"
-            >
-              <title>{formatAxis(shown(row.coinPriceLower), marketCap)} – {formatAxis(shown(row.coinPriceUpper), marketCap)} · {row.weightPct.toFixed(1)}%</title>
-            </rect>
-          )
-        })}
+        <line className="dlmm-chart-spot-line" x1={padL} x2={W - padL} y1={spotY} y2={spotY} />
+        <g className="dlmm-chart-spot-pill" transform={`translate(${padL + 5} ${clamp(spotY - 18, 3, H - 26)})`}>
+          <rect width="88" height="23" rx="8" />
+          <text x="8" y="15">现价 {formatAxis(shown(plan.coinSpot), marketCap)}</text>
+        </g>
 
         {(['lower', 'upper'] as const).map((which) => {
-          const x = which === 'lower' ? lowerX : upperX
-          const label = which === 'lower' ? '下限' : '上限'
-          const value = shown(which === 'lower' ? plan.coinPriceLower : plan.coinPriceUpper)
+          const y = which === 'lower' ? lowerY : upperY
+          const price = which === 'lower' ? plan.coinPriceLower : plan.coinPriceUpper
+          const pct = which === 'lower' ? plan.rangeLowerPct : plan.rangeUpperPct
+          const label = edgeLabel(side, which)
+          const pillY = clamp(y - 17, 2, H - 36)
           return (
             <g
               key={which}
-              className={`dlmm-drag-handle ${drag === which ? 'active' : ''}`}
+              className={`dlmm-drag-handle ${which} ${drag === which ? 'active' : ''}`}
               onPointerDown={(event) => startDrag(which, event)}
-              style={{ cursor: 'ew-resize' }}
+              onKeyDown={(event) => nudgeBoundary(which, event)}
+              role="slider"
+              tabIndex={0}
+              aria-label={label}
+              aria-valuenow={price}
+              aria-valuetext={`${label} ${formatAxis(shown(price), marketCap)}，距离现价 ${signedPct(pct)}`}
             >
-              <line className="dlmm-drag-hit" x1={x} x2={x} y1={padT} y2={binBottom + 3} />
-              <line x1={x} x2={x} y1={padT} y2={binBottom + 3} />
-              <rect x={x - 20} y={2} width={40} height={18} rx={8} />
-              <text x={x} y={15} textAnchor="middle">{label}</text>
-              <title>{label} {formatAxis(value, marketCap)}，左右拖动调整</title>
+              <line className="dlmm-drag-hit" x1={padL} x2={W - padL} y1={y} y2={y} />
+              <line x1={padL} x2={W - padL} y1={y} y2={y} />
+              <g className="dlmm-drag-pill" transform={`translate(${W - 124} ${pillY})`}>
+                <rect width="110" height="34" rx="10" />
+                <text className="label" x="9" y="14">↕ {label}</text>
+                <text className="value" x="9" y="27">{formatAxis(shown(price), marketCap)} · {signedPct(pct)}</text>
+              </g>
+              <title>{label}：上下拖动，或聚焦后按 ↑ / ↓ 调整</title>
             </g>
           )
         })}
 
-        <text className="dlmm-chart-axis-label" x={padL} y={H - 8}>
-          {formatAxis(shown(domain.min), marketCap)}
-        </text>
-        <text className="dlmm-chart-axis-label" x={W - padR} y={H - 8} textAnchor="end">
-          {formatAxis(shown(domain.max), marketCap)}
-        </text>
+        <text className="dlmm-chart-time-label" x={padL} y={H - 10}>较早</text>
+        <text className="dlmm-chart-time-label" x={padL + plotW} y={H - 10} textAnchor="end">现在</text>
       </svg>
-      <p className="muted dlmm-range-chart-hint">拖动“下限 / 上限”直接改范围；K 线来自共享市场索引，彩色柱是 {visualTranches.length} 个视觉 Bin。</p>
+      <div className="dlmm-range-chart-legend" aria-label="图表图例">
+        <span><i className="candles" />K 线</span>
+        <span><i className={`range ${side}`} />建仓区间</span>
+        <span><i className="bins" />{visualTranches.length} 个价格档</span>
+      </div>
+      <p className="muted dlmm-range-chart-hint">精调：抓住右侧大标签上下拖动；键盘 ↑/↓ 调 0.5%，Shift + ↑/↓ 调 5%。提交前仍会读取链上现价复检。</p>
     </div>
   )
 }

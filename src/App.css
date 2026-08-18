@@ -4935,9 +4935,51 @@ input:focus-visible, select:focus-visible, select:focus {
 .dlmm-range-unit button.active { background: var(--accent-soft); color: var(--accent); }
 .dlmm-range-unit button:disabled { opacity: 0.4; cursor: not-allowed; }
 
+.dlmm-quick-guide {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--line));
+  border-radius: var(--r-md);
+  background: linear-gradient(120deg, color-mix(in srgb, var(--accent-soft) 44%, var(--card)), var(--card));
+}
+.dlmm-quick-guide > div {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 9px;
+  opacity: 0.68;
+}
+.dlmm-quick-guide > div.active,
+.dlmm-quick-guide > div.done { opacity: 1; }
+.dlmm-quick-guide > div > b {
+  display: grid;
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--card-2);
+  color: var(--muted);
+  font-size: 13px;
+}
+.dlmm-quick-guide > div.active > b { border-color: var(--accent); background: var(--accent); color: white; }
+.dlmm-quick-guide > div.done > b { border-color: var(--ok); background: var(--ok); color: white; }
+.dlmm-quick-guide > div.done > b::before { content: '✓'; }
+.dlmm-quick-guide > div.done > b { font-size: 0; }
+.dlmm-quick-guide > div.done > b::before { font-size: 13px; }
+.dlmm-quick-guide > div > span { display: grid; min-width: 0; gap: 1px; }
+.dlmm-quick-guide strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.dlmm-quick-guide small { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.dlmm-quick-guide > i { color: var(--muted); font-style: normal; }
+
 .dlmm-range-chart {
   margin-top: 12px;
-  padding: 11px 12px 8px;
+  padding: 12px 12px 9px;
   border: 1px solid var(--line-soft);
   border-radius: var(--r-md);
   background: color-mix(in srgb, var(--card-2) 72%, transparent);
@@ -4949,15 +4991,30 @@ input:focus-visible, select:focus-visible, select:focus {
   gap: 10px;
   margin-bottom: 7px;
 }
-.dlmm-range-chart-meta strong { font-size: 13.5px; }
+.dlmm-range-chart-meta > div { display: grid; gap: 1px; }
+.dlmm-range-chart-meta strong { font-size: 14px; }
+.dlmm-range-chart-meta small { color: var(--muted); font-size: 11.5px; }
 .dlmm-range-chart-meta span { color: var(--muted); font-size: 12px; }
+.dlmm-range-chart-tip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 7px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent-soft) 58%, transparent);
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+.dlmm-range-chart-tip b { color: var(--accent); }
 .dlmm-range-chart-svg {
   display: block;
   width: 100%;
-  min-height: 240px;
+  min-height: 265px;
   overflow: visible;
   border-radius: 12px;
-  touch-action: none;
+  touch-action: pan-x pan-y;
   user-select: none;
 }
 .dlmm-range-chart-bg {
@@ -4965,9 +5022,16 @@ input:focus-visible, select:focus-visible, select:focus {
   stroke: var(--hairline);
 }
 .dlmm-range-selected {
-  fill: color-mix(in srgb, var(--accent) 8%, transparent);
-  stroke: color-mix(in srgb, var(--accent) 18%, transparent);
+  stroke-width: 1;
 }
+.dlmm-range-selected.bid { fill: color-mix(in srgb, #339fd8 13%, transparent); stroke: color-mix(in srgb, #339fd8 34%, transparent); }
+.dlmm-range-selected.ask { fill: color-mix(in srgb, #9462e8 13%, transparent); stroke: color-mix(in srgb, #9462e8 34%, transparent); }
+.dlmm-range-selected.both { fill: color-mix(in srgb, #36b9a6 12%, transparent); stroke: color-mix(in srgb, #36b9a6 34%, transparent); }
+.dlmm-chart-grid line { stroke: var(--hairline); stroke-width: 1; }
+.dlmm-chart-grid text,
+.dlmm-chart-time-label,
+.dlmm-bin-profile > text { fill: var(--muted); font: 10.5px var(--mono); }
+.dlmm-bin-profile > text { font: 650 10px var(--sans); }
 .dlmm-candle line { stroke-width: 1.15; }
 .dlmm-candle rect { stroke-width: 0.6; }
 .dlmm-candle.up line,
@@ -4984,23 +5048,44 @@ input:focus-visible, select:focus-visible, select:focus {
   stroke-width: 1.4;
   stroke-dasharray: 4 3;
 }
-.dlmm-chart-spot-text,
-.dlmm-chart-axis-label {
-  fill: var(--muted);
-  font: 11px var(--mono);
+.dlmm-chart-spot-pill rect { fill: var(--ink); opacity: 0.9; }
+.dlmm-chart-spot-pill text { fill: var(--card); font: 700 9.5px var(--sans); }
+.dlmm-drag-handle {
+  outline: none;
+  cursor: ns-resize;
+  touch-action: none;
 }
-.dlmm-chart-spot-text { fill: var(--ink); font: 700 10.5px var(--sans); }
 .dlmm-drag-handle > line:not(.dlmm-drag-hit) {
   stroke: var(--accent);
-  stroke-width: 2.2;
+  stroke-width: 2.4;
   filter: drop-shadow(0 0 3px color-mix(in srgb, var(--accent) 45%, transparent));
 }
-.dlmm-drag-hit { stroke: transparent; stroke-width: 20; }
-.dlmm-drag-handle > rect { fill: var(--accent); stroke: var(--card); stroke-width: 1; }
-.dlmm-drag-handle > text { fill: white; font: 700 10px var(--sans); pointer-events: none; }
-.dlmm-drag-handle.active > rect { fill: var(--ok); }
+.dlmm-drag-hit { stroke: transparent; stroke-width: 30; }
+.dlmm-drag-pill rect { fill: var(--accent); stroke: var(--card); stroke-width: 1.2; }
+.dlmm-drag-pill text { fill: white; pointer-events: none; }
+.dlmm-drag-pill .label { font: 750 10.5px var(--sans); }
+.dlmm-drag-pill .value { font: 650 9px var(--mono); opacity: 0.92; }
+.dlmm-drag-handle:hover .dlmm-drag-pill rect,
+.dlmm-drag-handle:focus-visible .dlmm-drag-pill rect { filter: brightness(1.12); stroke: var(--ink); stroke-width: 1.8; }
+.dlmm-drag-handle.active .dlmm-drag-pill rect { fill: var(--ok); }
 .dlmm-drag-handle.active > line:not(.dlmm-drag-hit) { stroke: var(--ok); }
-.dlmm-range-chart-hint { margin: 6px 1px 0; font-size: 11.5px; }
+.dlmm-range-chart.is-dragging { border-color: color-mix(in srgb, var(--ok) 55%, var(--line)); }
+.dlmm-range-chart-legend {
+  display: flex;
+  justify-content: center;
+  gap: 16px;
+  margin-top: -3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.dlmm-range-chart-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.dlmm-range-chart-legend i { width: 14px; height: 7px; border-radius: 3px; background: var(--line); }
+.dlmm-range-chart-legend i.candles { background: linear-gradient(90deg, var(--ok) 50%, var(--out) 50%); }
+.dlmm-range-chart-legend i.range.bid { background: #339fd8; }
+.dlmm-range-chart-legend i.range.ask { background: #9462e8; }
+.dlmm-range-chart-legend i.range.both { background: #36b9a6; }
+.dlmm-range-chart-legend i.bins { background: linear-gradient(90deg, transparent, var(--accent)); }
+.dlmm-range-chart-hint { margin: 7px 1px 0; font-size: 11.5px; line-height: 1.45; }
 
 .dlmm-layout-settings { display: grid; gap: 8px; }
 .dlmm-layout-settings .dlmm-band-preset { grid-template-columns: repeat(5, 38px); }
@@ -5189,34 +5274,109 @@ input:focus-visible, select:focus-visible, select:focus {
 .dlmm-delta-strategies .dlmm-strategy-bars.bid-ask i:nth-child(4) { height: 58%; }
 .dlmm-delta-strategies .dlmm-strategy-bars.bid-ask i:nth-child(3) { height: 24%; }
 .dlmm-delta-presets { grid-template-columns: repeat(4, 1fr); }
-.dlmm-delta-presets button { padding: 7px 6px; text-align: center; }
-.dlmm-range-inputs {
+.dlmm-delta-presets button { padding: 8px 6px; text-align: center; }
+.dlmm-delta-presets button em {
+  color: var(--muted);
+  font: 10.5px var(--mono);
+  font-style: normal;
+  white-space: nowrap;
+}
+.dlmm-section-title > span { display: inline-flex; align-items: center; gap: 6px; }
+.dlmm-section-step {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+}
+.dlmm-range-section {
+  background: linear-gradient(160deg, color-mix(in srgb, var(--accent-soft) 22%, transparent), transparent 48%);
+}
+.dlmm-range-explanation {
+  margin: 0 0 10px;
+  padding: 8px 9px;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  background: color-mix(in srgb, var(--accent-soft) 42%, transparent);
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.dlmm-range-explanation.bid { border-left-color: #339fd8; }
+.dlmm-range-explanation.ask { border-left-color: #9462e8; }
+.dlmm-range-explanation.both { border-left-color: #36b9a6; }
+.dlmm-range-endpoints {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-  align-items: center;
-  gap: 7px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
   margin-top: 9px;
 }
-.dlmm-range-inputs > i { color: var(--muted); font-style: normal; }
-.dlmm-range-inputs label {
+.dlmm-range-endpoint {
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--card-2);
+}
+.dlmm-range-endpoint.bid { border-top-color: color-mix(in srgb, #339fd8 62%, var(--line)); }
+.dlmm-range-endpoint.ask { border-top-color: color-mix(in srgb, #9462e8 62%, var(--line)); }
+.dlmm-range-endpoint.both { border-top-color: color-mix(in srgb, #36b9a6 62%, var(--line)); }
+.dlmm-range-endpoint-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 8px;
+}
+.dlmm-range-edge-dot {
   display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 3px 7px;
+  flex: 0 0 23px;
+  width: 23px;
+  height: 23px;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font: 750 10px var(--sans);
+}
+.dlmm-range-endpoint-head > div { display: grid; min-width: 0; gap: 1px; }
+.dlmm-range-endpoint-head strong { font-size: 13.5px; }
+.dlmm-range-endpoint-head small { overflow: hidden; color: var(--muted); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.dlmm-range-endpoint > label {
+  display: grid;
+  gap: 3px;
   min-width: 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11.5px;
 }
-.dlmm-range-inputs input {
-  grid-column: 1 / -1;
+.dlmm-range-endpoint > label + label { margin-top: 6px; }
+.dlmm-range-endpoint input {
   width: 100%;
   min-width: 0;
-  padding: 8px 9px;
-  font: 650 14px var(--mono);
+  height: 38px;
+  padding: 7px 8px;
+  font: 650 13px var(--mono);
 }
-.dlmm-range-inputs small { font: 11.5px var(--mono); }
-.dlmm-range-sliders { display: grid; gap: 7px; margin-top: 10px; }
-.dlmm-range-sliders label { display: grid; grid-template-columns: 34px 1fr; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
-.dlmm-range-sliders input { width: 100%; margin: 0; accent-color: var(--accent); }
+.dlmm-range-pct-input { position: relative; }
+.dlmm-range-pct-input input { padding-right: 25px; }
+.dlmm-range-pct-input > b {
+  position: absolute;
+  right: 8px;
+  bottom: 10px;
+  color: var(--muted);
+  font: 650 12px var(--mono);
+  pointer-events: none;
+}
+.dlmm-range-simple-help {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
 .dlmm-delta-advanced { margin-top: 10px; }
 .dlmm-delta-safety { margin-top: 10px; }
 .dlmm-delta-order > .dlmm-submit { width: calc(100% - 28px); margin: 10px 14px 0; min-height: 48px; font-size: 16px; }
@@ -5230,10 +5390,14 @@ input:focus-visible, select:focus-visible, select:focus {
 @media (max-width: 1120px) {
   .dlmm-delta-terminal { grid-template-columns: minmax(0, 1fr) 410px; }
   .dlmm-chart-bars { height: 230px; }
+  .dlmm-quick-guide small { display: none; }
 }
 @media (max-width: 930px) {
   .dlmm-delta-terminal { grid-template-columns: 1fr; }
-  .dlmm-delta-order { position: static; }
+  .dlmm-quick-guide { order: 0; }
+  .dlmm-delta-order { position: static; order: 1; }
+  .dlmm-delta-market { order: 2; }
+  .dlmm-quick-guide small { display: block; }
   .dlmm-chart-bars { height: 260px; }
 }
 @media (max-width: 640px) {
@@ -5242,8 +5406,17 @@ input:focus-visible, select:focus-visible, select:focus {
   .dlmm-chart-bars { height: 190px; gap: 3px; padding-inline: 2px; }
   .dlmm-chart-legend { gap: 9px; font-size: 11.5px; }
   .dlmm-range-chart { padding-inline: 7px; }
-  .dlmm-range-chart-svg { min-height: 200px; }
+  .dlmm-range-chart-svg { min-height: 230px; }
   .dlmm-range-chart-meta { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .dlmm-range-chart-tip { align-items: flex-start; flex-direction: column; gap: 1px; }
+  .dlmm-range-chart-legend { gap: 9px; font-size: 10px; }
+  .dlmm-range-chart-hint { font-size: 10.5px; }
+  .dlmm-quick-guide { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 8px; }
+  .dlmm-quick-guide > i { display: none; }
+  .dlmm-quick-guide > div { align-items: flex-start; gap: 5px; }
+  .dlmm-quick-guide > div > b { flex-basis: 24px; width: 24px; height: 24px; }
+  .dlmm-quick-guide strong { font-size: 11px; white-space: normal; }
+  .dlmm-quick-guide small { display: none; }
   .dlmm-delta-summary { grid-template-columns: 1fr; }
   .dlmm-delta-summary .dlmm-intent-icon,
   .dlmm-delta-summary .dlmm-intent-count { display: none; }
@@ -5253,6 +5426,7 @@ input:focus-visible, select:focus-visible, select:focus {
   .dlmm-delta-facts span { font-size: 11.5px; }
   .dlmm-delta-facts strong { font-size: 13px; }
   .dlmm-delta-presets { grid-template-columns: 1fr 1fr; }
+  .dlmm-range-endpoints { grid-template-columns: 1fr; }
   .dlmm-tranche-row-dual { grid-template-columns: 70px minmax(120px, 1fr) 70px; }
   .dlmm-tranche-row-dual > span:last-child { grid-column: 2 / -1; text-align: right; }
   .dlmm-nft-mode { grid-template-columns: 1fr; }
