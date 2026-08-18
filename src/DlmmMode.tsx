@@ -239,7 +239,14 @@ export default function DlmmMode(props: Props) {
     setAmountCoin('')
     setAmountQuote('')
     setFormError('')
-    if (rangePreset !== 'custom') applyPreset(side, rangePreset)
+    const customMatchesSide = side === 'bid'
+      ? upperPct < 0
+      : side === 'ask'
+        ? lowerPct > 0
+        : lowerPct < 0 && upperPct > 0
+    if (rangePreset !== 'custom' || !customMatchesSide) {
+      applyPreset(side, rangePreset === 'custom' ? 'balanced' : rangePreset)
+    }
     // A pool change clears amounts; a custom relative range is intentionally reusable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [poolKey])
@@ -785,7 +792,7 @@ export default function DlmmMode(props: Props) {
                   <div className="dlmm-band-count">
                     <span>链上档位数</span>
                     <div className="dlmm-band-preset" role="group" aria-label="链上档位数">
-                      {[4, 6, 8, 12].map((count) => (
+                      {[3, 4, 5, 6, 8, 12].map((count) => (
                         <button type="button" key={count} className={trancheCount === count ? 'active' : ''} disabled={count > (plan?.binCount ?? 1)} onClick={() => setTrancheCount(count)}>{count}</button>
                       ))}
                     </div>

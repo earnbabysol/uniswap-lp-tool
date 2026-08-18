@@ -4197,7 +4197,7 @@ input:focus-visible, select:focus-visible, select:focus {
   color: var(--muted);
   font-size: 11px;
 }
-.dlmm-band-preset { display: grid; grid-template-columns: repeat(4, 34px); gap: 4px; }
+.dlmm-band-preset { display: grid; grid-template-columns: repeat(6, 34px); gap: 4px; }
 .dlmm-band-preset button { padding: 4px 2px; }
 .dlmm-band-preset button:disabled { opacity: 0.35; cursor: not-allowed; }
 .dlmm-form-section {
