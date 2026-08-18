@@ -57,7 +57,7 @@ import {
 import { fetchJson, withTimeout } from './async'
 import { buildV3AccountingLedger, computePositionPnlUsd } from './pnlAccounting'
 import { mapWithConcurrency, readLogsAdaptive, runRpcTask } from './rpcScheduler'
-import { getInjectedNativeBalance, publicClient } from './wallet'
+import { getInjectedErc20Balance, getInjectedNativeBalance, publicClient } from './wallet'
 import {
   registerV4Deps,
   mintV4Position,
@@ -364,35 +364,42 @@ export async function resolveTokenMeta(address: Address): Promise<TokenMeta> {
 
 export async function getErc20Balance(token: Address, owner: Address): Promise<bigint> {
   const chainId = getActiveChainId()
-  return runRpcTask({
-    chainId,
-    lane: 'read',
-    label: '读取代币余额',
-    task: () => publicClient.readContract({
-      address: token,
-      abi: erc20Abi,
-      functionName: 'balanceOf',
-      args: [owner],
+  const walletBalance = await getInjectedErc20Balance(token, owner, chainId)
+  if (walletBalance != null) return walletBalance
+  return withTimeout(
+    runRpcTask({
+      chainId,
+      lane: 'balance',
+      retries: 1,
+      label: '读取代币余额',
+      task: () => publicClient.readContract({
+        address: token,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [owner],
+      }),
     }),
-  })
+    8_000,
+    '读取代币余额',
+  )
 }
 
 export async function getNativeBalance(owner: Address): Promise<bigint> {
   const chainId = getActiveChainId()
-  const rpcBalance = runRpcTask({
-    chainId,
-    lane: 'read',
-    label: '读取原生币余额',
-    task: () => publicClient.getBalance({ address: owner }),
-  })
   const walletBalance = await getInjectedNativeBalance(owner, chainId)
-
-  // 钱包节点与当前链一致时，以钱包读数为准；不要再等待可能限流的公共 RPC。
-  if (walletBalance != null) {
-    void rpcBalance.catch(() => undefined)
-    return walletBalance
-  }
-  return rpcBalance
+  // 钱包节点与当前链一致时，以钱包读数为准；不要占用公共 RPC 排队。
+  if (walletBalance != null) return walletBalance
+  return withTimeout(
+    runRpcTask({
+      chainId,
+      lane: 'balance',
+      retries: 1,
+      label: '读取原生币余额',
+      task: () => publicClient.getBalance({ address: owner }),
+    }),
+    8_000,
+    '读取原生币余额',
+  )
 }
 
 /**

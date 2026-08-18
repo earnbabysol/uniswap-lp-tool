@@ -471,6 +471,8 @@ export default function App() {
   const [useNativeEth, setUseNativeEth] = useState(false)
   /** 当前池由用户亲自选过支付资产后，后台余额刷新不能再擅自覆盖选择。 */
   const mintPaymentTouchedPoolRef = useRef<string | null>(null)
+  /** 新建池页的原生/包装币选择，独立于已加载池，避免被 Mint 页逻辑清掉。 */
+  const createPaymentTouchedRef = useRef<string | null>(null)
   const [mintProtocol, setMintProtocol] = usePersistentState<'v3' | 'v4'>('mintProtocol', 'v3')
   /**
    * 「初始价」输入框是 U 本位：用户填 USD per 币。
@@ -708,14 +710,25 @@ export default function App() {
   }, [filteredPositions, pushToast])
 
   const refreshBalances = useCallback(async (addr: Address) => {
-    const requestChainId = chainCfg.id
-    // 旧 render 可能在切链后的微任务里继续调用这里；绝不能把旧链余额写回新链。
+    const requestChainId = chainId
     if (getActiveChainId() !== requestChainId) return
     const generation = ++balanceRefreshGenRef.current
-    setEthBalStatus('loading')
-    setWethBalStatus(chainCfg.hasWrappedNative ? 'loading' : 'idle')
     const stillCurrent = () =>
       generation === balanceRefreshGenRef.current && getActiveChainId() === requestChainId
+
+    // 已有读数时不要闪成「…」；只在从未成功时显示读取中。
+    setEthBalStatus((current) => current === 'ready' ? 'ready' : 'loading')
+    if (chainCfg.hasWrappedNative) {
+      setWethBalStatus((current) => current === 'ready' ? 'ready' : 'loading')
+    } else {
+      setWethBalStatus('idle')
+    }
+
+    const watchdog = window.setTimeout(() => {
+      if (!stillCurrent()) return
+      setEthBalStatus((current) => current === 'loading' ? 'error' : current)
+      setWethBalStatus((current) => current === 'loading' ? 'error' : current)
+    }, 10_000)
 
     const extraBalance = chainCfg.key === 'arc'
       ? getTokenBalanceView(CONTRACTS.stable, addr)
@@ -726,9 +739,9 @@ export default function App() {
       getNativeBalance(addr),
       extraBalance,
     ])
+    window.clearTimeout(watchdog)
     if (!stillCurrent()) return
 
-    // 两类余额独立落地：WETH / USDC 节点偶发失败时，不再连带吞掉已经读到的原生 ETH。
     if (nativeResult.status === 'fulfilled') {
       setEthBal(nativeResult.value)
       setEthBalStatus('ready')
@@ -736,7 +749,6 @@ export default function App() {
         setGasTokenDisplay({ raw: nativeResult.value, decimals: 18 })
       }
     } else {
-      // 读取失败不是余额为 0；建仓页会明确显示失败，避免拿假 0 做余额判断。
       setEthBalStatus((current) => current === 'ready' ? 'ready' : 'error')
     }
     if (chainCfg.key === 'arc') {
@@ -760,7 +772,7 @@ export default function App() {
       setWethBal(0n)
       setWethBalStatus('idle')
     }
-  }, [chainCfg])
+  }, [chainCfg.hasWrappedNative, chainCfg.key, chainId])
 
   // 账户和应用链任一变化都重读余额。此前切链只刷新仓位，原生 ETH 可能保留为 0/旧链值。
   useEffect(() => {
@@ -2273,21 +2285,63 @@ export default function App() {
     }
   }
 
+  const createPaymentKey = showCreatePool
+    ? `create:${chainId}:${tokenA.toLowerCase()}:${tokenB.toLowerCase()}`
+    : ''
+  const createHasEthLike = isEthLikeCurrency(tokenA) || isEthLikeCurrency(tokenB)
+
+  // 新建 ETH 对：有原生币就默认付 ETH，别拿 0 WETH 标成「ETH 余额 0」。
+  useEffect(() => {
+    if (!showCreatePool || !createHasEthLike) return
+    if (createPaymentTouchedRef.current !== createPaymentKey) {
+      createPaymentTouchedRef.current = null
+    }
+    if (createPaymentTouchedRef.current === createPaymentKey) return
+    const choice = chooseWrappedPoolPayment({
+      nativeBalance: ethBal,
+      wrappedBalance: wethBal,
+      nativeStatus: ethBalStatus,
+      wrappedStatus: wethBalStatus,
+      gasReserve: MINT_GAS_RESERVE_WEI,
+    })
+    if (choice) setUseNativeEth(choice === 'native')
+  }, [
+    showCreatePool,
+    createHasEthLike,
+    createPaymentKey,
+    ethBal,
+    wethBal,
+    ethBalStatus,
+    wethBalStatus,
+  ])
+
   useEffect(() => {
     if (!address || !showCreatePool) return
+    let cancelled = false
     void (async () => {
-      const gas = 10n ** 15n
-      const balEth = ethBal > gas ? ethBal - gas : 0n
       const balA = isEthLikeCurrency(tokenA)
-        ? (useNativeEth ? balEth : wethBal)
+        ? (useNativeEth ? ethBal : wethBal)
         : await getErc20Balance(tokenA, address)
       const balB = isEthLikeCurrency(tokenB)
-        ? (useNativeEth ? balEth : wethBal)
+        ? (useNativeEth ? ethBal : wethBal)
         : await getErc20Balance(tokenB, address)
+      if (cancelled) return
       setCreateSeedBalA(balA)
       setCreateSeedBalB(balB)
     })()
+    return () => {
+      cancelled = true
+    }
   }, [address, showCreatePool, tokenA, tokenB, ethBal, wethBal, useNativeEth])
+
+  const createSideLabel = (addr: Address) => {
+    if (!isEthLikeCurrency(addr)) return tokenLabel(addr)
+    return useNativeEth ? getNativeSymbol() : getWrappedNativeSymbol()
+  }
+  const createSideBalanceStatus = (addr: Address): BalanceReadStatus => {
+    if (!isEthLikeCurrency(addr)) return 'ready'
+    return useNativeEth ? ethBalStatus : wethBalStatus
+  }
 
   const fillCreateSeedBalances = (pct = 100) => {
     if (!createSynth) return
@@ -2864,11 +2918,17 @@ export default function App() {
     : showBal1IsWrapped
       ? wethBalStatus
       : 'ready'
+  const headerBalanceText = (raw: bigint, status: BalanceReadStatus, symbol: string) => {
+    if (status === 'ready') return `${formatAmount(raw, 18, 4)} ${symbol}`
+    if (status === 'error') return `读取失败 ${symbol}`
+    if (raw > 0n) return `${formatAmount(raw, 18, 4)} ${symbol}`
+    return `… ${symbol}`
+  }
   const mintBalanceText = (raw: bigint, decimals: number, balanceStatus: BalanceReadStatus = 'ready') => {
-    if (balanceStatus !== 'ready') {
-      return balanceStatus === 'error' ? '读取失败' : '读取中…'
-    }
-    return formatAmount(raw, decimals, 6)
+    if (balanceStatus === 'ready') return formatAmount(raw, decimals, 6)
+    if (balanceStatus === 'error') return '读取失败'
+    if (raw > 0n) return formatAmount(raw, decimals, 6)
+    return '读取中…'
   }
   const gasReserve = MINT_GAS_RESERVE_WEI
   const mintMax0 = pool
@@ -3615,9 +3675,21 @@ export default function App() {
                   <a className="wallet-link mono" href={explorerAddress(address)} target="_blank" rel="noreferrer">
                     {shortAddr(address)}
                   </a>
-                  <span className="wallet-bals mono">
+                  <span
+                    className="wallet-bals mono"
+                    role="button"
+                    tabIndex={0}
+                    title="点击重新读取 ETH / WETH 余额"
+                    onClick={() => address && void refreshBalances(address)}
+                    onKeyDown={(e) => {
+                      if ((e.key === 'Enter' || e.key === ' ') && address) {
+                        e.preventDefault()
+                        void refreshBalances(address)
+                      }
+                    }}
+                  >
                     {chainHasWrappedNative()
-                      ? `${ethBalStatus === 'ready' ? formatAmount(ethBal, 18, 4) : '…'} ${getNativeSymbol()} · ${wethBalStatus === 'ready' ? formatAmount(wethBal, 18, 4) : '…'} ${getWrappedNativeSymbol()}`
+                      ? `${headerBalanceText(ethBal, ethBalStatus, getNativeSymbol())} · ${headerBalanceText(wethBal, wethBalStatus, getWrappedNativeSymbol())}`
                       : `${formatAmount(gasTokenDisplay.raw, gasTokenDisplay.decimals, 4)} ${chainCfg.chain.nativeCurrency.symbol}`}
                   </span>
                 </div>
@@ -4881,13 +4953,20 @@ export default function App() {
                       onChange={(e) => setV4TickSpacing(Math.max(1, Number(e.target.value) || 1))}
                     />
                   </label>
-                  {(isEthLikeCurrency(tokenA) || isEthLikeCurrency(tokenB)) && (
-                    <label className="inline-setting check" style={{ alignSelf: 'end', marginBottom: 8 }}>
-                      <input type="checkbox" checked={useNativeEth} onChange={(e) => setUseNativeEth(e.target.checked)} />
-                      {getNativeSymbol()} 用原生币（非 {getWrappedNativeSymbol()}）
-                    </label>
-                  )}
                 </div>
+              )}
+              {createHasEthLike && (
+                <label className="inline-setting check" style={{ margin: '0 0 8px' }}>
+                  <input
+                    type="checkbox"
+                    checked={useNativeEth}
+                    onChange={(e) => {
+                      createPaymentTouchedRef.current = createPaymentKey
+                      setUseNativeEth(e.target.checked)
+                    }}
+                  />
+                  {getNativeSymbol()} 用原生币（钱包 ETH），不要用 {getWrappedNativeSymbol()}
+                </label>
               )}
 
               <div className="grid2 mint-price-row">
@@ -5043,18 +5122,27 @@ export default function App() {
                       <> 上方初始价填好后，这里填一边就会自动配平（可点「取现价」从已有池子带过来）。</>
                     )}
                     {mintProtocol === 'v3' && (
-                      <> V3 链上用 {getWrappedNativeSymbol()}，可直接付 {getNativeSymbol()}（自动 Wrap）。</>
+                      <> V3 链上用 {getWrappedNativeSymbol()}，勾选原生币后会自动 Wrap。</>
+                    )}
+                    {createHasEthLike && (
+                      <> 当前按{useNativeEth ? `原生 ${getNativeSymbol()}` : getWrappedNativeSymbol()}计余额。</>
                     )}
                   </p>
                   <div className="grid2">
                     <label>
-                      {tokenLabel(tokenA)} 数量
+                      {createSideLabel(tokenA)} 数量
                       {createRangePreset === 'onesided-eth' && isEthLikeCurrency(tokenA)
                         ? '（单边）'
                         : createRangePreset === 'onesided-eth' && isEthLikeCurrency(tokenB)
                           ? '（不需要）'
                           : ''}
-                      <span className="bal-hint">余额 {formatAmount(createSeedBalA, createSynth?.decA ?? tokenDecimals(tokenA), 6)}</span>
+                      <span className="bal-hint">
+                        余额 {mintBalanceText(
+                          createSeedBalA,
+                          isEthLikeCurrency(tokenA) ? 18 : (createSynth?.decA ?? tokenDecimals(tokenA)),
+                          createSideBalanceStatus(tokenA),
+                        )}
+                      </span>
                       <input
                         value={seedAmtA}
                         onChange={(e) => onCreateSeedSide('A', e.target.value)}
@@ -5069,13 +5157,19 @@ export default function App() {
                       />
                     </label>
                     <label>
-                      {tokenLabel(tokenB)} 数量
+                      {createSideLabel(tokenB)} 数量
                       {createRangePreset === 'onesided-eth' && isEthLikeCurrency(tokenB)
                         ? '（单边）'
                         : createRangePreset === 'onesided-eth' && isEthLikeCurrency(tokenA)
                           ? '（不需要）'
                           : ''}
-                      <span className="bal-hint">余额 {formatAmount(createSeedBalB, createSynth?.decB ?? tokenDecimals(tokenB), 6)}</span>
+                      <span className="bal-hint">
+                        余额 {mintBalanceText(
+                          createSeedBalB,
+                          isEthLikeCurrency(tokenB) ? 18 : (createSynth?.decB ?? tokenDecimals(tokenB)),
+                          createSideBalanceStatus(tokenB),
+                        )}
+                      </span>
                       <input
                         value={seedAmtB}
                         onChange={(e) => onCreateSeedSide('B', e.target.value)}

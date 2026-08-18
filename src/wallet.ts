@@ -84,6 +84,30 @@ export const publicClient: PublicClient = new Proxy({} as PublicClient, {
   },
 })
 
+async function injectedOnChain(expectedChainId: SupportedChainId): Promise<boolean> {
+  if (typeof window === 'undefined' || !window.ethereum) return false
+  try {
+    const rawChainId = await withTimeout(
+      window.ethereum.request({ method: 'eth_chainId' }),
+      2_500,
+      '钱包网络读取',
+    )
+    return typeof rawChainId === 'string' && Number(BigInt(rawChainId)) === expectedChainId
+  } catch {
+    return false
+  }
+}
+
+function parseHexQuantity(raw: unknown): bigint | null {
+  if (typeof raw !== 'string' || !/^0x[0-9a-f]*$/i.test(raw)) return null
+  if (raw === '0x') return 0n
+  try {
+    return BigInt(raw)
+  } catch {
+    return null
+  }
+}
+
 /**
  * 直接向插件钱包当前使用的节点读取原生币余额。
  *
@@ -94,26 +118,41 @@ export async function getInjectedNativeBalance(
   owner: Address,
   expectedChainId: SupportedChainId,
 ): Promise<bigint | null> {
-  if (typeof window === 'undefined' || !window.ethereum) return null
+  if (!(await injectedOnChain(expectedChainId)) || !window.ethereum) return null
   try {
-    const rawChainId = await withTimeout(
-      window.ethereum.request({ method: 'eth_chainId' }),
-      1_500,
-      '钱包网络读取',
-    )
-    if (typeof rawChainId !== 'string' || Number(BigInt(rawChainId)) !== expectedChainId) return null
     const rawBalance = await withTimeout(
       window.ethereum.request({
         method: 'eth_getBalance',
         params: [owner, 'latest'],
       }),
-      2_500,
+      4_000,
       '钱包余额读取',
     )
-    if (typeof rawBalance !== 'string' || !/^0x[0-9a-f]+$/i.test(rawBalance)) return null
-    return BigInt(rawBalance)
+    return parseHexQuantity(rawBalance)
   } catch {
-    // 未授权、钱包锁定或节点异常时继续使用应用只读 RPC。
+    return null
+  }
+}
+
+/** 钱包当前链上的 ERC-20 balanceOf，避开公共 RPC 排队。 */
+export async function getInjectedErc20Balance(
+  token: Address,
+  owner: Address,
+  expectedChainId: SupportedChainId,
+): Promise<bigint | null> {
+  if (!(await injectedOnChain(expectedChainId)) || !window.ethereum) return null
+  try {
+    const data = `0x70a08231${owner.slice(2).toLowerCase().padStart(64, '0')}`
+    const raw = await withTimeout(
+      window.ethereum.request({
+        method: 'eth_call',
+        params: [{ to: token, data }, 'latest'],
+      }),
+      4_000,
+      '钱包代币余额读取',
+    )
+    return parseHexQuantity(raw)
+  } catch {
     return null
   }
 }
