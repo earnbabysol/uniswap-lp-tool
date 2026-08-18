@@ -1266,7 +1266,7 @@ export async function mintV4DlmmPositions(opts: {
 }) {
   const { walletClient, owner, onStatus } = opts
   if (opts.pool.version !== 'v4' || !opts.pool.poolId) throw new Error('需要 V4 池')
-  if (opts.bands.length < 2 || opts.bands.length > 12) throw new Error('多档仓位必须为 2–12 档')
+  if (opts.bands.length < 2 || opts.bands.length > 80) throw new Error('多档仓位必须为 2–80 档')
   const slippageBps = opts.slippageBps ?? 300
   const useNativeEth = Boolean(opts.useNativeEth)
   const srcPool = opts.pool

@@ -218,6 +218,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const [elapsedMs, setElapsedMs] = useState<number | null>(null)
   const [loadStage, setLoadStage] = useState('')
+  const [dataSource, setDataSource] = useState<'shared-index' | 'live-rpc' | null>(null)
   const eventsRef = useRef<FlowEvent[]>([])
   const genRef = useRef(0)
   const mountedRef = useRef(true)
@@ -249,13 +250,15 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
     runningKeyRef.current = key
     runningGenRef.current = gen
     setBusy(true)
-    setLoadStage('正在扫描池子…')
+    setLoadStage('正在读取共享索引…')
     const t0 = performance.now()
     const chainIds: FlowChainId[] =
       options.chainFilter === 'all' ? [...FLOW_CHAIN_IDS] : [options.chainFilter]
     try {
       let rows: FlowEvent[]
       let nextNotices: FlowNotice[]
+      let nextSource: 'shared-index' | 'live-rpc' = 'live-rpc'
+      let nextGeneratedAt = Date.now()
       if (chainIds.length === 1) {
         const result = await fetchFlowEvents({
           chainIds,
@@ -273,11 +276,18 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         })
         rows = result.events
         nextNotices = result.notices
+        nextSource = result.source ?? 'live-rpc'
+        nextGeneratedAt = result.generatedAt ?? Date.now()
       } else {
         // 多链首次扫描时哪个链先完成就先展示该链榜单，
         // 不让用户盯着空白页等最慢的数据源。
         const previousRows = eventsRef.current
-        const results = new Map<FlowChainId, { events: FlowEvent[]; notices: FlowNotice[] }>()
+        const results = new Map<FlowChainId, {
+          events: FlowEvent[]
+          notices: FlowNotice[]
+          source?: 'shared-index' | 'live-rpc'
+          generatedAt?: number
+        }>()
         const publishPartial = () => {
           if (!mountedRef.current || gen !== genRef.current) return
           const combined = chainIds.flatMap((chainId) =>
@@ -318,12 +328,21 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         rows = chainIds.flatMap((chainId) => results.get(chainId)?.events ?? [])
         rows.sort((a, b) => b.timestamp - a.timestamp)
         nextNotices = [...results.values()].flatMap((result) => result.notices)
+        const resultValues = [...results.values()]
+        const allIndexed = resultValues.length > 0
+          && resultValues.every((result) => result.source === 'shared-index')
+        nextSource = allIndexed ? 'shared-index' : 'live-rpc'
+        const generated = resultValues
+          .map((result) => result.generatedAt ?? 0)
+          .filter((value) => value > 0)
+        nextGeneratedAt = generated.length > 0 ? Math.min(...generated) : Date.now()
       }
       if (!mountedRef.current || gen !== genRef.current) return
       eventsRef.current = rows
       setEvents(rows)
       setNotices(nextNotices)
-      setUpdatedAt(Date.now())
+      setDataSource(nextSource)
+      setUpdatedAt(nextGeneratedAt)
       setElapsedMs(Math.round(performance.now() - t0))
     } catch (e) {
       if (!mountedRef.current || gen !== genRef.current) return
@@ -513,7 +532,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
             默认按手续费年化从高到低。年化优先采用 DexScreener 24h 成交量 × 池费率 ÷ 当前流动性 × 365；
             这是发现指标，不代表未来收益。
             <span className="flow-trust-note-extra">
-              精确池批量查询，不再为每个池扫描 Swap；未收录或动态费率池会显示为“—”。
+              优先读取每 10 分钟更新的共享索引，不再让每个浏览器重复扫链；索引异常才回退 RPC。
             </span>
           </p>
         </div>
@@ -634,13 +653,14 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
             </label>
             <label className="inline-setting check">
               <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
-              自动刷新 45s
+              自动检查 45s
             </label>
           </div>
         </details>
         {(updatedAt || busy) && (
           <span className="muted flow-updated">
             {updatedAt ? `更新于 ${new Date(updatedAt).toLocaleTimeString()}` : '首次加载'}
+            {dataSource ? ` · ${dataSource === 'shared-index' ? '共享索引' : 'RPC 兜底'}` : ''}
             {updatedAt && elapsedMs != null ? ` · ${elapsedMs}ms` : ''}
             {busy ? ` · ${loadStage || '增量中…'}` : ''}
           </span>

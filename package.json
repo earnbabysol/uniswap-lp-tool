@@ -10,9 +10,11 @@
     "test:rpc": "node scripts/rpc-scheduler.test.mjs",
     "test:flow": "node scripts/flow-events.test.mjs",
     "test:dlmm": "node scripts/dlmm-distribution.test.mjs",
+    "test:dlmm-layout": "tsx scripts/dlmm-layout.test.mjs",
     "test:dlmm-groups": "node scripts/dlmm-groups.test.mjs",
     "test:mint-payment": "node scripts/mint-payment.test.mjs",
-    "test": "npm run test:pnl && npm run test:rpc && npm run test:flow && npm run test:dlmm && npm run test:dlmm-groups && npm run test:mint-payment",
+    "index:flow": "tsx scripts/build-flow-index.mjs",
+    "test": "npm run test:pnl && npm run test:rpc && npm run test:flow && npm run test:dlmm && npm run test:dlmm-layout && npm run test:dlmm-groups && npm run test:mint-payment",
     "typecheck": "tsc -b",
     "lint": "oxlint",
     "preview": "vite preview"
@@ -29,6 +31,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "oxlint": "^1.71.0",
+    "tsx": "^4.23.12",
     "typescript": "~6.0.2",
     "vite": "^8.1.1"
   }

@@ -36,8 +36,11 @@ import { Q96, getAmountsForPosition, rawToNumber, tickToPrice } from './math'
 import { loadCustomRpcUrl } from './rpcSettings'
 import { classifyRpcError, readLogsAdaptive, runRpcTask } from './rpcScheduler'
 import { takeFlowPoolEvents, type FlowSelectableChainId } from './flowSelection'
+import { loadSharedFlowIndex } from './flowIndex'
 
 export { takeFlowPoolEvents } from './flowSelection'
+
+const DEV_MODE = Boolean(import.meta.env?.DEV)
 
 /** 动向支持的链 */
 export const FLOW_CHAIN_IDS = [56, 4663, 8453] as const satisfies readonly FlowSelectableChainId[]
@@ -114,6 +117,8 @@ export type FlowFetchOpts = {
   onBaseEvents?: (result: { events: FlowEvent[]; notices: FlowNotice[] }) => void
   /** 最大池数，而不是事件条数。 */
   limit?: number
+  /** 定时索引构建器传 false，浏览器默认优先同域共享快照。 */
+  preferSharedIndex?: boolean
 }
 
 export type FlowNotice = {
@@ -935,7 +940,7 @@ async function readIndexedLogs<TArgs>(opts: {
       // 50-row paginated crawl after a 429 only turns an APR miss into a
       // minute-long refresh. Preserve the base list and retry next cycle.
       if (classifyRpcError(error) === 'rate-limit') throw error
-      if (import.meta.env.DEV) {
+      if (DEV_MODE) {
         console.debug(`[flow] ${opts.label} getLogs 降级到 v2 分页：${friendlyErrorText(error)}`)
       }
       return readIndexedV2Logs<TArgs>(rangeOpts)
@@ -1023,7 +1028,7 @@ async function readFlowLogs<TArgs>(opts: {
           label: opts.label,
         })
       } catch (indexerError) {
-        if (import.meta.env.DEV) {
+        if (DEV_MODE) {
           console.debug(
             `[flow] ${opts.label} Base Blockscout 转入 RPC：${friendlyErrorText(indexerError)}`,
           )
@@ -1046,7 +1051,7 @@ async function readFlowLogs<TArgs>(opts: {
       })
     } catch (error) {
       const customRpc = loadCustomRpcUrl(4663)
-      if (import.meta.env.DEV) {
+      if (DEV_MODE) {
         const target = customRpc
           ? '自定义 RPC'
           : opts.allowPublicRpcFallback ? '小分片公共 RPC' : '缓存保护'
@@ -1066,7 +1071,7 @@ async function timedSource<T>(label: string, promise: Promise<T>): Promise<T> {
   try {
     return await promise
   } finally {
-    if (import.meta.env.DEV) {
+    if (DEV_MODE) {
       console.debug(`[flow] ${label}: ${Math.round(performance.now() - started)}ms`)
     }
   }
@@ -1613,7 +1618,7 @@ async function fetchV3PoolLogsRange(
     }
     return rows
   } catch (error) {
-    if (import.meta.env.DEV) {
+    if (DEV_MODE) {
       console.debug(`[flow] V3 pool 日志索引不可用：${friendlyErrorText(error)}`)
     }
     return []
@@ -2100,7 +2105,7 @@ async function fetchNpmFlowLogs(
       await retryRateLimited(chainId, () =>
         seedV3PositionsFromPoolLogs(client, chainId, useful, poolLogs))
     } catch (error) {
-      if (import.meta.env.DEV) {
+      if (DEV_MODE) {
         console.debug(`[flow] V3 pool 批量解析降级：${friendlyErrorText(error)}`)
       }
     }
@@ -3445,7 +3450,16 @@ async function enrichFlowMarketMeta(events: FlowEvent[]): Promise<FlowEvent[]> {
 export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
   events: FlowEvent[]
   notices: FlowNotice[]
+  source?: 'shared-index' | 'live-rpc'
+  generatedAt?: number
 }> {
+  if (opts.preferSharedIndex !== false) {
+    const indexed = await loadSharedFlowIndex(opts)
+    if (indexed) {
+      opts.onBaseEvents?.({ events: indexed.events, notices: indexed.notices })
+      return indexed
+    }
+  }
   const requestedMin = opts.minUsd ?? 100
   const minUsd = Number.isFinite(requestedMin) ? Math.max(0, requestedMin) : 100
   const limit = Math.min(100, Math.max(1, Math.floor(opts.limit ?? 30)))
@@ -3578,6 +3592,8 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
   return {
     events: merged,
     notices: uniqueNotices,
+    source: 'live-rpc',
+    generatedAt: Date.now(),
   }
 }
 

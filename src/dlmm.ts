@@ -11,6 +11,12 @@ import { distributeIntegerAmount, dlmmShapeWeight } from './dlmmDistribution'
 export type DlmmSide = 'bid' | 'ask' | 'both'
 export type DlmmShape = 'spot' | 'curve' | 'bid-ask'
 export type DlmmExecutionMode = 'single' | 'multi'
+export type DlmmNftMode = 'auto' | 'manual' | 'exact'
+
+export const DLMM_DEFAULT_VISUAL_BINS = 40
+export const DLMM_MAX_VISUAL_BINS = 80
+export const DLMM_MIN_AUTO_NFTS = 8
+export const DLMM_MAX_AUTO_NFTS = 16
 
 /**
  * EVM 版 DLMM 映射：一个「Bin」等于一个可用 tickSpacing 区间。
@@ -40,8 +46,9 @@ export type EvmDlmmPlan = {
 }
 
 /**
- * One on-chain NFT band. A band may group several visual bins so a 69-bin
- * strategy does not create 69 NFTs and exceed practical block gas limits.
+ * One visual price bin. Execution can keep every row as a real NFT or merge
+ * adjacent rows into fewer on-chain bands without changing the visual-bin
+ * allocation model.
  */
 export type EvmDlmmTranche = {
   index: number
@@ -56,6 +63,13 @@ export type EvmDlmmTranche = {
   liquiditySide: 0 | 1 | 'both'
   weightUnits: number
   weightPct: number
+}
+
+export type DlmmAllocation = { amount0: bigint; amount1: bigint }
+
+export type EvmDlmmExecutionLayout = {
+  tranches: EvmDlmmTranche[]
+  allocations: DlmmAllocation[]
 }
 
 function tokenIndex(pool: PoolInfo, token: TokenMeta): 0 | 1 {
@@ -260,7 +274,11 @@ export function buildEvmDlmmTranches(
   rawTrancheCount: number,
 ): EvmDlmmTranche[] {
   const spacing = Math.max(1, Math.floor(pool.tickSpacing || 1))
-  const trancheCount = finiteInt(rawTrancheCount, 1, Math.min(12, plan.binCount))
+  const trancheCount = finiteInt(
+    rawTrancheCount,
+    1,
+    Math.min(DLMM_MAX_VISUAL_BINS, plan.binCount),
+  )
   const cq = getCoinQuote(pool)
   const rows: EvmDlmmTranche[] = []
 
@@ -312,6 +330,107 @@ export function buildEvmDlmmTranches(
   }))
 }
 
+/**
+ * Choose the gas-aware default execution width. The live gas price controls
+ * how aggressively visual bins are merged, while the latest block gas limit
+ * prevents a suggested layout that is unlikely to fit in one transaction.
+ */
+export function chooseDlmmAutoNftCount(opts: {
+  version: PoolInfo['version']
+  visualBinCount: number
+  gasPriceWei?: bigint | null
+  blockGasLimit?: bigint | null
+}): number {
+  const visualCount = finiteInt(opts.visualBinCount, 1, DLMM_MAX_VISUAL_BINS)
+  if (visualCount <= DLMM_MIN_AUTO_NFTS) return visualCount
+
+  const gasGwei = opts.gasPriceWei != null && opts.gasPriceWei > 0n
+    ? Number(opts.gasPriceWei) / 1e9
+    : null
+  let target = gasGwei == null
+    ? 12
+    : gasGwei >= 10
+      ? 8
+      : gasGwei >= 3
+        ? 10
+        : gasGwei >= 1
+          ? 12
+          : gasGwei >= 0.2
+            ? 14
+            : 16
+
+  // A V4 MINT_POSITION action is heavier than one V3 NPM mint.
+  if (opts.version === 'v4' && target > DLMM_MIN_AUTO_NFTS) target -= 2
+
+  if (opts.blockGasLimit != null && opts.blockGasLimit > 0n) {
+    const base = opts.version === 'v4' ? 900_000n : 500_000n
+    const perNft = opts.version === 'v4' ? 750_000n : 550_000n
+    const budget = (opts.blockGasLimit * 72n) / 100n
+    const capacity = budget > base ? Number((budget - base) / perNft) : 1
+    target = Math.min(target, Math.max(1, capacity))
+  }
+
+  return finiteInt(
+    target,
+    Math.min(DLMM_MIN_AUTO_NFTS, visualCount),
+    Math.min(DLMM_MAX_AUTO_NFTS, visualCount),
+  )
+}
+
+/**
+ * Merge adjacent visual bins after their Delta weights and token allocations
+ * have been calculated. This preserves the 40-bin strategy model while
+ * reducing the number of expensive V3/V4 NFT mints.
+ */
+export function mergeEvmDlmmTranches(
+  pool: PoolInfo,
+  visualTranches: readonly EvmDlmmTranche[],
+  visualAllocations: readonly DlmmAllocation[],
+  rawTargetCount: number,
+): EvmDlmmExecutionLayout {
+  if (visualTranches.length === 0) return { tranches: [], allocations: [] }
+  if (visualAllocations.length !== visualTranches.length) {
+    throw new Error('视觉 Bin 与资金分配数量不一致')
+  }
+  const targetCount = finiteInt(rawTargetCount, 1, visualTranches.length)
+  const tranches: EvmDlmmTranche[] = []
+  const allocations: DlmmAllocation[] = []
+
+  for (let index = 0; index < targetCount; index += 1) {
+    const start = Math.floor((index * visualTranches.length) / targetCount)
+    const end = Math.floor(((index + 1) * visualTranches.length) / targetCount)
+    const rows = visualTranches.slice(start, end)
+    if (rows.length === 0) continue
+    const first = rows[0]!
+    const last = rows[rows.length - 1]!
+    const tickLower = first.tickLower
+    const tickUpper = last.tickUpper
+    const weightUnits = rows.reduce((sum, row) => sum + row.weightUnits, 0)
+    tranches.push({
+      index: tranches.length,
+      tickLower,
+      tickUpper,
+      coinPriceLower: Math.min(...rows.map((row) => row.coinPriceLower)),
+      coinPriceUpper: Math.max(...rows.map((row) => row.coinPriceUpper)),
+      virtualBinStart: first.virtualBinStart,
+      virtualBinEnd: last.virtualBinEnd,
+      virtualBinCount: rows.reduce((sum, row) => sum + row.virtualBinCount, 0),
+      distanceFromSpot: Math.min(...rows.map((row) => row.distanceFromSpot)),
+      liquiditySide: neededMintSide(pool.tick, tickLower, tickUpper),
+      weightUnits,
+      weightPct: rows.reduce((sum, row) => sum + row.weightPct, 0),
+    })
+    allocations.push(visualAllocations.slice(start, end).reduce(
+      (sum, amount) => ({
+        amount0: sum.amount0 + amount.amount0,
+        amount1: sum.amount1 + amount.amount1,
+      }),
+      { amount0: 0n, amount1: 0n },
+    ))
+  }
+  return { tranches, allocations }
+}
+
 /** Exact integer allocation: all tranche amounts add back to total. */
 export function allocateDlmmAmount(
   total: bigint,
@@ -328,7 +447,7 @@ export function allocateDlmmAmounts(
   total0: bigint,
   total1: bigint,
   tranches: readonly EvmDlmmTranche[],
-): Array<{ amount0: bigint; amount1: bigint }> {
+): DlmmAllocation[] {
   const amount0 = distributeIntegerAmount(
     total0,
     tranches.map((row) => (row.liquiditySide === 0 || row.liquiditySide === 'both' ? row.weightUnits : 0)),

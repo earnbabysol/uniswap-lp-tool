@@ -3,6 +3,8 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [master]
+  schedule:
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -24,6 +26,20 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - uses: actions/cache@v4
+        with:
+          path: .index-cache
+          key: flow-index-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            flow-index-${{ runner.os }}-
+      - name: Restore last published index
+        continue-on-error: true
+        run: |
+          curl -fsSL --retry 2 https://earnbabysol.github.io/uniswap-lp-tool/index/flow.json -o public/index/flow.json
+          curl -fsSL --retry 2 https://earnbabysol.github.io/uniswap-lp-tool/index/pools.json -o public/index/pools.json
+      - name: Refresh shared LP index
+        timeout-minutes: 7
+        run: npm run index:flow
       - run: npm run build
         env:
           GITHUB_PAGES: 'true'

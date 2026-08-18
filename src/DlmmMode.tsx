@@ -16,19 +16,27 @@ import {
   allocateDlmmAmounts,
   buildEvmDlmmPercentPlan,
   buildEvmDlmmTranches,
+  chooseDlmmAutoNftCount,
+  DLMM_DEFAULT_VISUAL_BINS,
+  mergeEvmDlmmTranches,
   type DlmmExecutionMode,
+  type DlmmNftMode,
   type DlmmShape,
   type DlmmSide,
   type EvmDlmmPlan,
 } from './dlmm'
 import { usePersistentState } from './prefs'
 import { InfoHint } from './ui'
+import { DlmmRangeChart } from './DlmmRangeChart'
 
 export type DlmmMintRequest = {
   side: DlmmSide
   executionMode: DlmmExecutionMode
   shape: DlmmShape
-  trancheCount: number
+  visualBinCount: number
+  nftMode: DlmmNftMode
+  manualNftCount: number
+  previewNftCount: number
   plan: EvmDlmmPlan
   amount0: string
   amount1: string
@@ -174,7 +182,12 @@ export default function DlmmMode(props: Props) {
   const [side, setSide] = usePersistentState<DlmmSide>('dlmmSide', 'bid')
   const [executionMode, setExecutionMode] = usePersistentState<DlmmExecutionMode>('dlmmExecutionMode', 'multi')
   const [shape, setShape] = usePersistentState<DlmmShape>('dlmmShape', 'bid-ask')
-  const [trancheCount, setTrancheCount] = usePersistentState('dlmmTrancheCount', 8)
+  const [visualBinCount, setVisualBinCount] = usePersistentState(
+    'dlmmVisualBinCount',
+    DLMM_DEFAULT_VISUAL_BINS,
+  )
+  const [nftMode, setNftMode] = usePersistentState<DlmmNftMode>('dlmmNftMode', 'auto')
+  const [manualNftCount, setManualNftCount] = usePersistentState('dlmmTrancheCount', 12)
   const [rangePreset, setRangePreset] = usePersistentState<FriendlyRangePreset>('dlmmRangePreset', 'balanced')
   const [lowerPct, setLowerPct] = usePersistentState('dlmmRangeLowerPct', -30)
   const [upperPct, setUpperPct] = usePersistentState('dlmmRangeUpperPct', -0.1)
@@ -322,17 +335,40 @@ export default function DlmmMode(props: Props) {
     }
   }, [pool, lowerPct, upperPct, inferredSide])
   const plan = planState.plan
-  const tranches = useMemo(() => {
+  const visualTranches = useMemo(() => {
     if (!pool || !plan) return []
-    return buildEvmDlmmTranches(pool, plan, shape, trancheCount)
-  }, [pool, plan, shape, trancheCount])
+    return buildEvmDlmmTranches(pool, plan, shape, visualBinCount)
+  }, [pool, plan, shape, visualBinCount])
 
   const amount0Raw = coinIndex === 0 ? coinRaw : quoteRaw
   const amount1Raw = coinIndex === 1 ? coinRaw : quoteRaw
-  const allocations = useMemo(
-    () => allocateDlmmAmounts(amount0Raw, amount1Raw, tranches),
-    [amount0Raw, amount1Raw, tranches],
+  const visualAllocations = useMemo(
+    () => allocateDlmmAmounts(amount0Raw, amount1Raw, visualTranches),
+    [amount0Raw, amount1Raw, visualTranches],
   )
+  const previewNftCount = executionMode === 'single'
+    ? 1
+    : nftMode === 'exact'
+      ? visualTranches.length
+      : nftMode === 'manual'
+        ? Math.min(manualNftCount, visualTranches.length)
+        : pool
+          ? chooseDlmmAutoNftCount({
+            version: pool.version,
+            visualBinCount: visualTranches.length,
+          })
+          : 0
+  const executionLayout = useMemo(() => {
+    if (!pool || executionMode === 'single') return { tranches: [], allocations: [] }
+    return mergeEvmDlmmTranches(
+      pool,
+      visualTranches,
+      visualAllocations,
+      previewNftCount,
+    )
+  }, [executionMode, pool, previewNftCount, visualAllocations, visualTranches])
+  const tranches = executionLayout.tranches
+  const allocations = executionLayout.allocations
   const amount0 = coinIndex === 0 ? amountCoin : amountQuote
   const amount1 = coinIndex === 1 ? amountCoin : amountQuote
   const coinSpendable = quote ? spendableFor(coinIndex, quote.coin) : 0n
@@ -358,16 +394,7 @@ export default function DlmmMode(props: Props) {
     () => [...tranches].sort((a, b) => a.coinPriceLower - b.coinPriceLower),
     [tranches],
   )
-  const maxWeight = Math.max(1, ...tranches.map((row) => row.weightUnits))
   const addressForPool = pool?.poolAddress ?? pool?.poolId
-  const spotPct = plan && plan.coinPriceUpper > plan.coinPriceLower
-    ? clamp(
-      ((plan.coinSpot - plan.coinPriceLower) / (plan.coinPriceUpper - plan.coinPriceLower)) * 100,
-      0,
-      100,
-      50,
-    )
-    : 50
 
   const actionTitle = inferredSide === 'bid'
     ? `用 ${displaySymbol(quote?.quote ?? null)} 分批买入 ${quote?.coin.symbol ?? ''}`
@@ -440,7 +467,10 @@ export default function DlmmMode(props: Props) {
       side: inferredSide,
       executionMode,
       shape,
-      trancheCount: tranches.length,
+      visualBinCount: visualTranches.length,
+      nftMode,
+      manualNftCount,
+      previewNftCount: tranches.length,
       plan,
       amount0,
       amount1,
@@ -556,38 +586,17 @@ export default function DlmmMode(props: Props) {
               </div>
             </div>
 
-            <div className="dlmm-delta-chart" aria-label="价格档位分布预览">
-              <div className="dlmm-chart-scale">
-                <span>{plan ? formatPrice(plan.coinPriceLower) : '—'}</span>
-                <strong>资金分布</strong>
-                <span>{plan ? formatPrice(plan.coinPriceUpper) : '—'}</span>
-              </div>
-              <div className="dlmm-chart-bars">
-                {sortedTranches.map((row) => {
-                  const visualSide = row.coinPriceUpper <= quote.spot
-                    ? 'bid'
-                    : row.coinPriceLower >= quote.spot
-                      ? 'ask'
-                      : 'both'
-                  return (
-                    <span
-                      key={`${row.tickLower}:${row.tickUpper}`}
-                      className={`dlmm-chart-bar ${visualSide}`}
-                      style={{ height: `${24 + (row.weightUnits / maxWeight) * 72}%` }}
-                      title={`${formatPrice(row.coinPriceLower)} – ${formatPrice(row.coinPriceUpper)} · ${row.weightPct.toFixed(1)}%`}
-                    />
-                  )
-                })}
-                <i className="dlmm-chart-spot" style={{ left: `${spotPct}%` }}>
-                  <b>现价</b>
-                </i>
-              </div>
-              <div className="dlmm-chart-legend">
-                <span><i className="bid" />Bid 买入档</span>
-                <span><i className="both" />现价档</span>
-                <span><i className="ask" />Ask 卖出档</span>
-              </div>
-            </div>
+            {plan && (
+              <DlmmRangeChart
+                pool={pool}
+                plan={plan}
+                visualTranches={visualTranches}
+                side={inferredSide}
+                rangeUnit={rangeUnit}
+                coinSupply={coinSupply}
+                onBoundaryPct={setPctBoundary}
+              />
+            )}
 
             <div className="dlmm-intent-summary dlmm-delta-summary">
               <div className={`dlmm-intent-icon ${inferredSide}`} aria-hidden>
@@ -600,7 +609,7 @@ export default function DlmmMode(props: Props) {
               </div>
               <div className="dlmm-intent-count">
                 <strong>{executionMode === 'multi' ? tranches.length : 1}</strong>
-                <span>个链上仓位</span>
+                <span>{executionMode === 'multi' ? `个 NFT · ${visualTranches.length} Bin` : '个链上仓位'}</span>
               </div>
             </div>
 
@@ -624,7 +633,7 @@ export default function DlmmMode(props: Props) {
 
             {executionMode === 'multi' && tranches.length > 0 && (
               <details className="dlmm-band-details">
-                <summary>查看 {tranches.length} 个链上档位与实际分配</summary>
+                <summary>查看 {tranches.length} 个链上 NFT 与实际合并分配</summary>
                 <div className="dlmm-tranche-table" aria-label="链上多档分配预览">
                   <div className="dlmm-tranche-head dlmm-tranche-head-dual">
                     <strong>档位</strong><span>价格</span><span>{displaySymbol(quote.coin)}</span><span>{displaySymbol(quote.quote)}</span>
@@ -778,7 +787,7 @@ export default function DlmmMode(props: Props) {
             </section>
 
             <details className="dlmm-advanced dlmm-delta-advanced">
-              <summary><span><strong>高级设置</strong><small>仓位数量、原生币与税币</small></span><b>展开</b></summary>
+              <summary><span><strong>高级设置</strong><small>视觉 Bin、NFT 合并、原生币与税币</small></span><b>展开</b></summary>
               <div className="dlmm-advanced-body">
                 <div className="dlmm-mode-tabs" role="group" aria-label="链上仓位模式">
                   <button type="button" className={executionMode === 'multi' ? 'active' : ''} onClick={() => setExecutionMode('multi')}>
@@ -789,13 +798,47 @@ export default function DlmmMode(props: Props) {
                   </button>
                 </div>
                 {executionMode === 'multi' && (
-                  <div className="dlmm-band-count">
-                    <span>链上档位数</span>
-                    <div className="dlmm-band-preset" role="group" aria-label="链上档位数">
-                      {[3, 4, 5, 6, 8, 12].map((count) => (
-                        <button type="button" key={count} className={trancheCount === count ? 'active' : ''} disabled={count > (plan?.binCount ?? 1)} onClick={() => setTrancheCount(count)}>{count}</button>
-                      ))}
+                  <div className="dlmm-layout-settings">
+                    <div className="dlmm-band-count">
+                      <span>视觉 Bin</span>
+                      <div className="dlmm-band-preset" role="group" aria-label="视觉 Bin 数">
+                        {[20, 40, 60, 80].map((count) => (
+                          <button
+                            type="button"
+                            key={count}
+                            className={visualBinCount === count ? 'active' : ''}
+                            disabled={count > (plan?.binCount ?? 1)}
+                            onClick={() => setVisualBinCount(count)}
+                          >{count}</button>
+                        ))}
+                      </div>
                     </div>
+                    <div className="dlmm-nft-mode" role="group" aria-label="NFT 合并方式">
+                      <button type="button" className={nftMode === 'auto' ? 'active' : ''} onClick={() => setNftMode('auto')}>
+                        <strong>Gas 自动</strong><span>自动合并为 8–16 个 NFT</span>
+                      </button>
+                      <button type="button" className={nftMode === 'manual' ? 'active' : ''} onClick={() => setNftMode('manual')}>
+                        <strong>手动合并</strong><span>固定 NFT 数</span>
+                      </button>
+                      <button type="button" className={nftMode === 'exact' ? 'active' : ''} onClick={() => setNftMode('exact')}>
+                        <strong>真实逐 Bin</strong><span>{visualTranches.length} Bin = {visualTranches.length} NFT</span>
+                      </button>
+                    </div>
+                    {nftMode === 'manual' && (
+                      <div className="dlmm-band-count">
+                        <span>链上 NFT 数</span>
+                        <div className="dlmm-band-preset" role="group" aria-label="链上 NFT 数">
+                          {[8, 10, 12, 14, 16].map((count) => (
+                            <button type="button" key={count} className={manualNftCount === count ? 'active' : ''} disabled={count > visualTranches.length} onClick={() => setManualNftCount(count)}>{count}</button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    <p className="muted small dlmm-layout-note">
+                      当前预览：{visualTranches.length} 个视觉 Bin → {tranches.length} 个链上 NFT。
+                      {nftMode === 'auto' ? ' 提交前会读取实时 Gas 与区块上限并在 8–16 个之间重算。' : ''}
+                      {nftMode === 'exact' ? ' 逐 Bin 最接近 DLMM，但 Gas 明显更高。' : ''}
+                    </p>
                   </div>
                 )}
                 <div className="dlmm-technical-range">
@@ -818,7 +861,7 @@ export default function DlmmMode(props: Props) {
                 )}
                 <div className="dlmm-compat-note">
                   <strong>EVM 实际执行方式</strong>
-                  <span>每档是一个真实 Uniswap V3/V4 NFT；V4 使用一条 modifyLiquidities 动作序列，V3 使用 PositionManager multicall。最多 12 档是为了控制 gas，不伪装成 Solana 的独立 DLMM bin。</span>
+                  <span>Delta 权重始终先在视觉 Bin 上计算，再把相邻 Bin 合并成真实 Uniswap V3/V4 NFT。V4 使用一条 modifyLiquidities 动作序列，V3 使用 PositionManager multicall；真实逐 Bin 不做合并。</span>
                 </div>
               </div>
             </details>

@@ -4935,6 +4935,97 @@ input:focus-visible, select:focus-visible, select:focus {
 .dlmm-range-unit button.active { background: var(--accent-soft); color: var(--accent); }
 .dlmm-range-unit button:disabled { opacity: 0.4; cursor: not-allowed; }
 
+.dlmm-range-chart {
+  margin-top: 12px;
+  padding: 11px 12px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--card-2) 72%, transparent);
+}
+.dlmm-range-chart-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 7px;
+}
+.dlmm-range-chart-meta strong { font-size: 13.5px; }
+.dlmm-range-chart-meta span { color: var(--muted); font-size: 12px; }
+.dlmm-range-chart-svg {
+  display: block;
+  width: 100%;
+  min-height: 240px;
+  overflow: visible;
+  border-radius: 12px;
+  touch-action: none;
+  user-select: none;
+}
+.dlmm-range-chart-bg {
+  fill: color-mix(in srgb, var(--card) 92%, var(--accent-soft));
+  stroke: var(--hairline);
+}
+.dlmm-range-selected {
+  fill: color-mix(in srgb, var(--accent) 8%, transparent);
+  stroke: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.dlmm-candle line { stroke-width: 1.15; }
+.dlmm-candle rect { stroke-width: 0.6; }
+.dlmm-candle.up line,
+.dlmm-candle.up rect { fill: color-mix(in srgb, var(--ok) 66%, transparent); stroke: var(--ok); }
+.dlmm-candle.down line,
+.dlmm-candle.down rect { fill: color-mix(in srgb, var(--out) 60%, transparent); stroke: var(--out); }
+.dlmm-visual-bin { opacity: 0.78; transition: opacity 120ms ease; }
+.dlmm-visual-bin:hover { opacity: 1; }
+.dlmm-visual-bin.bid { fill: #339fd8; }
+.dlmm-visual-bin.ask { fill: #9462e8; }
+.dlmm-visual-bin.both { fill: #36b9a6; }
+.dlmm-chart-spot-line {
+  stroke: color-mix(in srgb, var(--ink) 72%, transparent);
+  stroke-width: 1.4;
+  stroke-dasharray: 4 3;
+}
+.dlmm-chart-spot-text,
+.dlmm-chart-axis-label {
+  fill: var(--muted);
+  font: 11px var(--mono);
+}
+.dlmm-chart-spot-text { fill: var(--ink); font: 700 10.5px var(--sans); }
+.dlmm-drag-handle > line:not(.dlmm-drag-hit) {
+  stroke: var(--accent);
+  stroke-width: 2.2;
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--accent) 45%, transparent));
+}
+.dlmm-drag-hit { stroke: transparent; stroke-width: 20; }
+.dlmm-drag-handle > rect { fill: var(--accent); stroke: var(--card); stroke-width: 1; }
+.dlmm-drag-handle > text { fill: white; font: 700 10px var(--sans); pointer-events: none; }
+.dlmm-drag-handle.active > rect { fill: var(--ok); }
+.dlmm-drag-handle.active > line:not(.dlmm-drag-hit) { stroke: var(--ok); }
+.dlmm-range-chart-hint { margin: 6px 1px 0; font-size: 11.5px; }
+
+.dlmm-layout-settings { display: grid; gap: 8px; }
+.dlmm-layout-settings .dlmm-band-preset { grid-template-columns: repeat(5, 38px); }
+.dlmm-nft-mode { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
+.dlmm-nft-mode button {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 7px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--card-2);
+  color: var(--muted);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.dlmm-nft-mode button.active {
+  border-color: color-mix(in srgb, var(--accent) 62%, var(--line));
+  background: var(--accent-soft);
+}
+.dlmm-nft-mode strong { color: var(--ink); font-size: 11.5px; }
+.dlmm-nft-mode span { font-size: 9.5px; line-height: 1.35; }
+.dlmm-layout-note { margin: 0; line-height: 1.5; }
+
 .dlmm-delta-chart {
   padding: 13px 14px 10px;
   border: 1px solid var(--line-soft);
@@ -5150,6 +5241,9 @@ input:focus-visible, select:focus-visible, select:focus {
   .dlmm-delta-market-head { flex-direction: row; align-items: center; }
   .dlmm-chart-bars { height: 190px; gap: 3px; padding-inline: 2px; }
   .dlmm-chart-legend { gap: 9px; font-size: 11.5px; }
+  .dlmm-range-chart { padding-inline: 7px; }
+  .dlmm-range-chart-svg { min-height: 200px; }
+  .dlmm-range-chart-meta { align-items: flex-start; flex-direction: column; gap: 2px; }
   .dlmm-delta-summary { grid-template-columns: 1fr; }
   .dlmm-delta-summary .dlmm-intent-icon,
   .dlmm-delta-summary .dlmm-intent-count { display: none; }
@@ -5161,6 +5255,7 @@ input:focus-visible, select:focus-visible, select:focus {
   .dlmm-delta-presets { grid-template-columns: 1fr 1fr; }
   .dlmm-tranche-row-dual { grid-template-columns: 70px minmax(120px, 1fr) 70px; }
   .dlmm-tranche-row-dual > span:last-child { grid-column: 2 / -1; text-align: right; }
+  .dlmm-nft-mode { grid-template-columns: 1fr; }
 }
 @media (max-width: 430px) {
   .dlmm-delta-page .dlmm-easy-head p { display: block; font-size: 12.5px; }

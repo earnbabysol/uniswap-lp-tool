@@ -59,6 +59,11 @@ import { buildV3AccountingLedger, computePositionPnlUsd } from './pnlAccounting'
 import { mapWithConcurrency, readLogsAdaptive, runRpcTask } from './rpcScheduler'
 import { getInjectedErc20Balance, getInjectedNativeBalance, publicClient } from './wallet'
 import {
+  findIndexedPoolsByToken,
+  searchIndexedPools,
+  type IndexedPoolRef,
+} from './marketIndexer'
+import {
   registerV4Deps,
   mintV4Position,
   mintV4DlmmPositions,
@@ -4704,7 +4709,7 @@ export async function mintV3DlmmPositions(opts: {
 }) {
   const { walletClient, owner, pool, onStatus } = opts
   if (pool.version !== 'v3' || !pool.poolAddress) throw new Error('需要 V3 池')
-  if (opts.bands.length < 2 || opts.bands.length > 12) throw new Error('多档仓位必须为 2–12 档')
+  if (opts.bands.length < 2 || opts.bands.length > 80) throw new Error('多档仓位必须为 2–80 档')
   const npm = resolveV3Npm(pool)
   const slippageBps = opts.slippageBps ?? 300
   const useNative = Boolean(opts.useNativeEth) && pairHasWeth(pool.token0.address, pool.token1.address)
@@ -6103,6 +6108,51 @@ export type DiscoveredPool = {
   liquidity: bigint
 }
 
+async function loadIndexedPoolRefs(
+  refs: readonly IndexedPoolRef[],
+  targetToken?: Address,
+): Promise<DiscoveredPool[]> {
+  const loaded = await mapWithConcurrency(refs.slice(0, 24), 3, async (ref) => {
+    try {
+      const pool = ref.version === 'v4'
+        ? await loadV4PoolById(ref.ref as `0x${string}`)
+        : await loadV3Pool(ref.ref as Address)
+      const q = getCoinQuote(pool)
+      const targetIsCoin = targetToken
+        ? q.coin.address.toLowerCase() === targetToken.toLowerCase()
+        : true
+      return {
+        pool,
+        quoteSymbol: targetIsCoin ? q.quote.symbol : q.coin.symbol,
+        coinPrice: targetIsCoin ? q.spot : q.spot > 0 ? 1 / q.spot : 0,
+        tvlUsd: ref.tvlUsd,
+        liquidity: pool.liquidity,
+      } satisfies DiscoveredPool
+    } catch {
+      return null
+    }
+  })
+  const rows = loaded.filter((row): row is DiscoveredPool => row != null)
+  rows.sort((a, b) => {
+    if (a.tvlUsd != null && b.tvlUsd != null) return b.tvlUsd - a.tvlUsd
+    if (a.tvlUsd != null) return -1
+    if (b.tvlUsd != null) return 1
+    return a.liquidity === b.liquidity ? 0 : a.liquidity > b.liquidity ? -1 : 1
+  })
+  return rows
+}
+
+/** Symbol / token / pool search powered by the shared market index. */
+export async function discoverPoolsByQuery(
+  query: string,
+  opts?: { onStatus?: (s: string) => void },
+): Promise<DiscoveredPool[]> {
+  opts?.onStatus?.('正在查询池索引…')
+  const refs = await searchIndexedPools(getActiveChainId(), query)
+  opts?.onStatus?.(`索引命中 ${refs.length} 个 Uniswap 池，正在读取最新链上价格…`)
+  return loadIndexedPoolRefs(refs)
+}
+
 /** 目标币和哪些币配对值得扫：WETH、稳定币、原生币（V4 address(0)） */
 function quoteCandidates(target: Address): Address[] {
   const t = target.toLowerCase()
@@ -6171,6 +6221,20 @@ export async function discoverPoolsByToken(
   const say = opts?.onStatus
   const meta = await resolveTokenMeta(token)
   const quotes = quoteCandidates(token)
+
+  // GeckoTerminal 已替我们索引 PoolCreated / Initialize；先用一次 HTTP
+  // 查询替代几十次 factory/stateView RPC。索引缺失时再回退原来的扫链路径。
+  try {
+    say?.(`查询 ${meta.symbol} 的池索引…`)
+    const refs = await findIndexedPoolsByToken(getActiveChainId(), token)
+    const indexed = await loadIndexedPoolRefs(refs, token)
+    if (indexed.length > 0) {
+      say?.(`索引找到 ${indexed.length} 个池，已读取最新链上价格`)
+      return indexed
+    }
+  } catch {
+    say?.('池索引暂不可用，回退链上扫描…')
+  }
 
   say?.(`扫描 ${meta.symbol} 的 V3 池…`)
   const v3Lists = await Promise.all(quotes.map((q) => scanV3Pools(token, q).catch(() => [])))

@@ -27,6 +27,7 @@ import {
   createV4PoolAndSeed,
   describeFullRange,
   describeRange,
+  discoverPoolsByQuery,
   discoverPoolsByToken,
   findBestV3Pool,
   findV4Pool,
@@ -143,6 +144,8 @@ import DlmmPositionsPanel from './DlmmPositionsPanel'
 import {
   allocateDlmmAmounts,
   buildEvmDlmmTranches,
+  chooseDlmmAutoNftCount,
+  mergeEvmDlmmTranches,
   refreshEvmDlmmPlan,
   type DlmmSide,
   type EvmDlmmPlan,
@@ -1761,7 +1764,21 @@ export default function App() {
         `已加载 ${tag} · ${q.coin.symbol}/${q.quote.symbol} · Fee ${feePct}%${spacingNote}${hooksNote} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`,
       )
     } catch (e) {
-      setStatus(e instanceof Error ? e.message : String(e))
+      // 非链接文本（币名/符号/CA）走市场索引搜索；命中后让用户选池。
+      try {
+        setDiscovering(true)
+        const rows = await discoverPoolsByQuery(raw, { onStatus: setStatus })
+        if (rows.length > 0) {
+          setDiscovered(rows)
+          setStatus(`索引找到 ${rows.length} 个 Uniswap 池，选一个继续`)
+        } else {
+          setStatus(e instanceof Error ? e.message : String(e))
+        }
+      } catch {
+        setStatus(e instanceof Error ? e.message : String(e))
+      } finally {
+        setDiscovering(false)
+      }
     } finally {
       setBusy(false)
     }
@@ -3133,7 +3150,7 @@ export default function App() {
       const sourceAmount0 = parseAmount(request.amount0 || '0', sourcePool.token0.decimals)
       const sourceAmount1 = parseAmount(request.amount1 || '0', sourcePool.token1.decimals)
       void run(
-        `批量创建 ${request.trancheCount} 档 ${sideLabel} · ${sourcePool.version.toUpperCase()}`,
+        `批量创建 ${request.previewNftCount} 个 NFT · ${request.visualBinCount} Bin ${sideLabel} · ${sourcePool.version.toUpperCase()}`,
         async () => {
           const live = sourcePool.version === 'v4'
             ? (sourcePool.hooks != null && sourcePool.tickSpacing
@@ -3155,14 +3172,47 @@ export default function App() {
             : await loadV3Pool(sourcePool.poolAddress!)
           setPool(live)
           const freshPlan = refreshEvmDlmmPlan(live, request.plan)
-          const tranches = buildEvmDlmmTranches(
+          const visualTranches = buildEvmDlmmTranches(
             live,
             freshPlan,
             request.shape,
-            request.trancheCount,
+            request.visualBinCount,
           )
-          if (tranches.length < 2) throw new Error('当前范围不足以拆成多档，请增加 Bin 数')
-          const allocations = allocateDlmmAmounts(sourceAmount0, sourceAmount1, tranches)
+          if (visualTranches.length < 2) throw new Error('当前范围不足以拆成多档，请扩大价格范围')
+          const visualAllocations = allocateDlmmAmounts(
+            sourceAmount0,
+            sourceAmount1,
+            visualTranches,
+          )
+          let targetNftCount = request.nftMode === 'exact'
+            ? visualTranches.length
+            : request.nftMode === 'manual'
+              ? request.manualNftCount
+              : chooseDlmmAutoNftCount({
+                version: live.version,
+                visualBinCount: visualTranches.length,
+              })
+          if (request.nftMode === 'auto') {
+            setStatus('读取实时 Gas，计算本次最合适的 NFT 合并数…')
+            const [gasResult, blockResult] = await Promise.allSettled([
+              withTimeout(publicClient.getGasPrice(), 6_000, 'Gas 价格'),
+              withTimeout(publicClient.getBlock({ blockTag: 'latest' }), 6_000, '最新区块'),
+            ])
+            targetNftCount = chooseDlmmAutoNftCount({
+              version: live.version,
+              visualBinCount: visualTranches.length,
+              gasPriceWei: gasResult.status === 'fulfilled' ? gasResult.value : null,
+              blockGasLimit: blockResult.status === 'fulfilled' ? blockResult.value.gasLimit : null,
+            })
+          }
+          const layout = mergeEvmDlmmTranches(
+            live,
+            visualTranches,
+            visualAllocations,
+            targetNftCount,
+          )
+          const tranches = layout.tranches
+          const allocations = layout.allocations
           const allocationsReady = allocations.every((amount, index) => {
             const required = tranches[index]?.liquiditySide
             if (required === 0) return amount.amount0 > 0n
@@ -3170,7 +3220,7 @@ export default function App() {
             return amount.amount0 > 0n && amount.amount1 > 0n
           })
           if (!allocationsReady) {
-            throw new Error('数量太小，无法分配到全部档位；请增加数量或减少档位')
+            throw new Error('数量太小，无法分配到全部链上 NFT；请增加数量或改用 Gas 自动合并')
           }
           const bands = tranches.map((tranche, index) => ({
             tickLower: tranche.tickLower,
@@ -3179,7 +3229,7 @@ export default function App() {
             amount1: allocations[index]?.amount1 ?? 0n,
           }))
           setStatus(
-            `已按最新价格重建 ${bands.length} 档 ${sideLabel}，准备一笔原子批量 Mint…`,
+            `已按最新价格复检：${visualTranches.length} 个视觉 Bin → ${bands.length} 个 NFT，准备一笔原子批量 Mint…`,
           )
           const strictToken = freshPlan.depositTokenIndex === 'both'
             ? undefined
@@ -3213,7 +3263,7 @@ export default function App() {
             pool: result.pool,
             side: request.side,
             shape: request.shape,
-            binCount: freshPlan.binCount,
+            binCount: visualTranches.length,
             gapBins: freshPlan.gapBins,
             txHash: result.hash,
             bands: result.bands,
