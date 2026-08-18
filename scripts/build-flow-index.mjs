@@ -42,9 +42,23 @@ Object.defineProperty(globalThis, 'localStorage', {
 const previous = await readJson(flowFile, null)
 const { FLOW_CHAIN_IDS, FLOW_WINDOW_MINUTES, fetchFlowEvents, flowPoolRef } = await import('../src/flowEvents.ts')
 
+async function withDeadline(promise, timeoutMs) {
+  let timer
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('shared index build timed out')), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 let result
 try {
-  result = await Promise.race([
+  result = await withDeadline(
     fetchFlowEvents({
       chainIds: [...FLOW_CHAIN_IDS],
       minUsd: 0,
@@ -52,8 +66,8 @@ try {
       limit: 100,
       preferSharedIndex: false,
     }),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('shared index build timed out')), 5 * 60_000)),
-  ])
+    5 * 60_000,
+  )
 } catch (error) {
   if (Array.isArray(previous?.events) && previous.events.length > 0) {
     console.warn(`index scan failed, preserving previous snapshot: ${error instanceof Error ? error.message : error}`)
