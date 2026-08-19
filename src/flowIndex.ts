@@ -25,12 +25,21 @@ export type SharedFlowResult = {
   generatedAt: number
 }
 
-// Scheduled Actions can occasionally start a few minutes late. Keep the last
-// valid snapshot authoritative for up to two hours so a delayed deployment
-// never sends every open browser back to the same rate-limited public RPC.
-const MAX_INDEX_AGE_MS = 2 * 60 * 60_000
+// GitHub 的 schedule 是 best-effort，偶尔会漏跑几十分钟。快照超过这个
+// 时限后不再伪装成“已刷新”，浏览器会保留旧列表并转入节流的实时补刷。
+export const FLOW_SHARED_INDEX_FRESH_MS = 18 * 60_000
 let rawIndexCache: { at: number; value: Partial<SharedFlowIndex> } | null = null
 let rawIndexRequest: Promise<Partial<SharedFlowIndex> | null> | null = null
+
+export function isSharedFlowIndexFresh(
+  generatedAt: number,
+  now = Date.now(),
+  maxAgeMs = FLOW_SHARED_INDEX_FRESH_MS,
+): boolean {
+  if (!Number.isFinite(generatedAt) || !Number.isFinite(now) || !(maxAgeMs > 0)) return false
+  const age = now - generatedAt
+  return age >= -60_000 && age <= maxAgeMs
+}
 
 function restoreEvent(value: StoredFlowEvent): FlowEvent | null {
   if (
@@ -96,7 +105,11 @@ export async function loadSharedFlowIndex(opts: FlowFetchOpts): Promise<SharedFl
     if (
       (index.version !== 1 && index.version !== 2)
       || !Number.isFinite(index.generatedAt)
-      || Date.now() - Number(index.generatedAt) > MAX_INDEX_AGE_MS
+      || !isSharedFlowIndexFresh(
+        Number(index.generatedAt),
+        Date.now(),
+        opts.maxSharedIndexAgeMs ?? FLOW_SHARED_INDEX_FRESH_MS,
+      )
       || !Array.isArray(index.events)
     ) return null
     const coveredChains = index.version === 2 && Array.isArray(index.chainIds)

@@ -1279,24 +1279,89 @@ const V4_INITIALIZE = parseAbiItem(
   'event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)',
 )
 
-async function resolveV4PoolKeyFromId(poolId: `0x${string}`): Promise<{
+type ResolvedV4PoolKey = {
   currency0: Address
   currency1: Address
   fee: number
   tickSpacing: number
   hooks: Address
-}> {
+}
+
+const V4_POOL_KEY_STORAGE = 'rangedesk.v4-pool-keys.v1'
+const v4PoolKeyCache = new Map<string, ResolvedV4PoolKey>()
+
+function v4PoolKeyCacheId(poolId: `0x${string}`): string {
+  return `${getActiveChainId()}:${poolId.toLowerCase()}`
+}
+
+function readCachedV4PoolKey(poolId: `0x${string}`): ResolvedV4PoolKey | null {
+  const cacheId = v4PoolKeyCacheId(poolId)
+  const memory = v4PoolKeyCache.get(cacheId)
+  if (memory) return memory
+  if (typeof localStorage === 'undefined') return null
+  try {
+    const parsed = JSON.parse(localStorage.getItem(V4_POOL_KEY_STORAGE) ?? '{}') as Record<string, ResolvedV4PoolKey>
+    const row = parsed[cacheId]
+    if (
+      !row
+      || !isAddress(row.currency0)
+      || !isAddress(row.currency1)
+      || !isAddress(row.hooks)
+      || !Number.isFinite(row.fee)
+      || !Number.isFinite(row.tickSpacing)
+      || row.tickSpacing <= 0
+    ) return null
+    v4PoolKeyCache.set(cacheId, row)
+    return row
+  } catch {
+    return null
+  }
+}
+
+function rememberV4PoolKey(poolId: `0x${string}`, key: ResolvedV4PoolKey): ResolvedV4PoolKey {
+  const cacheId = v4PoolKeyCacheId(poolId)
+  v4PoolKeyCache.set(cacheId, key)
+  if (v4PoolKeyCache.size > 120) {
+    const oldest = v4PoolKeyCache.keys().next().value as string | undefined
+    if (oldest) v4PoolKeyCache.delete(oldest)
+  }
+  if (typeof localStorage !== 'undefined') {
+    try {
+      const stored = JSON.parse(localStorage.getItem(V4_POOL_KEY_STORAGE) ?? '{}') as Record<string, ResolvedV4PoolKey>
+      stored[cacheId] = key
+      const recentEntries = Object.entries(stored).slice(-120)
+      localStorage.setItem(V4_POOL_KEY_STORAGE, JSON.stringify(Object.fromEntries(recentEntries)))
+    } catch {
+      /* private mode / storage quota */
+    }
+  }
+  return key
+}
+
+async function resolveV4PoolKeyFromId(poolId: `0x${string}`): Promise<ResolvedV4PoolKey> {
   const id = poolId.toLowerCase() as `0x${string}`
   const chainLabel = getActiveChainConfig().label
+  const cached = readCachedV4PoolKey(id)
+  if (cached) return cached
 
   // 主路径：PositionManager.poolKeys(bytes25) —— 不依赖 eth_getLogs，BSC/Base 公共 RPC 也能用
   try {
     const id25 = slice(id, 0, 25)
-    const key = await publicClient.readContract({
-      address: CONTRACTS.v4PositionManager,
-      abi: v4PositionManagerAbi,
-      functionName: 'poolKeys',
-      args: [id25],
+    const key = await runRpcTask({
+      chainId: getActiveChainId(),
+      lane: 'interactive',
+      label: 'V4 poolKeys',
+      retries: 1,
+      task: () => withTimeout(
+        publicClient.readContract({
+          address: CONTRACTS.v4PositionManager,
+          abi: v4PositionManagerAbi,
+          functionName: 'poolKeys',
+          args: [id25],
+        }),
+        8_000,
+        'V4 poolKeys',
+      ),
     })
     // viem 对多返回值可能给数组，对 tuple 可能给命名对象
     const row = key as unknown as Address[] & {
@@ -1324,7 +1389,7 @@ async function resolveV4PoolKeyFromId(poolId: `0x${string}`): Promise<{
         || hooks !== zeroAddress
       )
     ) {
-      return { currency0, currency1, fee, tickSpacing, hooks }
+      return rememberV4PoolKey(id, { currency0, currency1, fee, tickSpacing, hooks })
     }
   } catch (e) {
     console.warn('V4 poolKeys() lookup failed', e)
@@ -1333,11 +1398,21 @@ async function resolveV4PoolKeyFromId(poolId: `0x${string}`): Promise<{
   // poolId 不携带 chainId。先用 StateView 做一次廉价存在性检查：如果当前链
   // 明确返回未初始化，就不要再从创世块扫描日志（Base 公共 RPC 会慢且常 429）。
   try {
-    const slot0 = await publicClient.readContract({
-      address: CONTRACTS.v4StateView,
-      abi: v4StateViewAbi,
-      functionName: 'getSlot0',
-      args: [id],
+    const slot0 = await runRpcTask({
+      chainId: getActiveChainId(),
+      lane: 'interactive',
+      label: 'V4 StateView',
+      retries: 1,
+      task: () => withTimeout(
+        publicClient.readContract({
+          address: CONTRACTS.v4StateView,
+          abi: v4StateViewAbi,
+          functionName: 'getSlot0',
+          args: [id],
+        }),
+        8_000,
+        'V4 StateView',
+      ),
     })
     if (!((slot0[0] as bigint) > 0n)) {
       throw new Error(`该 V4 poolId 未在 ${chainLabel} 初始化`)
@@ -1358,13 +1433,13 @@ async function resolveV4PoolKeyFromId(poolId: `0x${string}`): Promise<{
     })
     if (logs.length) {
       const log = logs[0]
-      return {
+      return rememberV4PoolKey(id, {
         currency0: log.args.currency0 as Address,
         currency1: log.args.currency1 as Address,
         fee: Number(log.args.fee),
         tickSpacing: Number(log.args.tickSpacing),
         hooks: log.args.hooks as Address,
-      }
+      })
     }
   } catch (e) {
     console.warn('RPC V4 Initialize lookup failed', e)
@@ -1401,13 +1476,13 @@ async function resolveV4PoolKeyFromId(poolId: `0x${string}`): Promise<{
             ],
             log.data as `0x${string}`,
           )
-          return {
+          return rememberV4PoolKey(id, {
             currency0: (`0x${log.topics[2].slice(-40)}`) as Address,
             currency1: (`0x${log.topics[3].slice(-40)}`) as Address,
             fee: Number(decoded[0]),
             tickSpacing: Number(decoded[1]),
             hooks: decoded[2] as Address,
-          }
+          })
         }
       }
     }
@@ -3696,6 +3771,25 @@ const ERC20_TRANSFER = parseAbiItem(
 
 function v4Salt(tokenId: bigint): `0x${string}` {
   return `0x${tokenId.toString(16).padStart(64, '0')}` as `0x${string}`
+}
+
+/**
+ * 已加载池的报价币 USD 单价。
+ *
+ * 常见池（稳定币、ETH/WETH）直接命中报价币；若报价币本身没有可用行情，
+ * 再用「标的币 USD ÷ 池内报价币/标的币」反推。返回 0 表示无法可靠换算，
+ * UI 必须停用 U 本位输入，不能把报价币价格冒充美元价格。
+ */
+export async function getPoolQuoteUsdPrice(pool: PoolInfo): Promise<number> {
+  const quote = getCoinQuote(pool)
+  const directQuoteUsd = await getTokenUsdPrice(quote.quote.address)
+  if (directQuoteUsd > 0 && Number.isFinite(directQuoteUsd)) return directQuoteUsd
+  const coinUsd = await getTokenUsdPrice(quote.coin.address)
+  if (coinUsd > 0 && quote.spot > 0 && Number.isFinite(coinUsd)) {
+    const inferred = coinUsd / quote.spot
+    return Number.isFinite(inferred) && inferred > 0 ? inferred : 0
+  }
+  return 0
 }
 
 type V4ModifyHistoryLog = {
@@ -6268,6 +6362,33 @@ export type DiscoveredPool = {
   /** 池内两侧余额折算的 USD；V4 拿不到就为 null，用 liquidity 比大小 */
   tvlUsd: number | null
   liquidity: bigint
+}
+
+/** 报价币/标的币 × USD/报价币 → USD/标的币。 */
+export function coinPriceToUsdPrice(coinPrice: number, quoteUsd: number): number {
+  if (!(coinPrice > 0) || !(quoteUsd > 0)) return 0
+  const value = coinPrice * quoteUsd
+  return Number.isFinite(value) && value > 0 ? value : 0
+}
+
+/** USD/标的币 → 报价币/标的币。 */
+export function usdPriceToCoinPrice(usdPrice: number, quoteUsd: number): number {
+  if (!(usdPrice > 0) || !(quoteUsd > 0)) return 0
+  const value = usdPrice / quoteUsd
+  return Number.isFinite(value) && value > 0 ? value : 0
+}
+
+/** 自定义 U 本位上下限 → 链上 ticks。 */
+export function ticksFromUsdPrices(
+  pool: PoolInfo,
+  usdLower: number,
+  usdUpper: number,
+  quoteUsd: number,
+) {
+  const coinLower = usdPriceToCoinPrice(usdLower, quoteUsd)
+  const coinUpper = usdPriceToCoinPrice(usdUpper, quoteUsd)
+  if (!(coinLower > 0) || !(coinUpper > 0)) throw new Error('无法把 USD 区间换算为池内价格')
+  return ticksFromCoinPrices(pool, coinLower, coinUpper)
 }
 
 async function loadIndexedPoolRefs(

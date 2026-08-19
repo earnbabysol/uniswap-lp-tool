@@ -34,6 +34,7 @@ import {
   formatAmount,
   getErc20Balance,
   getNativeBalance,
+  getPoolQuoteUsdPrice,
   getTokenBalanceView,
   isArcUsdcErc20,
   getTokenUsdPrice,
@@ -67,6 +68,8 @@ import {
   scanV3Pools,
   scanV4Pools,
   ticksFromCoinPrices,
+  ticksFromUsdPrices,
+  coinPriceToUsdPrice,
   getCoinQuote,
   getPositionCoinPrices,
   getPositionUsdRange,
@@ -279,17 +282,6 @@ function positionPoolRef(p: { poolAddress?: string | null; poolId?: string | nul
 }
 
 
-function applyDefaultCoinRange(
-  info: PoolInfo,
-  setLo: (v: string) => void,
-  setHi: (v: string) => void,
-) {
-  const q = getCoinQuote(info)
-  if (!(q.spot > 0)) return
-  setLo(formatPrice(q.spot * 0.95))
-  setHi(formatPrice(q.spot * 1.05))
-}
-
 /** 允许清空、中间态的数字输入，避免 number 框删不干净 */
 function SoftNumberInput(props: {
   value: number
@@ -470,6 +462,7 @@ export default function App() {
   const [rangeMode, setRangeMode] = useState<RangeMode>('percent')
   const [priceLo, setPriceLo] = useState('')
   const [priceHi, setPriceHi] = useState('')
+  const [poolUsdRate, setPoolUsdRate] = useState({ key: '', quoteUsd: 0, loading: false })
   const [poolDepth, setPoolDepth] = useState<PoolDepth | null>(null)
   const [depthLoading, setDepthLoading] = useState(false)
   const [depthError, setDepthError] = useState<string | null>(null)
@@ -523,6 +516,61 @@ export default function App() {
     () => positions.find((p) => `${p.version}-${p.tokenId}` === selectedId) ?? null,
     [positions, selectedId],
   )
+
+  const poolPricingKey = pool
+    ? `${chainId}:${pool.version}:${pool.poolId ?? pool.poolAddress ?? ''}:${getCoinQuote(pool).quote.address}`
+    : ''
+  const activePoolQuoteUsd = poolUsdRate.key === poolPricingKey ? poolUsdRate.quoteUsd : 0
+  const poolUsdLoading = Boolean(poolPricingKey)
+    && (poolUsdRate.key !== poolPricingKey || poolUsdRate.loading)
+  const defaultUsdRangeKeyRef = useRef('')
+  const poolUsdRequestKeyRef = useRef('')
+
+  useEffect(() => {
+    if (!pool || !poolPricingKey) {
+      defaultUsdRangeKeyRef.current = ''
+      poolUsdRequestKeyRef.current = ''
+      setPoolUsdRate({ key: '', quoteUsd: 0, loading: false })
+      return
+    }
+    let cancelled = false
+    const poolChanged = poolUsdRequestKeyRef.current !== poolPricingKey
+    poolUsdRequestKeyRef.current = poolPricingKey
+    if (poolChanged) {
+      // 换池后先清上一池数字；同池刷新 tick/现价时保留用户已填区间。
+      setPriceLo('')
+      setPriceHi('')
+    }
+    setPoolUsdRate({ key: poolPricingKey, quoteUsd: 0, loading: true })
+    void getPoolQuoteUsdPrice(pool)
+      .then((quoteUsd) => {
+        if (cancelled) return
+        setPoolUsdRate({ key: poolPricingKey, quoteUsd, loading: false })
+      })
+      .catch(() => {
+        if (cancelled) return
+        setPoolUsdRate({ key: poolPricingKey, quoteUsd: 0, loading: false })
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [pool, poolPricingKey])
+
+  useEffect(() => {
+    if (!pool || !poolPricingKey || !(activePoolQuoteUsd > 0)) return
+    if (defaultUsdRangeKeyRef.current === poolPricingKey) return
+    const spotUsd = coinPriceToUsdPrice(getCoinQuote(pool).spot, activePoolQuoteUsd)
+    if (!(spotUsd > 0)) return
+    defaultUsdRangeKeyRef.current = poolPricingKey
+    try {
+      const snapped = ticksFromUsdPrices(pool, spotUsd * 0.95, spotUsd * 1.05, activePoolQuoteUsd)
+      setPriceLo(formatPrice(coinPriceToUsdPrice(snapped.coinPriceLower, activePoolQuoteUsd)))
+      setPriceHi(formatPrice(coinPriceToUsdPrice(snapped.coinPriceUpper, activePoolQuoteUsd)))
+    } catch {
+      setPriceLo(formatPrice(spotUsd * 0.95))
+      setPriceHi(formatPrice(spotUsd * 1.05))
+    }
+  }, [pool, poolPricingKey, activePoolQuoteUsd])
 
   const dlmmPositionGroups = useMemo(
     () => resolveDlmmPositionGroups(dlmmGroupRecords, positions, chainId, address),
@@ -1222,7 +1270,6 @@ export default function App() {
       setTokenB(q.quote.address)
       setFee(info.fee)
       if (args.version === 'v4' && info.tickSpacing) setV4TickSpacing(info.tickSpacing)
-      applyDefaultCoinRange(info, setPriceLo, setPriceHi)
       setStatus(
         `已从动向加载 ${args.version.toUpperCase()} · ${q.coin.symbol}/${q.quote.symbol} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`,
       )
@@ -1534,7 +1581,6 @@ export default function App() {
         setPool(info)
         setShowCreatePool(false)
         setV4TickSpacing(info.tickSpacing)
-        applyDefaultCoinRange(info, setPriceLo, setPriceHi)
         setStatus(`已加载 V4 · fee ${(info.fee / 10000).toFixed(2)}% · spacing ${info.tickSpacing} · 币价 ${formatPrice(getCoinQuote(info).spot)}`)
         return
       }
@@ -1553,7 +1599,6 @@ export default function App() {
       }
       setPool(info)
       setShowCreatePool(false)
-      applyDefaultCoinRange(info, setPriceLo, setPriceHi)
       {
         const q = getCoinQuote(info)
         setStatus(`已加载 ${info.dexLabel ?? 'V3'} · ${(info.fee / 10000).toFixed(2)}% · ${info.poolAddress ? shortAddr(info.poolAddress) : ''} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`)
@@ -1582,7 +1627,6 @@ export default function App() {
       setPool(list[0])
       setShowCreatePool(false)
       setFee(list[0].fee)
-      applyDefaultCoinRange(list[0], setPriceLo, setPriceHi)
       setStatus(`找到 ${list.length} 个${mintProtocol.toUpperCase()} 池，默认 ${(list[0].fee / 10000).toFixed(2)}%`)
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e))
@@ -1655,7 +1699,6 @@ export default function App() {
     } else {
       setMintProtocol('v3')
     }
-    applyDefaultCoinRange(info, setPriceLo, setPriceHi)
     setShowCreatePool(false)
     setDiscovered(null)
     setDiscoverNote('')
@@ -1716,7 +1759,6 @@ export default function App() {
         setTokenA(q.coin.address)
         setTokenB(q.quote.address)
         setFee(info.fee)
-        applyDefaultCoinRange(info, setPriceLo, setPriceHi)
         setDiscovered(null)
         setStatus(
           `已加载 V3 · ${shortAddr(raw as Address)} · ${q.coin.symbol}/${q.quote.symbol} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`,
@@ -1735,20 +1777,28 @@ export default function App() {
     let autoDetectedChain: string | null = null
     try {
       const parsedInput = parsePoolInput(raw)
+      let preloadedInfo: PoolInfo | null = null
       if (parsedInput?.kind === 'v4') {
         const activeChainId = getActiveChainId()
-        setStatus(`正在确认 V4 poolId 所在网络（当前 ${getActiveChainConfig().label}）…`)
-        const detected = await detectV4PoolChain(parsedInput.poolId, activeChainId)
-        if (detected && detected.chainId !== activeChainId) {
-          autoDetectedChain = detected.label
-          onSwitchChain(detected.chainId, { preservePoolInput: raw })
-          // onSwitchChain 会重置链相关状态；本次加载仍继续使用原始 poolId。
-          setPoolInput(raw)
-          setBusy(true)
-          setStatus(`已识别：该池位于 ${detected.label}，正在自动切换并加载…`)
+        setStatus(`先在当前 ${getActiveChainConfig().label} 加载 V4 poolId…`)
+        try {
+          // 大多数人已经切在正确链：先走本链 poolKeys，避免每次都并行探测七条链。
+          preloadedInfo = await loadV4PoolById(parsedInput.poolId)
+        } catch (currentChainError) {
+          setStatus(`当前链未读到，正在确认 V4 poolId 所在网络…`)
+          const detected = await detectV4PoolChain(parsedInput.poolId, activeChainId)
+          if (!detected) throw currentChainError
+          if (detected.chainId !== activeChainId) {
+            autoDetectedChain = detected.label
+            onSwitchChain(detected.chainId, { preservePoolInput: raw })
+            // onSwitchChain 会重置链相关状态；本次加载仍继续使用原始 poolId。
+            setPoolInput(raw)
+            setBusy(true)
+            setStatus(`已识别：该池位于 ${detected.label}，正在自动切换并加载…`)
+          }
         }
       }
-      const info = await loadPoolFromInput(raw)
+      const info = preloadedInfo ?? await loadPoolFromInput(raw)
       setDiscovered(null)
       setPool(info)
       if (info.version === 'v4') setMintProtocol('v4')
@@ -1763,8 +1813,6 @@ export default function App() {
       // 超大 tickSpacing（如 3000）时默认 ±5% 会塌格；自动切全区间更稳
       if (info.tickSpacing >= 500) {
         setRangeMode('full')
-      } else {
-        applyDefaultCoinRange(info, setPriceLo, setPriceHi)
       }
       const q = getCoinQuote(info)
       const tag = info.version === 'v4'
@@ -1848,9 +1896,11 @@ export default function App() {
         } else if (rangeMode === 'percent') {
           ticks = describeRange(info, percentLower, percentUp)
         } else {
-          const lo = Number(priceLo)
-          const hi = Number(priceHi)
-          if (lo > 0 && hi > 0) ticks = ticksFromCoinPrices(info, lo, hi)
+          const lo = Number(priceLo.replace(/,/g, ''))
+          const hi = Number(priceHi.replace(/,/g, ''))
+          if (lo > 0 && hi > 0 && activePoolQuoteUsd > 0) {
+            ticks = ticksFromUsdPrices(info, lo, hi, activePoolQuoteUsd)
+          }
         }
       } catch {
         ticks = null
@@ -1972,11 +2022,12 @@ export default function App() {
       const lo = Number(priceLo.replace(/,/g, ''))
       const hi = Number(priceHi.replace(/,/g, ''))
       if (!(lo > 0) || !(hi > 0)) return null
-      return ticksFromCoinPrices(pool, lo, hi)
+      if (!(activePoolQuoteUsd > 0)) return null
+      return ticksFromUsdPrices(pool, lo, hi, activePoolQuoteUsd)
     } catch {
       return null
     }
-  }, [pool, percentLower, percentUp, rangeMode, priceLo, priceHi])
+  }, [pool, percentLower, percentUp, rangeMode, priceLo, priceHi, activePoolQuoteUsd])
 
   // 池子变化时加载深度剖面（不阻塞表单）
   useEffect(() => {
@@ -2007,10 +2058,11 @@ export default function App() {
   }, [pool?.poolAddress, pool?.poolId, pool?.tick, pool?.liquidity, pool?.version])
 
   const onDepthRangeChange = useCallback((range: { coinLower: number; coinUpper: number }) => {
+    if (!(activePoolQuoteUsd > 0)) return
     setRangeMode('custom')
-    setPriceLo(formatPrice(range.coinLower))
-    setPriceHi(formatPrice(range.coinUpper))
-  }, [])
+    setPriceLo(formatPrice(coinPriceToUsdPrice(range.coinLower, activePoolQuoteUsd)))
+    setPriceHi(formatPrice(coinPriceToUsdPrice(range.coinUpper, activePoolQuoteUsd)))
+  }, [activePoolQuoteUsd])
 
   // 切到单边区间时清掉不需要的那一侧输入
   useEffect(() => {
@@ -2602,7 +2654,6 @@ export default function App() {
         setPool(info)
         setFee(useFee)
         setShowCreatePool(false)
-        applyDefaultCoinRange(info, setPriceLo, setPriceHi)
         const q = getCoinQuote(info)
         setStatusHash(hash)
         setTxHistory(pushTxHistory({
@@ -2632,7 +2683,6 @@ export default function App() {
         })
         setPool(info)
         setShowCreatePool(false)
-        applyDefaultCoinRange(info, setPriceLo, setPriceHi)
         const q = getCoinQuote(info)
         if (hash) {
           setStatusHash(hash)
@@ -2651,6 +2701,29 @@ export default function App() {
       setStatus(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
+    }
+  }
+
+  const poolSpotUsd = pool
+    ? coinPriceToUsdPrice(rangePreview?.coinSpot ?? getCoinQuote(pool).spot, activePoolQuoteUsd)
+    : 0
+  const rangeUsdLower = rangePreview
+    ? coinPriceToUsdPrice(rangePreview.coinPriceLower, activePoolQuoteUsd)
+    : 0
+  const rangeUsdUpper = rangePreview
+    ? coinPriceToUsdPrice(rangePreview.coinPriceUpper, activePoolQuoteUsd)
+    : 0
+  const commitCustomUsdRange = (side: 'lo' | 'hi', rawValue: string) => {
+    if (!pool || rangeMode !== 'custom' || !(activePoolQuoteUsd > 0)) return
+    const usdLower = Number((side === 'lo' ? rawValue : priceLo).replace(/,/g, ''))
+    const usdUpper = Number((side === 'hi' ? rawValue : priceHi).replace(/,/g, ''))
+    if (!(usdLower > 0) || !(usdUpper > usdLower)) return
+    try {
+      const snapped = ticksFromUsdPrices(pool, usdLower, usdUpper, activePoolQuoteUsd)
+      setPriceLo(formatPrice(coinPriceToUsdPrice(snapped.coinPriceLower, activePoolQuoteUsd)))
+      setPriceHi(formatPrice(coinPriceToUsdPrice(snapped.coinPriceUpper, activePoolQuoteUsd)))
+    } catch {
+      /* 中间输入态不改写 */
     }
   }
 
@@ -5296,7 +5369,6 @@ export default function App() {
                   onClick={() => {
                     setPool(p)
                     setFee(p.fee)
-                    applyDefaultCoinRange(p, setPriceLo, setPriceHi)
                   }}
                 >
                   {p.dexLabel ? `${p.dexLabel} · ` : ''}{(p.fee / 10000).toFixed(2)}% · {formatPrice(getCoinQuote(p).spot)}
@@ -5444,12 +5516,14 @@ export default function App() {
                 <div className="mint-spot">
                   <span className="mint-spot-label">当前币价</span>
                   <strong className="mint-spot-val">
-                    {formatPrice(rangePreview?.coinSpot ?? getCoinQuote(pool).spot)}
+                    {poolUsdLoading
+                      ? '换算中…'
+                      : poolSpotUsd > 0
+                        ? `$${formatPrice(poolSpotUsd)}`
+                        : 'USD 暂不可用'}
                   </strong>
                   <span className="mint-spot-unit">
-                    {rangePreview?.quoteSymbol ?? getCoinQuote(pool).quote.symbol}
-                    {' per '}
-                    {rangePreview?.coinSymbol ?? getCoinQuote(pool).coin.symbol}
+                    USD per {rangePreview?.coinSymbol ?? getCoinQuote(pool).coin.symbol}
                   </span>
                 </div>
                 {pool.version === 'v4' && pool.hooks && pool.hooks.toLowerCase() !== '0x0000000000000000000000000000000000000000' && (
@@ -5615,6 +5689,10 @@ export default function App() {
                   coinLower={rangePreview?.coinPriceLower ?? null}
                   coinUpper={rangePreview?.coinPriceUpper ?? null}
                   fullRange={rangeMode === 'full'}
+                  displayPriceMultiplier={activePoolQuoteUsd > 0 ? activePoolQuoteUsd : 1}
+                  displayPriceUnit={activePoolQuoteUsd > 0
+                    ? `USD per ${getCoinQuote(pool).coin.symbol}`
+                    : `${getCoinQuote(pool).quote.symbol} per ${getCoinQuote(pool).coin.symbol}`}
                   onRangeChange={onDepthRangeChange}
                 />
 
@@ -5705,7 +5783,11 @@ export default function App() {
                           <span className="mint-pct-suffix">%</span>
                         </div>
                         <span className="mint-pct-price">
-                          ≈ {formatPrice(rangePreview?.coinPriceLower ?? getCoinQuote(pool).spot * (1 + percentLower / 100))}
+                          {poolUsdLoading
+                            ? 'U 价换算中…'
+                            : poolSpotUsd > 0
+                              ? `≈ $${formatPrice(rangeUsdLower || poolSpotUsd * (1 + percentLower / 100))}`
+                              : 'U 价暂不可用'}
                         </span>
                       </label>
                       <label className="mint-pct-field">
@@ -5723,26 +5805,65 @@ export default function App() {
                           <span className="mint-pct-suffix">%</span>
                         </div>
                         <span className="mint-pct-price">
-                          ≈ {formatPrice(rangePreview?.coinPriceUpper ?? getCoinQuote(pool).spot * (1 + percentUp / 100))}
+                          {poolUsdLoading
+                            ? 'U 价换算中…'
+                            : poolSpotUsd > 0
+                              ? `≈ $${formatPrice(rangeUsdUpper || poolSpotUsd * (1 + percentUp / 100))}`
+                              : 'U 价暂不可用'}
                         </span>
                       </label>
                     </div>
                   </>
                 ) : (
-                  <div className="mint-pct-grid">
-                    <label className="mint-pct-field">
-                      <span className="mint-pct-label">币价下限</span>
-                      <div className="mint-pct-input">
-                        <input value={priceLo} onChange={(e) => setPriceLo(e.target.value)} inputMode="decimal" />
-                      </div>
-                    </label>
-                    <label className="mint-pct-field">
-                      <span className="mint-pct-label">币价上限</span>
-                      <div className="mint-pct-input">
-                        <input value={priceHi} onChange={(e) => setPriceHi(e.target.value)} inputMode="decimal" />
-                      </div>
-                    </label>
-                  </div>
+                  <>
+                    <div className="mint-pct-grid">
+                      <label className="mint-pct-field">
+                        <span className="mint-pct-label">下限 · USD / {getCoinQuote(pool).coin.symbol}</span>
+                        <div className="mint-pct-input">
+                          <span className="mint-pct-prefix">$</span>
+                          <input
+                            value={priceLo}
+                            onChange={(e) => setPriceLo(e.target.value)}
+                            onBlur={(e) => commitCustomUsdRange('lo', e.currentTarget.value)}
+                            inputMode="decimal"
+                            placeholder={poolUsdLoading ? '换算中…' : '填写 U 价'}
+                            disabled={poolUsdLoading || !(activePoolQuoteUsd > 0)}
+                          />
+                        </div>
+                      </label>
+                      <label className="mint-pct-field">
+                        <span className="mint-pct-label">上限 · USD / {getCoinQuote(pool).coin.symbol}</span>
+                        <div className="mint-pct-input">
+                          <span className="mint-pct-prefix">$</span>
+                          <input
+                            value={priceHi}
+                            onChange={(e) => setPriceHi(e.target.value)}
+                            onBlur={(e) => commitCustomUsdRange('hi', e.currentTarget.value)}
+                            inputMode="decimal"
+                            placeholder={poolUsdLoading ? '换算中…' : '填写 U 价'}
+                            disabled={poolUsdLoading || !(activePoolQuoteUsd > 0)}
+                          />
+                        </div>
+                      </label>
+                    </div>
+                    <div className="mint-usd-actions">
+                      <p className={`mint-usd-note ${!poolUsdLoading && !(activePoolQuoteUsd > 0) ? 'warn-text' : 'muted'}`}>
+                        {poolUsdLoading
+                          ? `正在读取 ${getCoinQuote(pool).quote.symbol} 的 USD 汇率…`
+                          : activePoolQuoteUsd > 0
+                            ? `直接填 U 价；按 1 ${getCoinQuote(pool).quote.symbol} ≈ $${formatPrice(activePoolQuoteUsd)} 换算，并自动对齐可用 tick。`
+                            : `无法读取 ${getCoinQuote(pool).quote.symbol} 的 USD 汇率，暂不允许用错误价格开仓。`}
+                      </p>
+                      <button
+                        type="button"
+                        className="btn ghost tight mint-usd-apply"
+                        disabled={poolUsdLoading || !(activePoolQuoteUsd > 0)}
+                        onClick={() => commitCustomUsdRange('hi', priceHi)}
+                      >
+                        应用 U 价
+                      </button>
+                    </div>
+                  </>
                 )}
 
                 {rangePreview && (() => {
@@ -5779,7 +5900,9 @@ export default function App() {
                           <div>
                             <span className="mint-end-k">区间</span>
                             <span className="mint-end-v">
-                              {formatPrice(coinLo)} – {formatPrice(coinHi)}
+                              {rangeMode === 'custom' && rangeUsdLower > 0 && rangeUsdUpper > 0
+                                ? `$${formatPrice(rangeUsdLower)} – $${formatPrice(rangeUsdUpper)} / ${rangePreview.coinSymbol}`
+                                : '全价格范围'}
                             </span>
                           </div>
                         )}

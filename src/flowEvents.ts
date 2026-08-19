@@ -119,11 +119,18 @@ export type FlowFetchOpts = {
   /** 默认 true */
   filterHoneypot?: boolean
   /** 池发现完成后先发布首屏；风险、市值与年化随后补齐。 */
-  onBaseEvents?: (result: { events: FlowEvent[]; notices: FlowNotice[] }) => void
+  onBaseEvents?: (result: {
+    events: FlowEvent[]
+    notices: FlowNotice[]
+    source?: 'shared-index' | 'live-rpc'
+    generatedAt?: number
+  }) => void
   /** 最大池数，而不是事件条数。 */
   limit?: number
   /** 定时索引构建器传 false，浏览器默认优先同域共享快照。 */
   preferSharedIndex?: boolean
+  /** 浏览器允许共享快照有多旧；超出后自动转实时链上补刷。 */
+  maxSharedIndexAgeMs?: number
 }
 
 export type FlowNotice = {
@@ -3477,7 +3484,7 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
   if (opts.preferSharedIndex !== false) {
     const indexed = await loadSharedFlowIndex(opts)
     if (indexed) {
-      opts.onBaseEvents?.({ events: indexed.events, notices: indexed.notices })
+      opts.onBaseEvents?.(indexed)
       return indexed
     }
   }
@@ -3492,7 +3499,12 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
   const publishBase = (events: FlowEvent[], currentNotices: FlowNotice[] = notices) => {
     if (!opts.onBaseEvents || events.length === 0) return
     try {
-      opts.onBaseEvents({ events, notices: [...currentNotices] })
+      opts.onBaseEvents({
+        events,
+        notices: [...currentNotices],
+        source: 'live-rpc',
+        generatedAt: Date.now(),
+      })
     } catch {
       // UI progress callbacks must never break data collection.
     }

@@ -6,7 +6,7 @@
  * same chain from three independent call sites.
  */
 
-export type RpcLane = 'logs' | 'read' | 'indexer' | 'balance'
+export type RpcLane = 'logs' | 'read' | 'indexer' | 'balance' | 'interactive'
 
 export type RpcErrorKind =
   | 'rate-limit'
@@ -129,7 +129,7 @@ function laneConfig(chainId: number, lane: RpcLane): { concurrency: number; inte
     // exhausting the quota before APR enrichment starts.
     if (lane === 'indexer') return { concurrency: 2, intervalMs: 350 }
     // Wallet-facing balances must not wait behind getLogs / 动向扫描。
-    if (lane === 'balance') return { concurrency: 2, intervalMs: 80 }
+    if (lane === 'balance' || lane === 'interactive') return { concurrency: 2, intervalMs: 80 }
     // All Robinhood reads share one public quota. Serializing logs and calls
     // together prevents V3, V4 and APR refreshes from stampeding the endpoint.
     return { concurrency: 1, intervalMs: 350 }
@@ -138,7 +138,7 @@ function laneConfig(chainId: number, lane: RpcLane): { concurrency: number; inte
     // Base official RPC + Blockscout both choke on V3/V4 parallel bursts.
     // Share one lane for logs/reads; keep indexer slightly paced.
     if (lane === 'indexer') return { concurrency: 1, intervalMs: 280 }
-    if (lane === 'balance') return { concurrency: 2, intervalMs: 60 }
+    if (lane === 'balance' || lane === 'interactive') return { concurrency: 2, intervalMs: 60 }
     return { concurrency: 1, intervalMs: 260 }
   }
   return lane === 'logs'
@@ -147,7 +147,10 @@ function laneConfig(chainId: number, lane: RpcLane): { concurrency: number; inte
 }
 
 function getLane(chainId: number, lane: RpcLane): LaneState {
-  const key = (chainId === 4663 || chainId === 8453) && lane !== 'indexer' && lane !== 'balance'
+  const key = (chainId === 4663 || chainId === 8453)
+    && lane !== 'indexer'
+    && lane !== 'balance'
+    && lane !== 'interactive'
     ? `${chainId}:shared`
     : `${chainId}:${lane}`
   let state = laneStates.get(key)

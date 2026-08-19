@@ -12,6 +12,9 @@ export type RangeDepthChartProps = {
   coinUpper: number | null
   /** 全区间时隐藏拖拽手柄 */
   fullRange?: boolean
+  /** 仅改变图表上的价格显示；拖拽与 tick 计算仍使用池内报价。 */
+  displayPriceMultiplier?: number
+  displayPriceUnit?: string
   /** 拖拽或点击改区间时回调（已 snap） */
   onRangeChange: (range: { coinLower: number; coinUpper: number }) => void
 }
@@ -38,6 +41,8 @@ export function RangeDepthChart({
   coinLower,
   coinUpper,
   fullRange,
+  displayPriceMultiplier = 1,
+  displayPriceUnit,
   onRangeChange,
 }: RangeDepthChartProps) {
   const svgRef = useRef<SVGSVGElement | null>(null)
@@ -50,6 +55,10 @@ export function RangeDepthChart({
   const [viewSpanMult, setViewSpanMult] = useState(1)
 
   const poolKey = pool.poolAddress ?? pool.poolId ?? `${pool.token0.address}-${pool.token1.address}-${pool.fee}`
+  const shownMultiplier = displayPriceMultiplier > 0 && Number.isFinite(displayPriceMultiplier)
+    ? displayPriceMultiplier
+    : 1
+  const shownPrice = (coinPrice: number) => formatPrice(coinPrice * shownMultiplier)
 
   useEffect(() => {
     liveLo.current = coinLower
@@ -250,7 +259,7 @@ export function RangeDepthChart({
              * 这是价格单位，不是交易对名字 —— 而上面池子卡片正好用 "NVDA / USDG"
              * 写对名，两个只隔一屏、顺序还相反，斜杠写法会被读成自相矛盾。
              */}
-            {depth.quoteSymbol} per {depth.coinSymbol}
+            {displayPriceUnit || `${depth.quoteSymbol} per ${depth.coinSymbol}`}
             {depth.hasLiquidityProfile ? '' : ' · 占位轴（无深度数据）'}
           </span>
         )}
@@ -329,7 +338,7 @@ export function RangeDepthChart({
 
         <line x1={spotX} y1={padT} x2={spotX} y2={padT + plotH} className="depth-spot-line" />
         <text x={spotX + 4} y={padT + 12} className="depth-spot-label">
-          现价 {formatPrice(depth?.currentCoinPrice ?? 0)}
+          现价 {shownPrice(depth?.currentCoinPrice ?? getCoinSpot(pool))}
         </text>
 
         {showRange && (

@@ -3125,6 +3125,29 @@ input:focus-visible, select:focus-visible, select:focus {
   font-size: 15.5px;
   font-weight: 600;
 }
+.mint-pct-prefix {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 17px;
+  font-weight: 750;
+}
+.mint-pct-input:has(input:disabled) {
+  opacity: 0.68;
+}
+.mint-usd-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 7px;
+}
+.mint-usd-note {
+  margin: 0 2px;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.mint-usd-apply { flex: 0 0 auto; }
 .mint-pct-price {
   font-family: var(--mono);
   font-size: 13.5px;
@@ -5660,6 +5683,7 @@ input:focus-visible, select:focus-visible, select:focus {
 .flow-apr-min-setting { gap: 7px; }
 .flow-min-apply { min-height: 30px; padding-inline: 9px; }
 .flow-updated { font-size: 13px; }
+.flow-updated.delayed { color: var(--warn, #b97800); font-weight: 700; }
 .flow-discovery-bar {
   display: flex;
   align-items: center;

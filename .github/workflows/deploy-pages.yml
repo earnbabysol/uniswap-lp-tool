@@ -4,7 +4,8 @@ on:
   push:
     branches: [master]
   schedule:
-    - cron: '*/10 * * * *'
+    # 避开整 5/10 分钟的 Actions 高峰；客户端会在漏跑超过 18 分钟时实时补刷。
+    - cron: '3-58/5 * * * *'
   workflow_dispatch:
 
 permissions:

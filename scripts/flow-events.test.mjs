@@ -5,6 +5,10 @@ import {
   takeFlowPoolEvents,
   toggleFlowChainSelection,
 } from '../src/flowSelection.ts'
+import {
+  FLOW_SHARED_INDEX_FRESH_MS,
+  isSharedFlowIndexFresh,
+} from '../src/flowIndex.ts'
 
 const address = (suffix) => `0x${suffix.padStart(40, '0')}`
 const hash = (suffix) => `0x${suffix.padStart(64, '0')}`
@@ -68,5 +72,10 @@ assert.deepEqual(parseFlowChainSelection('bad json'), [1, 56, 4663, 8453])
 assert.deepEqual(toggleFlowChainSelection([1, 8453], 1), [8453])
 assert.deepEqual(toggleFlowChainSelection([8453], 8453), [8453], 'the last selected chain is retained')
 assert.deepEqual(toggleFlowChainSelection([56], 1), [1, 56])
+
+const now = 1_800_000_000_000
+assert.equal(isSharedFlowIndexFresh(now - FLOW_SHARED_INDEX_FRESH_MS, now), true)
+assert.equal(isSharedFlowIndexFresh(now - FLOW_SHARED_INDEX_FRESH_MS - 1, now), false)
+assert.equal(isSharedFlowIndexFresh(Number.NaN, now), false)
 
 console.log('flow event selection tests passed')
