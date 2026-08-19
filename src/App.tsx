@@ -59,6 +59,7 @@ import {
   mintV4Position,
   mintV4DlmmPositions,
   pairHasWeth,
+  parsePoolInput,
   recordPositionClaim,
   removeV3Liquidity,
   removeV4Liquidity,
@@ -82,6 +83,7 @@ import {
   type PoolInfo,
   type PositionRow,
 } from './lp'
+import { detectV4PoolChain } from './v4PoolChain'
 import { RangeDepthChart } from './RangeDepthChart'
 import { PositionDetailCard, estimateRebalanceHalfPercent } from './PositionDetailCard'
 import { PositionLegs } from './PositionLegs'
@@ -1113,7 +1115,10 @@ export default function App() {
     return merged
   }, [address, refreshBalances])
 
-  const onSwitchChain = (nextId: SupportedChainId) => {
+  const onSwitchChain = (
+    nextId: SupportedChainId,
+    options?: { preservePoolInput?: string },
+  ) => {
     if (nextId === chainId) return
     // 立刻作废进行中的刷新，避免旧链结果写回新链
     refreshGenRef.current += 1
@@ -1136,7 +1141,7 @@ export default function App() {
       setScannedPools([])
       setPositions([])
       setSelectedId(null)
-      setPoolInput('')
+      setPoolInput(options?.preservePoolInput ?? '')
       setAmount0('')
       setAmount1('')
       setInitPrice('')
@@ -1727,8 +1732,23 @@ export default function App() {
     }
     setBusy(true)
     setStatus('解析并加载池子…')
+    let autoDetectedChain: string | null = null
     try {
-      const info = await loadPoolFromInput(poolInput)
+      const parsedInput = parsePoolInput(raw)
+      if (parsedInput?.kind === 'v4') {
+        const activeChainId = getActiveChainId()
+        setStatus(`正在确认 V4 poolId 所在网络（当前 ${getActiveChainConfig().label}）…`)
+        const detected = await detectV4PoolChain(parsedInput.poolId, activeChainId)
+        if (detected && detected.chainId !== activeChainId) {
+          autoDetectedChain = detected.label
+          onSwitchChain(detected.chainId, { preservePoolInput: raw })
+          // onSwitchChain 会重置链相关状态；本次加载仍继续使用原始 poolId。
+          setPoolInput(raw)
+          setBusy(true)
+          setStatus(`已识别：该池位于 ${detected.label}，正在自动切换并加载…`)
+        }
+      }
+      const info = await loadPoolFromInput(raw)
       setDiscovered(null)
       setPool(info)
       if (info.version === 'v4') setMintProtocol('v4')
@@ -1761,9 +1781,15 @@ export default function App() {
           ? ' · hooks 空（若币种限制 PoolManager 结算，可能无法组 LP）'
           : ''
       setStatus(
-        `已加载 ${tag} · ${q.coin.symbol}/${q.quote.symbol} · Fee ${feePct}%${spacingNote}${hooksNote} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`,
+        `${autoDetectedChain ? `已自动切到 ${autoDetectedChain} · ` : ''}已加载 ${tag} · ${q.coin.symbol}/${q.quote.symbol} · Fee ${feePct}%${spacingNote}${hooksNote} · 币价 ${formatPrice(q.spot)} ${q.quote.symbol}/${q.coin.symbol}`,
       )
     } catch (e) {
+      // 完整 poolId 已经走过链上跨链探测；不要再把它当币名丢给市场搜索，
+      // 否则一个明确的“未初始化 / RPC”错误还会额外等待索引超时。
+      if (parsePoolInput(raw)?.kind === 'v4') {
+        setStatus(e instanceof Error ? e.message : String(e))
+        return
+      }
       // 非链接文本（币名/符号/CA）走市场索引搜索；命中后让用户选池。
       try {
         setDiscovering(true)

@@ -1329,6 +1329,24 @@ async function resolveV4PoolKeyFromId(poolId: `0x${string}`): Promise<{
     console.warn('V4 poolKeys() lookup failed', e)
   }
 
+  // poolId 不携带 chainId。先用 StateView 做一次廉价存在性检查：如果当前链
+  // 明确返回未初始化，就不要再从创世块扫描日志（Base 公共 RPC 会慢且常 429）。
+  try {
+    const slot0 = await publicClient.readContract({
+      address: CONTRACTS.v4StateView,
+      abi: v4StateViewAbi,
+      functionName: 'getSlot0',
+      args: [id],
+    })
+    if (!((slot0[0] as bigint) > 0n)) {
+      throw new Error(`该 V4 poolId 未在 ${chainLabel} 初始化`)
+    }
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith('该 V4 poolId 未在')) throw e
+    // StateView 本身不可用时仍保留日志兜底，避免把临时 RPC 故障误判成无池。
+    console.warn('V4 StateView existence check failed', e)
+  }
+
   try {
     const logs = await publicClient.getLogs({
       address: CONTRACTS.v4PoolManager,
