@@ -1,5 +1,5 @@
 /**
- * LP 资金动向：Uniswap V3 + V4（BSC / Robinhood / Base）。
+ * LP 资金动向：Uniswap V3 + V4（Ethereum / BSC / Robinhood / Base）。
  * V3：Subgraph 可选 + NPM 日志；V4：PoolManager.ModifyLiquidity。
  * The Graph API Key 非必须。
  */
@@ -31,11 +31,14 @@ import {
 import { fetchJson } from './async'
 import { CHAIN_CONFIGS, type SupportedChainId } from './chain'
 import { loadGraphApiKey } from './graphSettings'
-import { checkPoolTokensSafe, isHoneypotWhitelisted } from './honeypot'
+import { checkTokenSafe, isHoneypotWhitelisted } from './honeypot'
 import { Q96, getAmountsForPosition, rawToNumber, tickToPrice } from './math'
 import { loadCustomRpcUrl } from './rpcSettings'
 import { classifyRpcError, readLogsAdaptive, runRpcTask } from './rpcScheduler'
-import { takeFlowPoolEvents, type FlowSelectableChainId } from './flowSelection'
+import {
+  FLOW_SELECTABLE_CHAIN_IDS,
+  takeFlowPoolEvents,
+} from './flowSelection'
 import { loadSharedFlowIndex } from './flowIndex'
 
 export { takeFlowPoolEvents } from './flowSelection'
@@ -43,8 +46,10 @@ export { takeFlowPoolEvents } from './flowSelection'
 const DEV_MODE = Boolean(import.meta.env?.DEV)
 
 /** 动向支持的链 */
-export const FLOW_CHAIN_IDS = [56, 4663, 8453] as const satisfies readonly FlowSelectableChainId[]
+export const FLOW_CHAIN_IDS = FLOW_SELECTABLE_CHAIN_IDS
 export type FlowChainId = (typeof FLOW_CHAIN_IDS)[number]
+/** 列表与共享索引均按每条链独立保留池额度，新增链不会挤掉旧链。 */
+export const FLOW_POOL_LIMIT_PER_CHAIN = 60
 
 export type FlowSide = 'in' | 'out'
 export type FlowVersion = 'v3' | 'v4'
@@ -158,8 +163,8 @@ const EVENT_TTL_MS = FLOW_WINDOW_MINUTES * 60_000
 const WETH_USD_TTL_MS = 5 * 60_000
 /** 年化依赖 Swap getLogs，TTL 拉长减轻公共 RPC / 主线程压力 */
 const APR_TTL_MS = 180_000
-/** DexScreener 精确池批量查询覆盖完整可见榜单。 */
-const APR_POOL_LIMIT = 60
+/** DexScreener 精确池批量查询按链覆盖完整可见榜单。 */
+const APR_POOL_LIMIT_PER_CHAIN = FLOW_POOL_LIMIT_PER_CHAIN
 /** 模块级 Map 上限，防止长挂动向页缓涨内存 */
 const POS_CACHE_CAP = 800
 const POOL_CACHE_CAP = 600
@@ -167,10 +172,11 @@ const META_CACHE_CAP = 1_200
 const V4_POOL_CACHE_CAP = 600
 
 /**
- * 约 45 分钟的初次窗口。BSC/Robinhood 为高频出块，Base 约 2 秒；时间戳
- * 会再用窗口首尾区块动态校准，所以这里只需留出少量窗口余量。
+ * 约 45 分钟的初次窗口。Ethereum 约 12 秒、Base 约 2 秒，BSC/Robinhood
+ * 为高频出块；时间戳会再用窗口首尾区块动态校准。
  */
 const LOG_SCAN: Record<FlowChainId, { lookback: bigint; span: bigint; reorg: bigint }> = {
+  1: { lookback: 280n, span: 280n, reorg: 8n },
   56: { lookback: 7_000n, span: 5_000n, reorg: 24n },
   4663: { lookback: 30_000n, span: 30_000n, reorg: 120n },
   8453: { lookback: 1_800n, span: 900n, reorg: 12n },
@@ -179,6 +185,7 @@ const LOG_SCAN: Record<FlowChainId, { lookback: bigint; span: bigint; reorg: big
 // Swap 比 NPM/ModifyLiquidity 密集几个数量级，不能沿用普通动向日志的大跨度；
 // 否则公共 RPC 会把“结果过多”也当成 429。小块串行更稳定。
 const APR_LOG_SPAN: Record<FlowChainId, bigint> = {
+  1: 200n,
   56: 1_500n,
   4663: 5_000n,
   8453: 600n,
@@ -211,6 +218,19 @@ type ChainLogCache = {
 }
 
 const logCaches: Record<FlowChainId, ChainLogCache> = {
+  1: {
+    tip: 0n,
+    events: [],
+    pos: new Map(),
+    pools: new Map(),
+    meta: new Map(),
+    metaPending: new Map(),
+    wethUsd: 0,
+    wethUsdAt: 0,
+    wethUsdPromise: null,
+    client: null,
+    clientKey: '',
+  },
   56: {
     tip: 0n,
     events: [],
@@ -253,6 +273,7 @@ const logCaches: Record<FlowChainId, ChainLogCache> = {
 }
 
 const receiptCaches: Record<FlowChainId, Map<string, Promise<TransactionReceipt>>> = {
+  1: new Map(),
   56: new Map(),
   4663: new Map(),
   8453: new Map(),
@@ -278,6 +299,7 @@ type V4Cache = {
 }
 
 const v4Caches: Record<FlowChainId, V4Cache> = {
+  1: { tip: 0n, events: [], pools: new Map() },
   56: { tip: 0n, events: [], pools: new Map() },
   4663: { tip: 0n, events: [], pools: new Map() },
   8453: { tip: 0n, events: [], pools: new Map() },
@@ -418,6 +440,7 @@ function flowMarketKey(chainId: FlowChainId, token: Address): string {
 }
 
 function dexScreenerChain(chainId: FlowChainId): string {
+  if (chainId === 1) return 'ethereum'
   if (chainId === 56) return 'bsc'
   if (chainId === 8453) return 'base'
   return 'robinhood'
@@ -584,6 +607,7 @@ type ScanHead = {
 }
 
 const scanHeadCaches: Record<FlowChainId, { at: number; promise: Promise<ScanHead> | null }> = {
+  1: { at: 0, promise: null },
   56: { at: 0, promise: null },
   4663: { at: 0, promise: null },
   8453: { at: 0, promise: null },
@@ -703,12 +727,12 @@ function addressTopic(address: Address): Hex {
   return pad(address, { size: 32 })
 }
 
-type IndexedFlowChainId = Extract<FlowChainId, 4663 | 8453>
+type IndexedFlowChainId = Extract<FlowChainId, 1 | 4663 | 8453>
 
 /**
- * Robinhood's public RPC is heavily rate limited and Base's public archive
- * access is inconsistent. Both chains expose indexed logs through Blockscout,
- * so selective historical V3/V4 movement scans do not need eth_getLogs first.
+ * Ethereum / Base public archive access is inconsistent and Robinhood's public
+ * RPC is heavily rate limited. All three expose selective logs through
+ * Blockscout, so movement scans do not need eth_getLogs first.
  */
 async function readIndexedV2Logs<TArgs>(opts: {
   chainId: IndexedFlowChainId
@@ -895,7 +919,10 @@ async function readIndexedRpcApiLogs<TArgs>(opts: {
       topics: raw.topics,
       transaction_hash: raw.transactionHash,
     }))
-    if (rows.length >= 1_000 && fromBlock < toBlock) {
+    if (rows.length >= 1_000) {
+      if (fromBlock >= toBlock) {
+        throw new Error(`Blockscout ${opts.label} 单区块日志超过 1000 条`)
+      }
       const middle = fromBlock + (toBlock - fromBlock) / 2n
       const [left, right] = await Promise.all([
         readRange(fromBlock, middle),
@@ -982,9 +1009,9 @@ async function readIndexedLogs<TArgs>(opts: {
 }
 
 /**
- * Robinhood prefers Blockscout because its public RPC is intentionally tiny.
- * Base does the reverse: the official RPC handles the selective 45-minute
- * ranges quickly, while anonymous Blockscout is kept as a fallback only.
+ * Ethereum / Base / Robinhood prefer selective Blockscout logs and retain a
+ * bounded public-RPC fallback. Shared indexing keeps this work off browsers in
+ * the normal path.
  */
 async function readFlowLogs<TArgs>(opts: {
   chainId: FlowChainId
@@ -1013,13 +1040,12 @@ async function readFlowLogs<TArgs>(opts: {
     request: opts.request,
   })
 
-  if (opts.chainId === 8453) {
-    // Base 官方公共 RPC 对 V3+V4 并行扫描很容易 429；有 explorer 地址时
-    // 优先 Blockscout，失败再退回 RPC（与 Robinhood 同思路）。
+  if (opts.chainId === 1 || opts.chainId === 8453) {
+    // Ethereum / Base 有 explorer 地址时优先 Blockscout，失败再退回 RPC。
     if (opts.explorerAddress && opts.preferIndexer !== false) {
       try {
         return await readIndexedLogs<TArgs>({
-          chainId: 8453,
+          chainId: opts.chainId,
           event: opts.event,
           address: opts.explorerAddress,
           indexedTopics: opts.explorerIndexedTopics,
@@ -1030,7 +1056,7 @@ async function readFlowLogs<TArgs>(opts: {
       } catch (indexerError) {
         if (DEV_MODE) {
           console.debug(
-            `[flow] ${opts.label} Base Blockscout 转入 RPC：${friendlyErrorText(indexerError)}`,
+            `[flow] ${opts.label} ${flowChainLabel(opts.chainId)} Blockscout 转入 RPC：${friendlyErrorText(indexerError)}`,
           )
         }
       }
@@ -1508,10 +1534,10 @@ async function fetchNpmLogsRange(
         toBlock: to,
       }),
     })
-    // Robinhood movement logs use the independent Blockscout indexer lane, so
-    // both selective queries can run together. Keep BSC RPC streams serial to
-    // avoid recreating its 429 burst.
-    const [incs, decs] = chainId === 4663
+    // Ethereum / Robinhood movement logs use the independent Blockscout lane,
+    // so both selective queries can be queued together. Keep BSC RPC streams
+    // serial to avoid recreating its 429 burst.
+    const [incs, decs] = chainId === 1 || chainId === 4663
       ? await Promise.all([readIncs(), readDecs()])
       : [await readIncs(), await readDecs()]
     const rows: RawLog[] = []
@@ -2635,42 +2661,31 @@ async function fetchBscFlow(opts: {
 }
 
 async function filterHoneypotFast(events: FlowEvent[]): Promise<FlowEvent[]> {
-  const pairOk = new Map<string, boolean>()
-  const uniq: Array<{ key: string; chainId: SupportedChainId; t0: Address; t1: Address }> = []
+  const tokenOk = new Map<string, boolean>()
+  const pending = new Map<string, { key: string; chainId: SupportedChainId; token: Address }>()
   for (const e of events) {
-    const key = `${e.chainId}:${e.token0.toLowerCase()}:${e.token1.toLowerCase()}`
-    if (pairOk.has(key)) continue
-    const t0 = asErc20(e.chainId, e.token0)
-    const t1 = asErc20(e.chainId, e.token1)
-    if (
-      isHoneypotWhitelisted(e.chainId as SupportedChainId, t0)
-      && isHoneypotWhitelisted(e.chainId as SupportedChainId, t1)
-    ) {
-      pairOk.set(key, true)
-      continue
+    for (const rawToken of [e.token0, e.token1]) {
+      const token = asErc20(e.chainId, rawToken)
+      const key = `${e.chainId}:${token.toLowerCase()}`
+      if (tokenOk.has(key) || pending.has(key)) continue
+      if (e.chainId === 4663 || isHoneypotWhitelisted(e.chainId, token)) {
+        tokenOk.set(key, true)
+      } else {
+        pending.set(key, { key, chainId: e.chainId, token })
+      }
     }
-    if (e.chainId === 4663) {
-      pairOk.set(key, true)
-      continue
-    }
-    uniq.push({
-      key,
-      chainId: e.chainId as SupportedChainId,
-      t0,
-      t1,
-    })
   }
 
-  await mapPool(uniq, 10, async (u) => {
-    const ok = await checkPoolTokensSafe(u.chainId, u.t0, u.t1)
-    pairOk.set(u.key, ok)
-    return ok
+  await mapPool([...pending.values()], 10, async (row) => {
+    const result = await checkTokenSafe(row.chainId, row.token)
+    tokenOk.set(row.key, result.ok)
+    return result.ok
   })
 
-  return events.filter((e) => {
-    const key = `${e.chainId}:${e.token0.toLowerCase()}:${e.token1.toLowerCase()}`
-    return pairOk.get(key) !== false
-  })
+  return events.filter((event) => [event.token0, event.token1].every((rawToken) => {
+    const token = asErc20(event.chainId, rawToken)
+    return tokenOk.get(`${event.chainId}:${token.toLowerCase()}`) !== false
+  }))
 }
 
 function absBigint(value: bigint): bigint {
@@ -3172,9 +3187,15 @@ async function enrichFlowApr(events: FlowEvent[]): Promise<{
 
   // Exact pair ids are batched by DexScreener, so this covers the complete
   // visible list without dozens of per-pool eth_getLogs calls.
-  const ranked = [...pendingPools.entries()]
-    .sort((a, b) => b[1].amountUsd - a[1].amountUsd)
-    .slice(0, APR_POOL_LIMIT)
+  const ranked: Array<[string, FlowEvent]> = []
+  const rankedPerChain = new Map<FlowChainId, number>()
+  for (const row of [...pendingPools.entries()].sort((a, b) => b[1].amountUsd - a[1].amountUsd)) {
+    const chainId = row[1].chainId
+    const count = rankedPerChain.get(chainId) ?? 0
+    if (count >= APR_POOL_LIMIT_PER_CHAIN) continue
+    ranked.push(row)
+    rankedPerChain.set(chainId, count + 1)
+  }
   const pending = new Map<string, FlowEvent[]>()
   for (const [key, sample] of ranked) {
     const groupKey = `${sample.chainId}:${sample.version}`
@@ -3462,7 +3483,9 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
   }
   const requestedMin = opts.minUsd ?? 100
   const minUsd = Number.isFinite(requestedMin) ? Math.max(0, requestedMin) : 100
-  const limit = Math.min(100, Math.max(1, Math.floor(opts.limit ?? 30)))
+  const maxPoolsForSelection = FLOW_POOL_LIMIT_PER_CHAIN * Math.max(1, opts.chainIds.length)
+  const limit = Math.min(maxPoolsForSelection, Math.max(1, Math.floor(opts.limit ?? 30)))
+  const perChainLimit = Math.min(FLOW_POOL_LIMIT_PER_CHAIN, limit)
   const filterHp = opts.filterHoneypot !== false
   const notices: FlowNotice[] = []
   const parts: FlowEvent[] = []
@@ -3495,9 +3518,23 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
   publishBase(takeFlowPoolEvents(cached, opts.chainIds, limit), [])
 
   const jobs: Promise<void>[] = []
+  if (opts.chainIds.includes(1)) {
+    // Mainnet 的 V3/V4 都优先走共享 Blockscout 配额，串行可避免首次索引时
+    // 四条日志流互相限速；V4 更轻，先发布可用池列表。
+    jobs.push((async () => {
+      const v4 = await timedSource('Ethereum V4', fetchV4FlowLogs(1, { minUsd, limit: perChainLimit }))
+      if (v4.error) notices.push({ level: 'error', message: `Ethereum V4：${v4.error}` })
+      parts.push(...v4.events)
+      publishCollectedParts()
+      const v3 = await timedSource('Ethereum V3', fetchNpmFlowLogs(1, { minUsd, limit: perChainLimit }))
+      if (v3.error) notices.push({ level: 'error', message: `Ethereum V3：${v3.error}` })
+      parts.push(...v3.events)
+      publishCollectedParts()
+    })())
+  }
   if (opts.chainIds.includes(56)) {
     jobs.push(
-      timedSource('BSC V3', fetchBscFlow({ minUsd, limit })).then((r) => {
+      timedSource('BSC V3', fetchBscFlow({ minUsd, limit: perChainLimit })).then((r) => {
         if (r.note) notices.push({ level: 'warning', message: r.note })
         if (r.error) notices.push({ level: 'error', message: `BSC V3：${r.error}` })
         parts.push(...r.events)
@@ -3505,7 +3542,7 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
       }),
     )
     jobs.push(
-      timedSource('BSC V4', fetchV4FlowLogs(56, { minUsd, limit })).then((r) => {
+      timedSource('BSC V4', fetchV4FlowLogs(56, { minUsd, limit: perChainLimit })).then((r) => {
         if (r.error) notices.push({ level: 'error', message: `BSC V4：${r.error}` })
         parts.push(...r.events)
         publishCollectedParts()
@@ -3516,14 +3553,14 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
     // V4 needs only one selective log stream and much less metadata than V3.
     // Start it first so a useful pool list can paint while V3 NFTs resolve.
     jobs.push(
-      timedSource('Robinhood V4', fetchV4FlowLogs(4663, { minUsd, limit })).then((result) => {
+      timedSource('Robinhood V4', fetchV4FlowLogs(4663, { minUsd, limit: perChainLimit })).then((result) => {
         if (result.error) notices.push({ level: 'error', message: `Robinhood V4：${result.error}` })
         parts.push(...result.events)
         publishCollectedParts()
       }),
     )
     jobs.push(
-      timedSource('Robinhood V3', fetchNpmFlowLogs(4663, { minUsd, limit })).then((result) => {
+      timedSource('Robinhood V3', fetchNpmFlowLogs(4663, { minUsd, limit: perChainLimit })).then((result) => {
         if (result.error) notices.push({ level: 'error', message: `Robinhood V3：${result.error}` })
         parts.push(...result.events)
         publishCollectedParts()
@@ -3533,11 +3570,11 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
   if (opts.chainIds.includes(8453)) {
     // Base 公共配额很紧：V4 与 V3 绝不能并行抢同一 RPC，否则必 429 且拖到几分钟。
     jobs.push((async () => {
-      const v4 = await timedSource('Base V4', fetchV4FlowLogs(8453, { minUsd, limit }))
+      const v4 = await timedSource('Base V4', fetchV4FlowLogs(8453, { minUsd, limit: perChainLimit }))
       if (v4.error) notices.push({ level: 'error', message: `Base V4：${v4.error}` })
       parts.push(...v4.events)
       publishCollectedParts()
-      const v3 = await timedSource('Base V3', fetchNpmFlowLogs(8453, { minUsd, limit }))
+      const v3 = await timedSource('Base V3', fetchNpmFlowLogs(8453, { minUsd, limit: perChainLimit }))
       if (v3.error) notices.push({ level: 'error', message: `Base V3：${v3.error}` })
       parts.push(...v3.events)
       publishCollectedParts()
@@ -3607,6 +3644,7 @@ export function flowChainLabel(chainId: FlowChainId): string {
 
 /** 动向卡片用的短链名，缩放时也不容易被挤没 */
 export function flowChainCompact(chainId: FlowChainId): string {
+  if (chainId === 1) return 'ETH'
   if (chainId === 56) return 'BSC'
   if (chainId === 4663) return 'RH'
   return 'Base'

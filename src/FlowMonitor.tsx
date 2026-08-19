@@ -3,6 +3,7 @@ import type { Address } from 'viem'
 import {
   FLOW_WINDOW_MINUTES,
   FLOW_CHAIN_IDS,
+  FLOW_POOL_LIMIT_PER_CHAIN,
   fetchFlowEvents,
   flowChainCompact,
   flowChainLabel,
@@ -14,9 +15,12 @@ import {
   type FlowSide,
   type FlowVersion,
 } from './flowEvents'
+import {
+  parseFlowChainSelection,
+  toggleFlowChainSelection,
+} from './flowSelection'
 import { shortAddr } from './wallet'
 
-type ChainFilter = 'all' | FlowChainId
 type SideFilter = 'all' | FlowSide
 type VersionFilter = 'all' | FlowVersion
 type SortMode = 'apr' | 'inflow' | 'net' | 'volume' | 'latest'
@@ -192,7 +196,16 @@ export type FlowMonitorProps = {
   onOpenPool: (args: OpenFlowPoolArgs) => void
 }
 
-const FLOW_POOL_LIMIT_PER_CHAIN = 60
+const FLOW_CHAIN_SELECTION_KEY = 'rangedesk.flow-chains.v1'
+
+function readFlowChainSelection(): FlowChainId[] {
+  if (typeof localStorage === 'undefined') return [...FLOW_CHAIN_IDS]
+  try {
+    return parseFlowChainSelection(localStorage.getItem(FLOW_CHAIN_SELECTION_KEY))
+  } catch {
+    return [...FLOW_CHAIN_IDS]
+  }
+}
 
 function flowPoolCount(events: FlowEvent[]): number {
   return new Set(events.map((event) =>
@@ -200,7 +213,7 @@ function flowPoolCount(events: FlowEvent[]): number {
 }
 
 export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
-  const [chainFilter, setChainFilter] = useState<ChainFilter>('all')
+  const [selectedChains, setSelectedChains] = useState<FlowChainId[]>(readFlowChainSelection)
   const [sideFilter, setSideFilter] = useState<SideFilter>('all')
   const [versionFilter, setVersionFilter] = useState<VersionFilter>('all')
   const [sortMode, setSortMode] = useState<SortMode>('apr')
@@ -227,12 +240,14 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
   const runningGenRef = useRef(0)
   const rerunRef = useRef(false)
   const loadRef = useRef<() => Promise<void>>(async () => {})
-  const optionsRef = useRef({ chainFilter, minUsd, filterHp })
-  optionsRef.current = { chainFilter, minUsd, filterHp }
+  const selectedChainKey = selectedChains.join(',')
+  const selectedChainSet = useMemo(() => new Set<FlowChainId>(selectedChains), [selectedChains])
+  const optionsRef = useRef({ chainIds: selectedChains, minUsd, filterHp })
+  optionsRef.current = { chainIds: selectedChains, minUsd, filterHp }
 
   const load = useCallback(async () => {
     const options = optionsRef.current
-    const key = `${options.chainFilter}:${options.minUsd}:${options.filterHp}`
+    const key = `${options.chainIds.join(',')}:${options.minUsd}:${options.filterHp}`
     if (runningRef.current) {
       // 定时器/连点不叠加同一请求；筛选条件变了则废弃旧结果，结束后补跑最新条件。
       if (key !== runningKeyRef.current) {
@@ -252,8 +267,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
     setBusy(true)
     setLoadStage('正在读取共享索引…')
     const t0 = performance.now()
-    const chainIds: FlowChainId[] =
-      options.chainFilter === 'all' ? [...FLOW_CHAIN_IDS] : [options.chainFilter]
+    const chainIds: FlowChainId[] = [...options.chainIds]
     try {
       let rows: FlowEvent[]
       let nextNotices: FlowNotice[]
@@ -371,8 +385,17 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
   }, [])
 
   useEffect(() => {
-    void load()
-  }, [chainFilter, minUsd, filterHp, load])
+    const timer = window.setTimeout(() => void load(), 120)
+    return () => window.clearTimeout(timer)
+  }, [selectedChainKey, minUsd, filterHp, load])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(FLOW_CHAIN_SELECTION_KEY, JSON.stringify(selectedChains))
+    } catch {
+      /* private mode / storage quota */
+    }
+  }, [selectedChains])
 
   useEffect(() => {
     if (!auto) return
@@ -395,9 +418,8 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
   const pools = useMemo(() => {
     const grouped = new Map<string, FlowPoolRow>()
     for (const event of events) {
-      // 切换单链时，旧请求可能仍在结束阶段；UI 必须立刻隐藏另一条链的缓存，
-      // 不能让“BSC”筛选短暂显示 Robinhood 行。
-      if (chainFilter !== 'all' && event.chainId !== chainFilter) continue
+      // 组合变化时旧请求可能仍在结束阶段；UI 必须立即隐藏未选链缓存。
+      if (!selectedChainSet.has(event.chainId)) continue
       if (versionFilter !== 'all' && event.version !== versionFilter) continue
       const poolRef = flowPoolRef(event)
       const key = `${event.chainId}:${event.version}:${poolRef.toLowerCase()}`
@@ -451,7 +473,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
       }
     }
     return [...grouped.values()]
-  }, [chainFilter, events, versionFilter])
+  }, [events, selectedChainSet, versionFilter])
 
   const visible = useMemo(() => {
     const query = search.trim().toLowerCase()
@@ -517,6 +539,11 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
     setMinUsd(next)
   }
 
+  const allChainsSelected = selectedChains.length === FLOW_CHAIN_IDS.length
+  const toggleChain = (chainId: FlowChainId) => {
+    setSelectedChains((current) => toggleFlowChainSelection(current, chainId))
+  }
+
   const warningMessages = notices.filter((notice) => notice.level === 'warning')
   const errorMessages = notices.filter((notice) => notice.level === 'error')
 
@@ -526,7 +553,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         <div>
           <h2 className="pos-page-title">LP 资金动向</h2>
           <p className="muted pos-page-sub">
-            最近 {FLOW_WINDOW_MINUTES} 分钟 · Uniswap V3 + V4 · BSC / Robinhood / Base 开/加仓与撤出
+            最近 {FLOW_WINDOW_MINUTES} 分钟 · Uniswap V3 + V4 · Ethereum / BSC / Robinhood / Base 开/加仓与撤出
           </p>
           <p className="flow-trust-note">
             默认按手续费年化从高到低。年化优先采用 DexScreener 24h 成交量 × 池费率 ÷ 当前流动性 × 365；
@@ -550,21 +577,35 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
       </div>
 
       <div className="flow-filters">
-        <label className="inline-setting">
-          链
-          <select
-            value={chainFilter === 'all' ? 'all' : String(chainFilter)}
-            onChange={(e) => {
-              const v = e.target.value
-              setChainFilter(v === 'all' ? 'all' : (Number(v) as FlowChainId))
-            }}
+        <div className="flow-chain-selector" role="group" aria-label="选择监控链">
+          <span className="flow-chain-caption">链</span>
+          <button
+            type="button"
+            className={`btn ghost tight flow-chain-choice all ${allChainsSelected ? 'selected' : ''}`}
+            aria-pressed={allChainsSelected}
+            onClick={() => setSelectedChains([...FLOW_CHAIN_IDS])}
           >
-            <option value="all">全部（BSC + Robinhood + Base）</option>
-            <option value="56">BSC</option>
-            <option value="4663">Robinhood</option>
-            <option value="8453">Base</option>
-          </select>
-        </label>
+            全部
+          </button>
+          {FLOW_CHAIN_IDS.map((chainId) => {
+            const selected = selectedChainSet.has(chainId)
+            const lastSelected = selected && selectedChains.length === 1
+            return (
+              <button
+                key={chainId}
+                type="button"
+                className={`btn ghost tight flow-chain-choice chain-${chainId} ${selected ? 'selected' : ''}`}
+                aria-pressed={selected}
+                title={lastSelected ? '至少保留一条监控链' : `${selected ? '取消' : '加入'} ${flowChainLabel(chainId)}`}
+                onClick={() => toggleChain(chainId)}
+              >
+                <span className="flow-chain-dot" aria-hidden="true" />
+                {flowChainLabel(chainId)}
+              </button>
+            )
+          })}
+          <span className="muted flow-chain-count">已选 {selectedChains.length} 条</span>
+        </div>
         <label className="inline-setting">
           协议
           <select value={versionFilter} onChange={(e) => setVersionFilter(e.target.value as VersionFilter)}>
@@ -647,7 +688,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
               />
               仅看有效样本
             </label>
-            <label className="inline-setting check" title="仅过滤风险接口明确判定的 BSC 貔貅；Base / Robinhood 未知代币不会误杀">
+            <label className="inline-setting check" title="过滤风险接口明确判定的 ETH / BSC 貔貅；Base / Robinhood 未知代币不会误杀">
               <input type="checkbox" checked={filterHp} onChange={(e) => setFilterHp(e.target.checked)} />
               过滤已确认貔貅
             </label>

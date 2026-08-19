@@ -113,6 +113,11 @@ export function rpcBackoffMs(
 }
 
 function laneConfig(chainId: number, lane: RpcLane): { concurrency: number; intervalMs: number } {
+  if (chainId === 1 && lane === 'indexer') {
+    // Ethereum 动向优先走 Blockscout。顺序处理高选择性日志，避免 NPM 与
+    // PoolManager 同时消耗匿名配额；普通主网 RPC 读取仍走下方默认并发。
+    return { concurrency: 1, intervalMs: 180 }
+  }
   if (chainId === 56) {
     return lane === 'logs'
       ? { concurrency: 1, intervalMs: 220 }

@@ -5949,6 +5949,58 @@ input:focus-visible, select:focus-visible, select:focus {
   font-size: 12.5px;
 }
 .flow-filters select { min-height: 32px; }
+.flow-chain-selector {
+  display: flex;
+  flex: 1 0 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--line-soft, var(--line));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--card) 82%, var(--dash-fill));
+}
+.flow-chain-caption {
+  padding: 0 3px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.flow-chain-choice {
+  gap: 6px;
+  min-height: 30px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 680;
+}
+.flow-chain-choice.selected {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
+  background: color-mix(in srgb, var(--accent) 13%, var(--card));
+  color: var(--ink);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.flow-chain-choice:not(.selected) { opacity: 0.72; }
+.flow-chain-choice:not(.selected):hover { opacity: 1; }
+.flow-chain-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 8%, transparent);
+}
+.flow-chain-choice.chain-1 .flow-chain-dot { background: #627eea; }
+.flow-chain-choice.chain-56 .flow-chain-dot { background: #f0b90b; }
+.flow-chain-choice.chain-4663 .flow-chain-dot { background: #5b8def; }
+.flow-chain-choice.chain-8453 .flow-chain-dot { background: #0052ff; }
+.flow-chain-count {
+  margin-left: auto;
+  padding-right: 3px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
 .flow-min-input {
   min-height: 32px;
   padding: 5px 8px;
@@ -6110,6 +6162,10 @@ input:focus-visible, select:focus-visible, select:focus {
 .flow-chain-badge.chain-56 {
   background: color-mix(in srgb, #f0b90b 22%, var(--card));
   color: #8a6a00;
+}
+.flow-chain-badge.chain-1 {
+  background: color-mix(in srgb, #627eea 20%, var(--card));
+  color: #3e58b5;
 }
 .flow-chain-badge.chain-4663 {
   background: color-mix(in srgb, #5b8def 20%, var(--card));
@@ -6355,6 +6411,9 @@ input:focus-visible, select:focus-visible, select:focus {
 }
 
 @media (max-width: 560px) {
+  .flow-chain-selector { gap: 5px; padding: 6px; }
+  .flow-chain-choice { padding-inline: 8px; }
+  .flow-chain-count { display: none; }
   .flow-overview { grid-template-columns: 1fr; }
   .flow-discovery-bar {
     grid-template-columns: minmax(0, 1fr) auto;

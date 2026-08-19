@@ -1,4 +1,42 @@
-export type FlowSelectableChainId = 56 | 4663 | 8453
+export const FLOW_SELECTABLE_CHAIN_IDS = [1, 56, 4663, 8453] as const
+export type FlowSelectableChainId = (typeof FLOW_SELECTABLE_CHAIN_IDS)[number]
+
+const FLOW_SELECTABLE_CHAIN_SET = new Set<number>(FLOW_SELECTABLE_CHAIN_IDS)
+
+export function isFlowSelectableChainId(value: unknown): value is FlowSelectableChainId {
+  return typeof value === 'number' && FLOW_SELECTABLE_CHAIN_SET.has(value)
+}
+
+/** Canonical order keeps combinations stable for cache keys and the UI. */
+export function normalizeFlowChainSelection(values: readonly unknown[]): FlowSelectableChainId[] {
+  const selected = new Set(values.filter(isFlowSelectableChainId))
+  const normalized = FLOW_SELECTABLE_CHAIN_IDS.filter((chainId) => selected.has(chainId))
+  return normalized.length > 0 ? [...normalized] : [...FLOW_SELECTABLE_CHAIN_IDS]
+}
+
+export function parseFlowChainSelection(raw: string | null): FlowSelectableChainId[] {
+  if (!raw) return [...FLOW_SELECTABLE_CHAIN_IDS]
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    return Array.isArray(parsed)
+      ? normalizeFlowChainSelection(parsed)
+      : [...FLOW_SELECTABLE_CHAIN_IDS]
+  } catch {
+    return [...FLOW_SELECTABLE_CHAIN_IDS]
+  }
+}
+
+/** Toggle one chain while guaranteeing that the monitor never has an empty selection. */
+export function toggleFlowChainSelection(
+  values: readonly FlowSelectableChainId[],
+  chainId: FlowSelectableChainId,
+): FlowSelectableChainId[] {
+  const selected = normalizeFlowChainSelection(values)
+  if (selected.includes(chainId)) {
+    return selected.length === 1 ? selected : selected.filter((value) => value !== chainId)
+  }
+  return normalizeFlowChainSelection([...selected, chainId])
+}
 
 export type FlowPoolSelectable = {
   chainId: FlowSelectableChainId

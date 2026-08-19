@@ -30,7 +30,7 @@ assert.equal(
 )
 assert.ok(SUPPORTED_CHAINS.some((chain) => chain.id === 42161))
 
-assert.deepEqual([...FLOW_CHAIN_IDS], [56, 4663, 8453])
+assert.deepEqual([...FLOW_CHAIN_IDS], [1, 56, 4663, 8453])
 assert.equal(FLOW_CHAIN_IDS.includes(42161), false)
 
 console.log('chain configuration tests passed')

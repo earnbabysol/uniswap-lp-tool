@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict'
-import { takeFlowPoolEvents } from '../src/flowSelection.ts'
+import {
+  FLOW_SELECTABLE_CHAIN_IDS,
+  parseFlowChainSelection,
+  takeFlowPoolEvents,
+  toggleFlowChainSelection,
+} from '../src/flowSelection.ts'
 
 const address = (suffix) => `0x${suffix.padStart(40, '0')}`
 const hash = (suffix) => `0x${suffix.padStart(64, '0')}`
@@ -42,18 +47,26 @@ const balanced = takeFlowPoolEvents(dual, [56, 4663], 4)
 assert.equal(balanced.filter((event) => event.chainId === 56).length, 2)
 assert.equal(balanced.filter((event) => event.chainId === 4663).length, 2)
 
-const triple = [
+const fourChains = [
+  ...[1, 2, 3].map((n) => makeEvent({ id: `e${n}`, chainId: 1, pool: address(`41${n}`), timestamp: 400 - n })),
   ...[1, 2, 3].map((n) => makeEvent({ id: `b${n}`, chainId: 56, pool: address(`156${n}`), timestamp: 300 - n })),
   ...[1, 2, 3].map((n) => makeEvent({ id: `r${n}`, chainId: 4663, pool: address(`246${n}`), timestamp: 200 - n })),
   ...[1, 2, 3].map((n) => makeEvent({ id: `a${n}`, chainId: 8453, pool: address(`384${n}`), timestamp: 100 - n })),
 ]
-const allChains = takeFlowPoolEvents(triple, [56, 4663, 8453], 6)
+const allChains = takeFlowPoolEvents(fourChains, [...FLOW_SELECTABLE_CHAIN_IDS], 8)
+assert.equal(allChains.filter((event) => event.chainId === 1).length, 2)
 assert.equal(allChains.filter((event) => event.chainId === 56).length, 2)
 assert.equal(allChains.filter((event) => event.chainId === 4663).length, 2)
 assert.equal(allChains.filter((event) => event.chainId === 8453).length, 2)
-const baseOnly = takeFlowPoolEvents(triple, [8453], 10)
+const baseOnly = takeFlowPoolEvents(fourChains, [8453], 10)
 assert.equal(baseOnly.length, 3)
 assert.ok(baseOnly.every((event) => event.chainId === 8453))
-assert.deepEqual(takeFlowPoolEvents(triple, [], 10), [])
+assert.deepEqual(takeFlowPoolEvents(fourChains, [], 10), [])
+
+assert.deepEqual(parseFlowChainSelection('[8453,1,1,999]'), [1, 8453])
+assert.deepEqual(parseFlowChainSelection('bad json'), [1, 56, 4663, 8453])
+assert.deepEqual(toggleFlowChainSelection([1, 8453], 1), [8453])
+assert.deepEqual(toggleFlowChainSelection([8453], 8453), [8453], 'the last selected chain is retained')
+assert.deepEqual(toggleFlowChainSelection([56], 1), [1, 56])
 
 console.log('flow event selection tests passed')

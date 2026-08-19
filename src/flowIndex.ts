@@ -4,13 +4,16 @@ import type {
   FlowFetchOpts,
   FlowNotice,
 } from './flowEvents'
+import { isFlowSelectableChainId } from './flowSelection'
 
 type StoredFlowEvent = Omit<FlowEvent, 'blockNumber'> & { blockNumber?: string }
 
 type SharedFlowIndex = {
-  version: 1
+  version: 1 | 2
   generatedAt: number
   windowMinutes: number
+  /** v2 explicitly records quiet/error chains so the browser knows coverage. */
+  chainIds?: number[]
   events: StoredFlowEvent[]
   notices?: FlowNotice[]
 }
@@ -32,7 +35,7 @@ let rawIndexRequest: Promise<Partial<SharedFlowIndex> | null> | null = null
 function restoreEvent(value: StoredFlowEvent): FlowEvent | null {
   if (
     !value
-    || (value.chainId !== 56 && value.chainId !== 4663 && value.chainId !== 8453)
+    || !isFlowSelectableChainId(value.chainId)
     || (value.version !== 'v3' && value.version !== 'v4')
     || (value.side !== 'in' && value.side !== 'out')
     || typeof value.id !== 'string'
@@ -91,11 +94,15 @@ export async function loadSharedFlowIndex(opts: FlowFetchOpts): Promise<SharedFl
     const index = await readRawIndex()
     if (!index) return null
     if (
-      index.version !== 1
+      (index.version !== 1 && index.version !== 2)
       || !Number.isFinite(index.generatedAt)
       || Date.now() - Number(index.generatedAt) > MAX_INDEX_AGE_MS
       || !Array.isArray(index.events)
     ) return null
+    const coveredChains = index.version === 2 && Array.isArray(index.chainIds)
+      ? index.chainIds.filter(isFlowSelectableChainId)
+      : [56, 4663, 8453]
+    if (!opts.chainIds.every((chainId) => coveredChains.includes(chainId))) return null
     const chainSet = new Set<FlowChainId>(opts.chainIds)
     const minUsd = Math.max(0, Number.isFinite(opts.minUsd) ? Number(opts.minUsd) : 100)
     const cutoff = Date.now() / 1000 - Math.max(1, Number(index.windowMinutes) || 45) * 60

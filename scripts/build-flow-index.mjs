@@ -40,7 +40,13 @@ Object.defineProperty(globalThis, 'localStorage', {
 })
 
 const previous = await readJson(flowFile, null)
-const { FLOW_CHAIN_IDS, FLOW_WINDOW_MINUTES, fetchFlowEvents, flowPoolRef } = await import('../src/flowEvents.ts')
+const {
+  FLOW_CHAIN_IDS,
+  FLOW_POOL_LIMIT_PER_CHAIN,
+  FLOW_WINDOW_MINUTES,
+  fetchFlowEvents,
+  flowPoolRef,
+} = await import('../src/flowEvents.ts')
 
 async function withDeadline(promise, timeoutMs) {
   let timer
@@ -63,7 +69,7 @@ try {
       chainIds: [...FLOW_CHAIN_IDS],
       minUsd: 0,
       filterHoneypot: true,
-      limit: 100,
+      limit: FLOW_POOL_LIMIT_PER_CHAIN * FLOW_CHAIN_IDS.length,
       preferSharedIndex: false,
     }),
     5 * 60_000,
@@ -83,9 +89,10 @@ if (result) {
   const generatedAt = Date.now()
   const serialize = (_key, value) => typeof value === 'bigint' ? value.toString() : value
   const snapshot = {
-    version: 1,
+    version: 2,
     generatedAt,
     windowMinutes: FLOW_WINDOW_MINUTES,
+    chainIds: [...FLOW_CHAIN_IDS],
     events: result.events,
     notices: result.notices,
   }

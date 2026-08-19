@@ -190,7 +190,7 @@ const NAV_ITEMS: { key: TabKey; label: string; icon: string; hotkey: string; blu
   { key: 'tools', label: '工具', icon: '⚒', hotkey: '3', blurb: '批量操作与链上辅助查询' },
   { key: 'auto', label: '自动化', icon: '◈', hotkey: '4', blurb: '本地私钥签名与自动复投 / Rebalance' },
   { key: 'history', label: '交易历史', icon: '⇅', hotkey: '5', blurb: '本机记录的交易与浏览器链接' },
-  { key: 'flow', label: '动向', icon: '↗', hotkey: '6', blurb: 'BSC / Robinhood / Base 大额开仓与撤出' },
+  { key: 'flow', label: '动向', icon: '↗', hotkey: '6', blurb: 'ETH / BSC / Robinhood / Base 大额开仓与撤出' },
 ]
 
 function formatPnl(n: number): string {
