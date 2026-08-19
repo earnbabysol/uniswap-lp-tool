@@ -12,9 +12,12 @@ import {
 import {
   FLOW_DEFAULT_MIN_APR,
   FLOW_DEFAULT_MIN_USD,
+  FLOW_FULL_REQUEST_TIMEOUT_MS,
+  FLOW_INCREMENTAL_REQUEST_TIMEOUT_MS,
   FLOW_LIVE_REFRESH_COOLDOWN_MS,
   shouldThrottleAutomaticLiveRefresh,
 } from '../src/flowMonitorConfig.ts'
+import { carryForwardFlowEnrichment } from '../src/flowEvents.ts'
 
 const address = (suffix) => `0x${suffix.padStart(40, '0')}`
 const hash = (suffix) => `0x${suffix.padStart(64, '0')}`
@@ -86,8 +89,29 @@ assert.equal(isSharedFlowIndexFresh(Number.NaN, now), false)
 
 assert.equal(FLOW_DEFAULT_MIN_USD, 30)
 assert.equal(FLOW_DEFAULT_MIN_APR, 300)
+assert.equal(FLOW_LIVE_REFRESH_COOLDOWN_MS, 5 * 60_000)
+assert.ok(FLOW_INCREMENTAL_REQUEST_TIMEOUT_MS < FLOW_FULL_REQUEST_TIMEOUT_MS)
 assert.equal(shouldThrottleAutomaticLiveRefresh(null, now), false)
 assert.equal(shouldThrottleAutomaticLiveRefresh(now - FLOW_LIVE_REFRESH_COOLDOWN_MS + 1, now), true)
 assert.equal(shouldThrottleAutomaticLiveRefresh(now - FLOW_LIVE_REFRESH_COOLDOWN_MS, now), false)
+
+const enrichedPool = address('abc')
+const previousEnriched = {
+  ...makeEvent({ id: 'old-enriched', pool: enrichedPool, timestamp: 90 }),
+  feeAprPct: 456,
+  windowSwapUsd: 12_345,
+  windowFeeUsd: 12.3,
+  aprLiquidityUsd: 2_000,
+  aprSwapCount: 8,
+  aprWindowMinutes: 1_440,
+  aprBasis: 'dexscreener-liquidity',
+  marketCapUsd: 9_000_000,
+}
+const freshBase = makeEvent({ id: 'fresh-base', pool: enrichedPool, timestamp: 100 })
+const [carried] = carryForwardFlowEnrichment([freshBase], [previousEnriched])
+assert.equal(carried.feeAprPct, 456)
+assert.equal(carried.windowSwapUsd, 12_345)
+assert.equal(carried.marketCapUsd, 9_000_000)
+assert.equal(freshBase.feeAprPct, undefined, 'carry-forward must not mutate base events')
 
 console.log('flow event selection tests passed')

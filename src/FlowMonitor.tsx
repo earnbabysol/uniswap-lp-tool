@@ -5,11 +5,13 @@ import {
   FLOW_WINDOW_MINUTES,
   FLOW_CHAIN_IDS,
   FLOW_POOL_LIMIT_PER_CHAIN,
+  carryForwardFlowEnrichment,
   fetchFlowEvents,
   flowChainCompact,
   flowChainLabel,
   flowExplorerTx,
   flowPoolRef,
+  primeFlowEnrichmentCache,
   type FlowChainId,
   type FlowEvent,
   type FlowNotice,
@@ -27,7 +29,9 @@ import {
 import {
   FLOW_DEFAULT_MIN_APR,
   FLOW_DEFAULT_MIN_USD,
-  FLOW_LIVE_REQUEST_TIMEOUT_MS,
+  FLOW_FULL_REQUEST_TIMEOUT_MS,
+  FLOW_INCREMENTAL_REQUEST_TIMEOUT_MS,
+  FLOW_SHARED_SEED_MAX_AGE_MS,
   shouldThrottleAutomaticLiveRefresh,
 } from './flowMonitorConfig'
 import { shortAddr } from './wallet'
@@ -308,6 +312,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         || indexed.generatedAt <= (updatedAtRef.current ?? 0)
       ) return
       const indexedRows = [...indexed.events].sort((a, b) => b.timestamp - a.timestamp)
+      primeFlowEnrichmentCache(indexedRows)
       eventsRef.current = indexedRows
       setEvents(indexedRows)
       setNotices(indexed.notices)
@@ -318,6 +323,9 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
       setElapsedMs(null)
       return
     }
+    let incremental = !forceLive
+      && completedKeyRef.current === baseKey
+      && eventsRef.current.length > 0
     forceLiveRef.current = false
     const gen = ++genRef.current
     runningRef.current = true
@@ -326,15 +334,48 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
     setRefreshing(true)
     setBusy(forceLive || eventsRef.current.length === 0)
     setElapsedMs(null)
-    setLoadStage(forceLive ? '正在实时扫描所选链…' : '正在读取共享索引…')
+    setLoadStage(forceLive
+      ? '正在完整刷新所选链…'
+      : incremental ? '正在增量检查新增动向…' : '正在读取共享索引…')
     const t0 = performance.now()
     const chainIds: FlowChainId[] = [...options.chainIds]
     try {
+      // 定时任务延迟时，新访客也先拿稍旧快照秒开榜单；随后本轮只补
+      // 快照之后的区块，并复用其中的 APR / 市值，不让页面空等完整扫描。
+      if (!forceLive && eventsRef.current.length === 0) {
+        const seed = await loadSharedFlowIndex({
+          chainIds,
+          minUsd: options.minUsd,
+          filterHoneypot: options.filterHp,
+          limit: FLOW_POOL_LIMIT_PER_CHAIN * Math.max(1, chainIds.length),
+          maxSharedIndexAgeMs: FLOW_SHARED_SEED_MAX_AGE_MS,
+        })
+        if (seed && mountedRef.current && gen === genRef.current) {
+          const seedRows = [...seed.events].sort((a, b) => b.timestamp - a.timestamp)
+          primeFlowEnrichmentCache(seedRows)
+          eventsRef.current = seedRows
+          setEvents(seedRows)
+          setNotices(seed.notices)
+          dataSourceRef.current = 'shared-index'
+          updatedAtRef.current = seed.generatedAt
+          setDataSource('shared-index')
+          setUpdatedAt(seed.generatedAt)
+          if (seedRows.length > 0) {
+            setBusy(false)
+            incremental = true
+            setLoadStage('快照已显示，正在增量检查新增动向…')
+          }
+        }
+      }
+      const requestTimeoutMs = incremental
+        ? FLOW_INCREMENTAL_REQUEST_TIMEOUT_MS
+        : FLOW_FULL_REQUEST_TIMEOUT_MS
       let rows: FlowEvent[]
       let nextNotices: FlowNotice[]
       let nextSource: 'shared-index' | 'live-rpc' = 'live-rpc'
       let nextGeneratedAt = Date.now()
       if (chainIds.length === 1) {
+        const previousRows = eventsRef.current
         let acceptUpdates = true
         const request = fetchFlowEvents({
           chainIds,
@@ -345,7 +386,8 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
           maxSharedIndexAgeMs: FLOW_SHARED_INDEX_FRESH_MS,
           onBaseEvents: (base) => {
             if (!acceptUpdates || !mountedRef.current || gen !== genRef.current) return
-            const partialRows = [...base.events].sort((a, b) => b.timestamp - a.timestamp)
+            const partialRows = [...carryForwardFlowEnrichment(base.events, previousRows)]
+              .sort((a, b) => b.timestamp - a.timestamp)
             eventsRef.current = partialRows
             setEvents(partialRows)
             setNotices(base.notices)
@@ -358,20 +400,22 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
               updatedAtRef.current = base.generatedAt
               setUpdatedAt(base.generatedAt)
             }
-            setLoadStage(`已发现 ${flowPoolCount(partialRows)} 个池，正在后台补全年化与风险…`)
+            setLoadStage(incremental
+              ? `已同步 ${flowPoolCount(partialRows)} 个池，正在补充新池数据…`
+              : `已发现 ${flowPoolCount(partialRows)} 个池，正在后台补全年化与风险…`)
           },
         })
         let result: Awaited<typeof request>
         try {
           result = await withTimeout(
             request,
-            FLOW_LIVE_REQUEST_TIMEOUT_MS,
+            requestTimeoutMs,
             `${flowChainLabel(chainIds[0])} 实时补刷`,
           )
         } finally {
           acceptUpdates = false
         }
-        rows = result.events
+        rows = carryForwardFlowEnrichment(result.events, previousRows)
         nextNotices = result.notices
         nextSource = result.source ?? 'live-rpc'
         nextGeneratedAt = result.generatedAt ?? Date.now()
@@ -407,7 +451,10 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
               maxSharedIndexAgeMs: FLOW_SHARED_INDEX_FRESH_MS,
               onBaseEvents: (base) => {
                 if (!acceptUpdates || !mountedRef.current || gen !== genRef.current) return
-                results.set(chainId, base)
+                results.set(chainId, {
+                  ...base,
+                  events: carryForwardFlowEnrichment(base.events, previousRows),
+                })
                 if (base.source === 'live-rpc') {
                   dataSourceRef.current = 'live-rpc'
                   setDataSource('live-rpc')
@@ -419,15 +466,20 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
                 publishPartial()
                 const discovered = [...results.values()].flatMap((item) => item.events)
                 if (discovered.length > 0) setBusy(false)
-                setLoadStage(`已发现 ${flowPoolCount(discovered)} 个池，正在后台补全年化与风险…`)
+                setLoadStage(incremental
+                  ? `已同步 ${flowPoolCount(discovered)} 个池，正在补充新池数据…`
+                  : `已发现 ${flowPoolCount(discovered)} 个池，正在后台补全年化与风险…`)
               },
             })
-            const result = await withTimeout(
+            const rawResult = await withTimeout(
               request,
-              FLOW_LIVE_REQUEST_TIMEOUT_MS,
+              requestTimeoutMs,
               '实时补刷',
             )
-            results.set(chainId, result)
+            results.set(chainId, {
+              ...rawResult,
+              events: carryForwardFlowEnrichment(rawResult.events, previousRows),
+            })
           } catch (error) {
             const partial = results.get(chainId)
             results.set(chainId, {
@@ -684,7 +736,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
             默认按手续费年化从高到低。年化优先采用 DexScreener 24h 成交量 × 池费率 ÷ 当前流动性 × 365；
             这是发现指标，不代表未来收益。
             <span className="flow-trust-note-extra">
-              优先读取共享索引；快照延迟超过 18 分钟时后台实时补刷，列表先展示，四链补刷最多每 15 分钟一次。
+              优先读取共享索引；延迟时先展示快照，再每 5 分钟增量补新增动向，已有池年化不会重复重算。
             </span>
           </p>
         </div>

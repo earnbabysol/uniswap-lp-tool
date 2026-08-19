@@ -168,8 +168,8 @@ const V4_SWAP = parseAbiItem(
 export const FLOW_WINDOW_MINUTES = 45
 const EVENT_TTL_MS = FLOW_WINDOW_MINUTES * 60_000
 const WETH_USD_TTL_MS = 5 * 60_000
-/** 年化依赖 Swap getLogs，TTL 拉长减轻公共 RPC / 主线程压力 */
-const APR_TTL_MS = 180_000
+/** 24h 年化不需要跟动向同频重算；15 分钟缓存让 5 分钟增量只补新池。 */
+const APR_TTL_MS = 15 * 60_000
 /** DexScreener 精确池批量查询按链覆盖完整可见榜单。 */
 const APR_POOL_LIMIT_PER_CHAIN = FLOW_POOL_LIMIT_PER_CHAIN
 /** 模块级 Map 上限，防止长挂动向页缓涨内存 */
@@ -434,7 +434,7 @@ type FlowMarketCacheEntry = {
   meta: FlowMarketMeta
 }
 
-const FLOW_MARKET_TTL_MS = 5 * 60_000
+const FLOW_MARKET_TTL_MS = 15 * 60_000
 const FLOW_MARKET_CACHE_CAP = 800
 const flowMarketCache = new Map<string, FlowMarketCacheEntry>()
 
@@ -490,6 +490,109 @@ function pruneMapSize<K, V>(map: Map<K, V>, cap: number): void {
     map.delete(key)
     if (++i >= drop) break
   }
+}
+
+type CarriedFlowEnrichment = Pick<FlowEvent,
+  | 'windowSwapUsd'
+  | 'windowFeeUsd'
+  | 'aprLiquidityUsd'
+  | 'feeAprPct'
+  | 'aprSwapCount'
+  | 'aprWindowMinutes'
+  | 'effectiveFeePips'
+  | 'aprBasis'
+  | 'coinAddress'
+  | 'coinSymbol'
+  | 'marketCapUsd'
+  | 'tokenCreatedAt'
+>
+
+/**
+ * 增量日志先发布时沿用同池上一轮的年化/市值，避免 APR 筛选榜单闪空。
+ * 新池没有旧数据，仍会在本轮 enrichment 完成后自然出现。
+ */
+export function carryForwardFlowEnrichment(
+  events: FlowEvent[],
+  previousEvents: FlowEvent[],
+): FlowEvent[] {
+  if (events.length === 0 || previousEvents.length === 0) return events
+  const previousByPool = new Map<string, Partial<CarriedFlowEnrichment>>()
+  for (const event of previousEvents) {
+    const key = flowAprKey(event.chainId, event.version, flowPoolRef(event))
+    const prior = previousByPool.get(key)
+    previousByPool.set(key, {
+      windowSwapUsd: prior?.windowSwapUsd ?? event.windowSwapUsd,
+      windowFeeUsd: prior?.windowFeeUsd ?? event.windowFeeUsd,
+      aprLiquidityUsd: prior?.aprLiquidityUsd ?? event.aprLiquidityUsd,
+      feeAprPct: prior?.feeAprPct ?? event.feeAprPct,
+      aprSwapCount: prior?.aprSwapCount ?? event.aprSwapCount,
+      aprWindowMinutes: prior?.aprWindowMinutes ?? event.aprWindowMinutes,
+      effectiveFeePips: prior?.effectiveFeePips ?? event.effectiveFeePips,
+      aprBasis: prior?.aprBasis ?? event.aprBasis,
+      coinAddress: prior?.coinAddress ?? event.coinAddress,
+      coinSymbol: prior?.coinSymbol ?? event.coinSymbol,
+      marketCapUsd: prior?.marketCapUsd ?? event.marketCapUsd,
+      tokenCreatedAt: prior?.tokenCreatedAt ?? event.tokenCreatedAt,
+    })
+  }
+  return events.map((event) => {
+    const previous = previousByPool.get(flowAprKey(event.chainId, event.version, flowPoolRef(event)))
+    if (!previous) return event
+    return {
+      ...event,
+      windowSwapUsd: event.windowSwapUsd ?? previous.windowSwapUsd,
+      windowFeeUsd: event.windowFeeUsd ?? previous.windowFeeUsd,
+      aprLiquidityUsd: event.aprLiquidityUsd ?? previous.aprLiquidityUsd,
+      feeAprPct: event.feeAprPct ?? previous.feeAprPct,
+      aprSwapCount: event.aprSwapCount ?? previous.aprSwapCount,
+      aprWindowMinutes: event.aprWindowMinutes ?? previous.aprWindowMinutes,
+      effectiveFeePips: event.effectiveFeePips ?? previous.effectiveFeePips,
+      aprBasis: event.aprBasis ?? previous.aprBasis,
+      coinAddress: event.coinAddress ?? previous.coinAddress,
+      coinSymbol: event.coinSymbol ?? previous.coinSymbol,
+      marketCapUsd: event.marketCapUsd ?? previous.marketCapUsd,
+      tokenCreatedAt: event.tokenCreatedAt ?? previous.tokenCreatedAt,
+    }
+  })
+}
+
+/** 把共享快照中的 enrichment 放入内存缓存，后续增量只请求新出现的池。 */
+export function primeFlowEnrichmentCache(events: FlowEvent[], at = Date.now()): void {
+  for (const event of events) {
+    if (
+      event.windowSwapUsd != null
+      && event.windowFeeUsd != null
+      && event.aprSwapCount != null
+      && event.aprBasis != null
+    ) {
+      flowAprCache.set(flowAprKey(event.chainId, event.version, flowPoolRef(event)), {
+        at,
+        metric: {
+          windowSwapUsd: event.windowSwapUsd,
+          windowFeeUsd: event.windowFeeUsd,
+          aprLiquidityUsd: event.aprLiquidityUsd,
+          feeAprPct: event.feeAprPct,
+          aprSwapCount: event.aprSwapCount,
+          aprWindowMinutes: event.aprWindowMinutes,
+          effectiveFeePips: event.effectiveFeePips,
+          aprBasis: event.aprBasis,
+        },
+      })
+    }
+    if (event.coinAddress && event.coinSymbol) {
+      flowMarketCache.set(flowMarketKey(event.chainId, event.coinAddress), {
+        at,
+        meta: {
+          coinAddress: event.coinAddress,
+          coinSymbol: event.coinSymbol,
+          marketCapUsd: event.marketCapUsd,
+          tokenCreatedAt: event.tokenCreatedAt,
+        },
+      })
+    }
+  }
+  pruneMapSize(flowAprCache, 600)
+  pruneMapSize(flowMarketCache, FLOW_MARKET_CACHE_CAP)
 }
 
 function pruneChainCaches(chainId: FlowChainId): void {
@@ -3484,6 +3587,7 @@ export async function fetchFlowEvents(opts: FlowFetchOpts): Promise<{
   if (opts.preferSharedIndex !== false) {
     const indexed = await loadSharedFlowIndex(opts)
     if (indexed) {
+      primeFlowEnrichmentCache(indexed.events)
       opts.onBaseEvents?.(indexed)
       return indexed
     }
