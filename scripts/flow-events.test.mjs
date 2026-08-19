@@ -9,6 +9,12 @@ import {
   FLOW_SHARED_INDEX_FRESH_MS,
   isSharedFlowIndexFresh,
 } from '../src/flowIndex.ts'
+import {
+  FLOW_DEFAULT_MIN_APR,
+  FLOW_DEFAULT_MIN_USD,
+  FLOW_LIVE_REFRESH_COOLDOWN_MS,
+  shouldThrottleAutomaticLiveRefresh,
+} from '../src/flowMonitorConfig.ts'
 
 const address = (suffix) => `0x${suffix.padStart(40, '0')}`
 const hash = (suffix) => `0x${suffix.padStart(64, '0')}`
@@ -77,5 +83,11 @@ const now = 1_800_000_000_000
 assert.equal(isSharedFlowIndexFresh(now - FLOW_SHARED_INDEX_FRESH_MS, now), true)
 assert.equal(isSharedFlowIndexFresh(now - FLOW_SHARED_INDEX_FRESH_MS - 1, now), false)
 assert.equal(isSharedFlowIndexFresh(Number.NaN, now), false)
+
+assert.equal(FLOW_DEFAULT_MIN_USD, 30)
+assert.equal(FLOW_DEFAULT_MIN_APR, 300)
+assert.equal(shouldThrottleAutomaticLiveRefresh(null, now), false)
+assert.equal(shouldThrottleAutomaticLiveRefresh(now - FLOW_LIVE_REFRESH_COOLDOWN_MS + 1, now), true)
+assert.equal(shouldThrottleAutomaticLiveRefresh(now - FLOW_LIVE_REFRESH_COOLDOWN_MS, now), false)
 
 console.log('flow event selection tests passed')

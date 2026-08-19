@@ -5684,6 +5684,13 @@ input:focus-visible, select:focus-visible, select:focus {
 .flow-min-apply { min-height: 30px; padding-inline: 9px; }
 .flow-updated { font-size: 13px; }
 .flow-updated.delayed { color: var(--warn, #b97800); font-weight: 700; }
+.flow-filter-active {
+  margin-left: 6px;
+  color: var(--accent);
+  font-size: 0.9em;
+  font-weight: 750;
+  white-space: nowrap;
+}
 .flow-discovery-bar {
   display: flex;
   align-items: center;

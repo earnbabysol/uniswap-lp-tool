@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Address } from 'viem'
+import { withTimeout } from './async'
 import {
   FLOW_WINDOW_MINUTES,
   FLOW_CHAIN_IDS,
@@ -19,7 +20,16 @@ import {
   parseFlowChainSelection,
   toggleFlowChainSelection,
 } from './flowSelection'
-import { FLOW_SHARED_INDEX_FRESH_MS } from './flowIndex'
+import {
+  FLOW_SHARED_INDEX_FRESH_MS,
+  loadSharedFlowIndex,
+} from './flowIndex'
+import {
+  FLOW_DEFAULT_MIN_APR,
+  FLOW_DEFAULT_MIN_USD,
+  FLOW_LIVE_REQUEST_TIMEOUT_MS,
+  shouldThrottleAutomaticLiveRefresh,
+} from './flowMonitorConfig'
 import { shortAddr } from './wallet'
 
 type SideFilter = 'all' | FlowSide
@@ -198,8 +208,6 @@ export type FlowMonitorProps = {
 }
 
 const FLOW_CHAIN_SELECTION_KEY = 'rangedesk.flow-chains.v1'
-const FLOW_LIVE_REFRESH_INTERVAL_MS = 3 * 60_000
-
 function readFlowChainSelection(): FlowChainId[] {
   if (typeof localStorage === 'undefined') return [...FLOW_CHAIN_IDS]
   try {
@@ -214,19 +222,26 @@ function flowPoolCount(events: FlowEvent[]): number {
     `${event.chainId}:${event.version}:${flowPoolRef(event).toLowerCase()}`)).size
 }
 
+function formatRefreshDuration(ms: number): string {
+  if (ms < 1_000) return `${ms}ms`
+  const seconds = ms / 1_000
+  return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)} 秒`
+}
+
 export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
   const [selectedChains, setSelectedChains] = useState<FlowChainId[]>(readFlowChainSelection)
   const [sideFilter, setSideFilter] = useState<SideFilter>('all')
   const [versionFilter, setVersionFilter] = useState<VersionFilter>('all')
   const [sortMode, setSortMode] = useState<SortMode>('apr')
   const [search, setSearch] = useState('')
-  const [minAprDraft, setMinAprDraft] = useState('0')
+  const [minAprDraft, setMinAprDraft] = useState(String(FLOW_DEFAULT_MIN_APR))
   const [reliableOnly, setReliableOnly] = useState(false)
-  const [minUsd, setMinUsd] = useState(100)
-  const [minUsdDraft, setMinUsdDraft] = useState('100')
+  const [minUsd, setMinUsd] = useState(FLOW_DEFAULT_MIN_USD)
+  const [minUsdDraft, setMinUsdDraft] = useState(String(FLOW_DEFAULT_MIN_USD))
   const [filterHp, setFilterHp] = useState(true)
   const [auto, setAuto] = useState(true)
   const [busy, setBusy] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
   const [events, setEvents] = useState<FlowEvent[]>([])
   const [notices, setNotices] = useState<FlowNotice[]>([])
   const [expandedKey, setExpandedKey] = useState<string | null>(null)
@@ -244,6 +259,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
   const forceLiveRef = useRef(false)
   const completedKeyRef = useRef('')
   const updatedAtRef = useRef<number | null>(null)
+  const lastLiveCompletedAtRef = useRef<number | null>(null)
   const dataSourceRef = useRef<'shared-index' | 'live-rpc' | null>(null)
   const loadRef = useRef<() => Promise<void>>(async () => {})
   const selectedChainKey = selectedChains.join(',')
@@ -272,15 +288,44 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
       !forceLive
       && completedKeyRef.current === baseKey
       && dataSourceRef.current === 'live-rpc'
-      && updatedAtRef.current != null
-      && Date.now() - updatedAtRef.current < FLOW_LIVE_REFRESH_INTERVAL_MS
-    ) return
+      && shouldThrottleAutomaticLiveRefresh(lastLiveCompletedAtRef.current)
+    ) {
+      // 实时补刷冷却期间仍轻量检查共享索引；一旦定时任务产出更新快照，
+      // 立即切回索引，而不是为了节流把新快照也挡在外面。
+      const probeGen = genRef.current
+      const indexed = await loadSharedFlowIndex({
+        chainIds: [...options.chainIds],
+        minUsd: options.minUsd,
+        filterHoneypot: options.filterHp,
+        limit: FLOW_POOL_LIMIT_PER_CHAIN * Math.max(1, options.chainIds.length),
+        maxSharedIndexAgeMs: FLOW_SHARED_INDEX_FRESH_MS,
+      })
+      if (
+        !indexed
+        || !mountedRef.current
+        || runningRef.current
+        || probeGen !== genRef.current
+        || indexed.generatedAt <= (updatedAtRef.current ?? 0)
+      ) return
+      const indexedRows = [...indexed.events].sort((a, b) => b.timestamp - a.timestamp)
+      eventsRef.current = indexedRows
+      setEvents(indexedRows)
+      setNotices(indexed.notices)
+      dataSourceRef.current = 'shared-index'
+      updatedAtRef.current = indexed.generatedAt
+      setDataSource('shared-index')
+      setUpdatedAt(indexed.generatedAt)
+      setElapsedMs(null)
+      return
+    }
     forceLiveRef.current = false
     const gen = ++genRef.current
     runningRef.current = true
     runningKeyRef.current = key
     runningGenRef.current = gen
-    setBusy(true)
+    setRefreshing(true)
+    setBusy(forceLive || eventsRef.current.length === 0)
+    setElapsedMs(null)
     setLoadStage(forceLive ? '正在实时扫描所选链…' : '正在读取共享索引…')
     const t0 = performance.now()
     const chainIds: FlowChainId[] = [...options.chainIds]
@@ -290,7 +335,8 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
       let nextSource: 'shared-index' | 'live-rpc' = 'live-rpc'
       let nextGeneratedAt = Date.now()
       if (chainIds.length === 1) {
-        const result = await fetchFlowEvents({
+        let acceptUpdates = true
+        const request = fetchFlowEvents({
           chainIds,
           minUsd: options.minUsd,
           filterHoneypot: options.filterHp,
@@ -298,11 +344,12 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
           preferSharedIndex: !forceLive,
           maxSharedIndexAgeMs: FLOW_SHARED_INDEX_FRESH_MS,
           onBaseEvents: (base) => {
-            if (!mountedRef.current || gen !== genRef.current) return
+            if (!acceptUpdates || !mountedRef.current || gen !== genRef.current) return
             const partialRows = [...base.events].sort((a, b) => b.timestamp - a.timestamp)
             eventsRef.current = partialRows
             setEvents(partialRows)
             setNotices(base.notices)
+            if (partialRows.length > 0) setBusy(false)
             if (base.source) {
               dataSourceRef.current = base.source
               setDataSource(base.source)
@@ -311,9 +358,19 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
               updatedAtRef.current = base.generatedAt
               setUpdatedAt(base.generatedAt)
             }
-            setLoadStage(`已发现 ${flowPoolCount(partialRows)} 个池，正在补全年化与风险…`)
+            setLoadStage(`已发现 ${flowPoolCount(partialRows)} 个池，正在后台补全年化与风险…`)
           },
         })
+        let result: Awaited<typeof request>
+        try {
+          result = await withTimeout(
+            request,
+            FLOW_LIVE_REQUEST_TIMEOUT_MS,
+            `${flowChainLabel(chainIds[0])} 实时补刷`,
+          )
+        } finally {
+          acceptUpdates = false
+        }
         rows = result.events
         nextNotices = result.notices
         nextSource = result.source ?? 'live-rpc'
@@ -339,8 +396,9 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
           setNotices([...results.values()].flatMap((result) => result.notices))
         }
         await Promise.all(chainIds.map(async (chainId) => {
+          let acceptUpdates = true
           try {
-            const result = await fetchFlowEvents({
+            const request = fetchFlowEvents({
               chainIds: [chainId],
               minUsd: options.minUsd,
               filterHoneypot: options.filterHp,
@@ -348,7 +406,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
               preferSharedIndex: !forceLive,
               maxSharedIndexAgeMs: FLOW_SHARED_INDEX_FRESH_MS,
               onBaseEvents: (base) => {
-                if (!mountedRef.current || gen !== genRef.current) return
+                if (!acceptUpdates || !mountedRef.current || gen !== genRef.current) return
                 results.set(chainId, base)
                 if (base.source === 'live-rpc') {
                   dataSourceRef.current = 'live-rpc'
@@ -360,18 +418,29 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
                 }
                 publishPartial()
                 const discovered = [...results.values()].flatMap((item) => item.events)
-                setLoadStage(`已发现 ${flowPoolCount(discovered)} 个池，正在补全年化与风险…`)
+                if (discovered.length > 0) setBusy(false)
+                setLoadStage(`已发现 ${flowPoolCount(discovered)} 个池，正在后台补全年化与风险…`)
               },
             })
+            const result = await withTimeout(
+              request,
+              FLOW_LIVE_REQUEST_TIMEOUT_MS,
+              '实时补刷',
+            )
             results.set(chainId, result)
           } catch (error) {
+            const partial = results.get(chainId)
             results.set(chainId, {
-              events: [],
-              notices: [{
-                level: 'error',
+              events: partial?.events ?? [],
+              notices: [...(partial?.notices ?? []), {
+                level: partial?.events.length ? 'warning' : 'error',
                 message: `${flowChainLabel(chainId)}：${error instanceof Error ? error.message : String(error)}`,
               }],
+              source: partial?.source ?? 'live-rpc',
+              generatedAt: partial?.generatedAt ?? Date.now(),
             })
+          } finally {
+            acceptUpdates = false
           }
           publishPartial()
         }))
@@ -397,19 +466,30 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
       setDataSource(nextSource)
       setUpdatedAt(nextGeneratedAt)
       setElapsedMs(Math.round(performance.now() - t0))
+      if (nextSource === 'live-rpc') lastLiveCompletedAtRef.current = Date.now()
     } catch (e) {
       if (!mountedRef.current || gen !== genRef.current) return
-      setNotices([{
-        level: 'error',
+      const hasPartial = eventsRef.current.length > 0
+      setNotices((current) => [...current, {
+        level: hasPartial ? 'warning' : 'error',
         message: e instanceof Error ? e.message : String(e),
       }])
+      if (dataSourceRef.current === 'live-rpc') {
+        completedKeyRef.current = baseKey
+        lastLiveCompletedAtRef.current = Date.now()
+        setElapsedMs(Math.round(performance.now() - t0))
+      }
     } finally {
       runningRef.current = false
       if (rerunRef.current && mountedRef.current) {
         rerunRef.current = false
+        setBusy(false)
+        setRefreshing(false)
+        setLoadStage('')
         queueMicrotask(() => void loadRef.current())
       } else if (mountedRef.current) {
         setBusy(false)
+        setRefreshing(false)
         setLoadStage('')
       }
     }
@@ -514,10 +594,11 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
     return [...grouped.values()]
   }, [events, selectedChainSet, versionFilter])
 
+  const parsedMinApr = Number(minAprDraft.replace(/,/g, '').trim())
+  const minApr = Number.isFinite(parsedMinApr) ? Math.max(0, parsedMinApr) : 0
+
   const visible = useMemo(() => {
     const query = search.trim().toLowerCase()
-    const parsedMinApr = Number(minAprDraft.replace(/,/g, '').trim())
-    const minApr = Number.isFinite(parsedMinApr) ? Math.max(0, parsedMinApr) : 0
     const rows = pools.filter((row) => {
       if (sideFilter === 'in' && !(row.net > 0)) return false
       if (sideFilter === 'out' && !(row.net < 0)) return false
@@ -557,7 +638,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
       return a.key.localeCompare(b.key)
     })
     return rows
-  }, [minAprDraft, pools, reliableOnly, search, sideFilter, sortMode])
+  }, [minApr, pools, reliableOnly, search, sideFilter, sortMode])
 
   const summary = useMemo(() => {
     let inflow = 0
@@ -603,22 +684,22 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
             默认按手续费年化从高到低。年化优先采用 DexScreener 24h 成交量 × 池费率 ÷ 当前流动性 × 365；
             这是发现指标，不代表未来收益。
             <span className="flow-trust-note-extra">
-              优先读取约每 5 分钟更新的共享索引；快照延迟超过 18 分钟会自动实时补刷。
+              优先读取共享索引；快照延迟超过 18 分钟时后台实时补刷，列表先展示，四链补刷最多每 15 分钟一次。
             </span>
           </p>
         </div>
         <div className="pos-page-actions">
           <button
             type="button"
-            className={`btn primary ${busy ? 'active' : ''}`}
-            disabled={busy}
-            aria-busy={busy}
+            className={`btn primary ${refreshing ? 'active' : ''}`}
+            disabled={refreshing}
+            aria-busy={refreshing}
             onClick={() => {
               forceLiveRef.current = true
               void load()
             }}
           >
-            {busy ? '刷新中…' : '实时刷新'}
+            {busy ? '扫描中…' : refreshing ? '后台补全中' : '实时刷新'}
           </button>
         </div>
       </div>
@@ -684,7 +765,10 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
           </select>
         </label>
         <details className="flow-more-filters">
-          <summary className="btn ghost tight">金额与样本筛选</summary>
+          <summary className="btn ghost tight">
+            金额与样本筛选
+            <span className="flow-filter-active">≥ ${minUsd} · APR ≥ {minApr}%</span>
+          </summary>
           <div className="flow-more-panel">
             <div className="inline-setting flow-min-setting">
               <span>单笔动向 ≥ USD</span>
@@ -692,7 +776,7 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
                 className="flow-min-input"
                 type="number"
                 min={0}
-                step={50}
+                step={10}
                 value={minUsdDraft}
                 aria-label="最低锚定 USD 金额"
                 onChange={(e) => setMinUsdDraft(e.target.value)}
@@ -741,17 +825,17 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
             </label>
             <label className="inline-setting check">
               <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
-              自动检查 45s
+              自动检查共享索引 45s
             </label>
           </div>
         </details>
-        {(updatedAt || busy) && (
+        {(updatedAt || refreshing) && (
           <span className={`muted flow-updated ${sharedDelayed ? 'delayed' : ''}`}>
             {updatedAt ? `更新于 ${new Date(updatedAt).toLocaleTimeString()}` : '首次加载'}
             {dataSource ? ` · ${dataSource === 'shared-index' ? '共享索引' : '实时链上'}` : ''}
             {sharedAgeMinutes != null ? ` · ${sharedAgeMinutes} 分钟前` : ''}
-            {updatedAt && elapsedMs != null ? ` · ${elapsedMs}ms` : ''}
-            {busy ? ` · ${loadStage || '增量中…'}` : ''}
+            {!refreshing && updatedAt && elapsedMs != null ? ` · 本轮 ${formatRefreshDuration(elapsedMs)}` : ''}
+            {refreshing ? ` · ${loadStage || '后台增量中…'}` : ''}
           </span>
         )}
       </div>
@@ -813,6 +897,8 @@ export default function FlowMonitor({ onOpenPool }: FlowMonitorProps) {
         <p className="muted flow-empty">
           {errorMessages.length > 0
             ? '当前数据源暂不可用，请检查上方错误或在设置中更换 RPC 后重试'
+            : refreshing && pools.length > 0 && minApr > 0
+              ? `已发现 ${pools.length} 个池，正在后台计算年化；符合 ≥ ${minApr}% 的池会自动出现`
             : pools.length > 0
               ? '没有池子符合当前年化、方向或搜索条件，请放宽筛选后重试'
               : '最近窗口暂无符合条件的锚定资金记录（可调低金额或关闭貔貅过滤重试）'}
