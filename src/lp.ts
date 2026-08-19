@@ -15,6 +15,7 @@ import {
   type Address,
   type WalletClient,
   type Hash,
+  type Hex,
 } from 'viem'
 import {
   CONTRACTS,
@@ -2991,8 +2992,8 @@ async function loadV3NpmLogs(
   toBlock: bigint,
   npm: Address = CONTRACTS.v3Npm,
 ): Promise<{ logs: NpmAmountLog[]; incomplete: boolean }> {
-  // BSC / Robinhood 的 Blockscout 对 indexed tokenId 查询远快于从铸造块逐段扫 RPC。
-  if (getActiveChainId() === 56 || getActiveChainId() === 4663) {
+  // BSC / Robinhood / Arbitrum 的 Blockscout 对 indexed tokenId 查询远快于从铸造块逐段扫 RPC。
+  if (getActiveChainId() === 56 || getActiveChainId() === 4663 || getActiveChainId() === 42161) {
     const explorer = await fetchNpmLogsBlockscout(eventName, tokenId, fromBlock, npm)
     if (explorer.complete) {
       return { logs: dedupeNpmLogs(explorer.logs), incomplete: false }
@@ -3560,7 +3561,7 @@ async function listV4TokenIds(
       ? 500n
       : chainId === 56
         ? 48n
-        : chainId === 1 || chainId === 196 || chainId === 8453
+        : chainId === 1 || chainId === 196 || chainId === 8453 || chainId === 42161
           ? 80n
           : 120n
     const start = nextId > probe ? nextId - probe : 1n
@@ -3641,6 +3642,7 @@ async function scanV4TokenIdsByLogs(owner: Address, lookbackBlocks: bigint): Pro
     chainId === 1
     || chainId === 196
     || chainId === 8453
+    || chainId === 42161
     || chainId === 56
       ? 2_000n
       : 8_000n
@@ -3696,6 +3698,137 @@ function v4Salt(tokenId: bigint): `0x${string}` {
   return `0x${tokenId.toString(16).padStart(64, '0')}` as `0x${string}`
 }
 
+type V4ModifyHistoryLog = {
+  blockNumber: bigint
+  transactionHash: Hash
+  logIndex?: number
+  tickLower: number
+  tickUpper: number
+  liquidityDelta: bigint
+}
+
+/**
+ * Arbitrum 每秒产生多个 L2 block，从 NFT 铸造块逐段 eth_getLogs 可能需要数万次请求。
+ * Blockscout 的多 topic API 能先锁定 PoolManager + poolId + PositionManager；命中 1000
+ * 条上限时按区块二分，最后再按 salt（tokenId）过滤，既完整又不会拖死仓位刷新。
+ */
+async function fetchArbitrumV4ModifyLogs(opts: {
+  poolId: `0x${string}`
+  tokenId: bigint
+  fromBlock: bigint
+  toBlock: bigint
+}): Promise<{ logs: V4ModifyHistoryLog[]; complete: boolean }> {
+  type RawLog = {
+    blockNumber?: string
+    data?: Hex
+    logIndex?: string
+    topics?: Array<Hex | null>
+    transactionHash?: Hash
+  }
+  type ApiResponse = {
+    status?: string
+    message?: string
+    result?: RawLog[] | string | null
+  }
+
+  const topics = encodeEventTopics({
+    abi: [V4_MODIFY_LIQUIDITY],
+    eventName: 'ModifyLiquidity',
+    args: { id: opts.poolId, sender: CONTRACTS.v4PositionManager },
+  })
+  const singleTopic = (topic: Hex | Hex[] | null | undefined): Hex | undefined =>
+    Array.isArray(topic) ? topic[0] : topic ?? undefined
+  const topic0 = singleTopic(topics[0])
+  const topic1 = singleTopic(topics[1])
+  const topic2 = singleTopic(topics[2])
+  if (!topic0 || !topic1 || !topic2) return { logs: [], complete: false }
+
+  const readRange = async (
+    fromBlock: bigint,
+    toBlock: bigint,
+    depth = 0,
+  ): Promise<{ rows: RawLog[]; complete: boolean }> => {
+    const url = new URL(`${getExplorerApi()}/api`)
+    url.searchParams.set('module', 'logs')
+    url.searchParams.set('action', 'getLogs')
+    url.searchParams.set('fromBlock', fromBlock.toString())
+    url.searchParams.set('toBlock', toBlock.toString())
+    url.searchParams.set('address', CONTRACTS.v4PoolManager)
+    url.searchParams.set('topic0', topic0)
+    url.searchParams.set('topic1', topic1)
+    url.searchParams.set('topic2', topic2)
+    url.searchParams.set('topic0_1_opr', 'and')
+    url.searchParams.set('topic0_2_opr', 'and')
+    url.searchParams.set('topic1_2_opr', 'and')
+
+    try {
+      const payload = await fetchJson<ApiResponse>(url.toString(), 12_000)
+      if (!Array.isArray(payload.result)) {
+        const message = `${payload.message ?? ''} ${String(payload.result ?? '')}`.trim()
+        if (/no (logs|records)|not found/i.test(message)) return { rows: [], complete: true }
+        return { rows: [], complete: false }
+      }
+      if (payload.result.length >= 1_000) {
+        if (fromBlock >= toBlock || depth >= 24) {
+          return { rows: payload.result, complete: false }
+        }
+        const middle = fromBlock + (toBlock - fromBlock) / 2n
+        const left = await readRange(fromBlock, middle, depth + 1)
+        const right = await readRange(middle + 1n, toBlock, depth + 1)
+        return {
+          rows: [...left.rows, ...right.rows],
+          complete: left.complete && right.complete,
+        }
+      }
+      return { rows: payload.result, complete: true }
+    } catch (e) {
+      console.warn('Arbitrum Blockscout V4 history failed', fromBlock.toString(), e)
+      return { rows: [], complete: false }
+    }
+  }
+
+  const result = await readRange(opts.fromBlock, opts.toBlock)
+  const expectedSalt = v4Salt(opts.tokenId).toLowerCase()
+  const decoded = new Map<string, V4ModifyHistoryLog>()
+  for (const raw of result.rows) {
+    if (!raw.data || !raw.transactionHash || !raw.blockNumber) continue
+    const logTopics = (raw.topics ?? []).filter((topic): topic is Hex => Boolean(topic))
+    if (logTopics.length < 3) continue
+    try {
+      const event = decodeEventLog({
+        abi: [V4_MODIFY_LIQUIDITY],
+        data: raw.data,
+        topics: logTopics as [Hex, ...Hex[]],
+        strict: false,
+      })
+      const args = event.args as {
+        tickLower?: number
+        tickUpper?: number
+        liquidityDelta?: bigint
+        salt?: Hex
+      }
+      if ((args.salt ?? '').toLowerCase() !== expectedSalt) continue
+      const logIndex = raw.logIndex != null ? Number(raw.logIndex) : undefined
+      const row: V4ModifyHistoryLog = {
+        blockNumber: BigInt(raw.blockNumber),
+        transactionHash: raw.transactionHash,
+        logIndex: Number.isFinite(logIndex) ? logIndex : undefined,
+        tickLower: Number(args.tickLower),
+        tickUpper: Number(args.tickUpper),
+        liquidityDelta: args.liquidityDelta ?? 0n,
+      }
+      decoded.set(`${row.transactionHash}:${row.logIndex ?? ''}`, row)
+    } catch {
+      /* malformed explorer row */
+    }
+  }
+  const logs = [...decoded.values()].sort((a, b) => {
+    if (a.blockNumber !== b.blockNumber) return a.blockNumber < b.blockNumber ? -1 : 1
+    return (a.logIndex ?? Number.MAX_SAFE_INTEGER) - (b.logIndex ?? Number.MAX_SAFE_INTEGER)
+  })
+  return { logs, complete: result.complete }
+}
+
 /** Blockscout：该 V4 NFT 的铸造块（扫现金流起点） */
 async function v4MintBlock(tokenId: bigint): Promise<bigint | null> {
   try {
@@ -3733,6 +3866,17 @@ async function collectV4ModifyLogs(opts: {
   const salt = v4Salt(tokenId).toLowerCase()
   const latest = await publicClient.getBlockNumber()
   const chainId = getActiveChainId()
+  if (chainId === 42161) {
+    const explorer = await fetchArbitrumV4ModifyLogs({
+      poolId,
+      tokenId,
+      fromBlock,
+      toBlock: latest,
+    })
+    // 即使 explorer 临时限流，也不要退回数万次 L2 分块扫描；不完整会让
+    // PnL 明确降级为估算，而不是卡住整个仓位刷新或显示伪精确结果。
+    return { logs: explorer.logs, incomplete: !explorer.complete }
+  }
   const span =
     chainId === 1
     || chainId === 196

@@ -13,8 +13,9 @@
     "test:dlmm-layout": "tsx scripts/dlmm-layout.test.mjs",
     "test:dlmm-groups": "node scripts/dlmm-groups.test.mjs",
     "test:mint-payment": "node scripts/mint-payment.test.mjs",
+    "test:chains": "tsx scripts/chain-config.test.mjs",
     "index:flow": "tsx scripts/build-flow-index.mjs",
-    "test": "npm run test:pnl && npm run test:rpc && npm run test:flow && npm run test:dlmm && npm run test:dlmm-layout && npm run test:dlmm-groups && npm run test:mint-payment",
+    "test": "npm run test:pnl && npm run test:rpc && npm run test:flow && npm run test:dlmm && npm run test:dlmm-layout && npm run test:dlmm-groups && npm run test:mint-payment && npm run test:chains",
     "typecheck": "tsc -b",
     "lint": "oxlint",
     "preview": "vite preview"

@@ -62,6 +62,7 @@ function networkSlug(chainId: SupportedChainId): string | null {
   if (chainId === 196) return 'x-layer'
   if (chainId === 4663) return 'robinhood'
   if (chainId === 8453) return 'base'
+  if (chainId === 42161) return 'arbitrum'
   return null
 }
 

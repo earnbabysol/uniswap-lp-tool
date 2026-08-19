@@ -15,6 +15,7 @@ export function defaultRpcUrl(chainId: SupportedChainId = getActiveChainId()): s
   if (chainId === 1) return 'https://ethereum.publicnode.com'
   if (chainId === 196) return 'https://xlayerrpc.okx.com'
   if (chainId === 8453) return 'https://mainnet.base.org'
+  if (chainId === 42161) return 'https://arb1.arbitrum.io/rpc'
   if (chainId === 5042) return 'https://5042.rpc.thirdweb.com'
   if (chainId === 56) return 'https://bsc-dataseed.binance.org'
   return 'https://rpc.mainnet.chain.robinhood.com'

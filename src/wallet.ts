@@ -35,7 +35,7 @@ function makeReadTransport() {
       ? 6_000
       : cfg.key === 'bsc'
         ? 4_000
-        : cfg.key === 'ethereum' || cfg.key === 'xlayer'
+        : cfg.key === 'ethereum' || cfg.key === 'xlayer' || cfg.key === 'arbitrum'
           ? 8_000
           : 20_000
   const retryCount = customUrl ? 2 : cfg.key === 'bsc' ? 0 : 1

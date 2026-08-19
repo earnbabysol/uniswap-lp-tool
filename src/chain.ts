@@ -1,7 +1,7 @@
 import { defineChain, type Address, type Chain } from 'viem'
-import { mainnet, xLayer } from 'viem/chains'
+import { arbitrum, mainnet, xLayer } from 'viem/chains'
 
-export type SupportedChainId = 1 | 196 | 4663 | 8453 | 5042 | 56
+export type SupportedChainId = 1 | 56 | 196 | 4663 | 5042 | 8453 | 42161
 
 /** 同链上额外的 Uniswap-V3 兼容 DEX（如 BSC Pancake） */
 export type V3DexFactory = {
@@ -43,7 +43,7 @@ export type ChainContracts = {
 
 export type AppChainConfig = {
   id: SupportedChainId
-  key: 'ethereum' | 'xlayer' | 'robinhood' | 'base' | 'arc' | 'bsc'
+  key: 'ethereum' | 'arbitrum' | 'xlayer' | 'robinhood' | 'base' | 'arc' | 'bsc'
   label: string
   shortLabel: string
   chain: Chain
@@ -122,6 +122,7 @@ export const bsc = defineChain({
 
 export const ethereum = mainnet
 export const xlayer = xLayer
+export const arbitrumOne = arbitrum
 
 /**
  * Ethereum 主网 Uniswap 官方部署：
@@ -146,6 +147,28 @@ const ETHEREUM_CONTRACTS: ChainContracts = {
 }
 
 const ETHEREUM_USDT: Address = '0xdAC17F958D2ee523a2206206994597C13D831ec7'
+
+/** Uniswap 官方 Arbitrum One 部署： https://github.com/Uniswap/contracts/blob/main/deployments/42161.md */
+const ARBITRUM_CONTRACTS: ChainContracts = {
+  weth: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1',
+  stable: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', // 原生 USDC
+  usdg: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
+  v3Factory: '0x1F98431c8aD98523631AE4a59f267346ea31F984',
+  v3Npm: '0xC36442b4a4522E871399CD717aBDD847Ab11FE88',
+  v3SwapRouter: '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45',
+  v3Quoter: '0x61fFE014bA17989E743c5F6cB21bF9697530B21e',
+  v3QuoterIsV2: true,
+  v4PoolManager: '0x360e68faccca8ca495c1b759fd9eee466db9fb32',
+  v4PositionManager: '0xd88f38f930b7952f2db2432cb002e7abbf3dd869',
+  v4StateView: '0x76fd297e2d437cd7f76d50f01afe6160f86e9990',
+  v4Quoter: '0x3972c00f7ed4885e145823eb7c655375d275a1c5',
+  permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
+  universalRouter: '0x96b2fd2f80e9428daa65d859653117d453981ab4',
+}
+
+const ARBITRUM_USDT0: Address = '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9'
+const ARBITRUM_USDCE: Address = '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8'
+const ARBITRUM_ARB: Address = '0x912CE59144191C1204E64559FE8253a0e49E6548'
 
 /**
  * X Layer 主网 Uniswap 官方部署：
@@ -298,6 +321,32 @@ export const CHAIN_CONFIGS: Record<SupportedChainId, AppChainConfig> = {
     defaultTokenB: ETHEREUM_CONTRACTS.weth,
     hasWrappedNative: true,
     usdStables: [ETHEREUM_USDT],
+  },
+  42161: {
+    id: 42161,
+    key: 'arbitrum',
+    label: 'Arbitrum One',
+    shortLabel: 'Arbitrum',
+    chain: arbitrumOne,
+    defaultRpcUrls: [
+      'https://arb1.arbitrum.io/rpc',
+      'https://arbitrum-one-rpc.publicnode.com',
+      'https://arbitrum.drpc.org',
+    ],
+    explorerUrl: 'https://arbiscan.io',
+    explorerApi: 'https://arbitrum.blockscout.com',
+    contracts: ARBITRUM_CONTRACTS,
+    knownTokens: tokensFromContracts(ARBITRUM_CONTRACTS, {
+      [ARBITRUM_CONTRACTS.stable.toLowerCase()]: { symbol: 'USDC', decimals: 6 },
+      [ARBITRUM_USDT0.toLowerCase()]: { symbol: 'USDT0', decimals: 6 },
+      [ARBITRUM_USDCE.toLowerCase()]: { symbol: 'USDC.e', decimals: 6 },
+      [ARBITRUM_ARB.toLowerCase()]: { symbol: 'ARB', decimals: 18 },
+    }),
+    v3PoolInitCodeHash: '0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54',
+    defaultTokenA: ARBITRUM_CONTRACTS.stable,
+    defaultTokenB: ARBITRUM_CONTRACTS.weth,
+    hasWrappedNative: true,
+    usdStables: [ARBITRUM_USDT0, ARBITRUM_USDCE],
   },
   196: {
     id: 196,
@@ -453,7 +502,7 @@ function readSavedChainId(): SupportedChainId {
   try {
     const raw = localStorage.getItem(CHAIN_KEY)
     const id = Number(raw)
-    if (id === 1 || id === 196 || id === 4663 || id === 8453 || id === 5042 || id === 56) return id
+    if (id === 1 || id === 56 || id === 196 || id === 4663 || id === 5042 || id === 8453 || id === 42161) return id
   } catch {
     /* ignore */
   }
@@ -483,7 +532,7 @@ export function setActiveChainId(id: SupportedChainId): AppChainConfig {
 }
 
 export function isSupportedChainId(id: number): id is SupportedChainId {
-  return id === 1 || id === 196 || id === 4663 || id === 8453 || id === 5042 || id === 56
+  return id === 1 || id === 56 || id === 196 || id === 4663 || id === 5042 || id === 8453 || id === 42161
 }
 
 /** 当前链是否有可 wrap 的原生币（WETH / WBNB） */

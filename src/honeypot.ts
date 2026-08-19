@@ -59,7 +59,7 @@ export async function fetchTransferTaxBps(
   chainId: number,
   token: Address,
 ): Promise<number | null> {
-  if (chainId !== 56 && chainId !== 1) return null
+  if (chainId !== 56 && chainId !== 1 && chainId !== 42161) return null
   if (isHoneypotWhitelisted(chainId as SupportedChainId, token)) return 0
   const url =
     `https://api.gopluslabs.io/api/v1/token_security/${chainId}?contract_addresses=${token.toLowerCase()}`
@@ -95,8 +95,8 @@ export async function fetchTransferTaxBps(
  * 网络失败时返回 null（调用方决定是否放行）。
  */
 async function goPlusCheck(chainId: number, token: Address): Promise<boolean | null> {
-  // GoPlus：1=ETH 56=BSC；Robinhood 无官方链码，跳过
-  if (chainId !== 56 && chainId !== 1) return null
+  // GoPlus：1=ETH、56=BSC、42161=Arbitrum；Robinhood 等无官方链码时跳过。
+  if (chainId !== 56 && chainId !== 1 && chainId !== 42161) return null
   const url =
     `https://api.gopluslabs.io/api/v1/token_security/${chainId}?contract_addresses=${token.toLowerCase()}`
   try {
