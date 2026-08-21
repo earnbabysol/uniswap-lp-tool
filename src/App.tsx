@@ -25,6 +25,7 @@ import {
   closeV4PositionBatch,
   createV3PoolAndSeed,
   createV4PoolAndSeed,
+  createV4DirectionalTaxPoolAndSeed,
   describeFullRange,
   describeRange,
   discoverPoolsByQuery,
@@ -172,6 +173,12 @@ import {
 } from './graphSettings'
 import { fetchTransferTaxBps, isHoneypotWhitelisted } from './honeypot'
 import { chooseWrappedPoolPayment, type BalanceReadStatus } from './mintPayment'
+import {
+  DIRECTIONAL_TAX_PRESETS_BPS,
+  readDirectionalTaxHookConfig,
+  supportsDirectionalTax,
+  type DirectionalTaxHookConfig,
+} from './directionalTaxHook'
 import './App.css'
 import './signer.css'
 
@@ -453,6 +460,7 @@ export default function App() {
   const [tokenMetaCache, setTokenMetaCache] = useState<Record<string, { symbol: string; decimals: number }>>({})
   const [fee, setFee] = useState(500)
   const [pool, setPool] = useState<PoolInfo | null>(null)
+  const [poolDirectionalTax, setPoolDirectionalTax] = useState<DirectionalTaxHookConfig | null>(null)
   const [scannedPools, setScannedPools] = useState<PoolInfo[]>([])
   const [amount0, setAmount0] = useState('')
   const [amount1, setAmount1] = useState('')
@@ -484,6 +492,8 @@ export default function App() {
   const [showCreatePool, setShowCreatePool] = useState(false)
   const [v4TickSpacing, setV4TickSpacing] = useState(200)
   const [customFeeInput, setCustomFeeInput] = useState('')
+  const [directionalTaxBps, setDirectionalTaxBps] = useState(0)
+  const [directionalTaxTokenSide, setDirectionalTaxTokenSide] = useState<'coin' | 'quote'>('coin')
   const [seedOnCreate, setSeedOnCreate] = useState(true)
   const [seedAmtA, setSeedAmtA] = useState('')
   const [seedAmtB, setSeedAmtB] = useState('')
@@ -508,6 +518,25 @@ export default function App() {
   /** 递增可使进行中的刷新结果全部作废（切链 / 重新刷新 / 断开） */
   const refreshGenRef = useRef(0)
   const refreshingRef = useRef(false)
+
+  useEffect(() => {
+    let cancelled = false
+    const hook = pool?.version === 'v4' ? pool.hooks : undefined
+    if (!hook || hook.toLowerCase() === '0x0000000000000000000000000000000000000000') {
+      setPoolDirectionalTax(null)
+      return () => { cancelled = true }
+    }
+    setPoolDirectionalTax(null)
+    void readDirectionalTaxHookConfig(hook).then((config) => {
+      if (cancelled) return
+      if (config && pool?.poolId && config.poolId.toLowerCase() !== pool.poolId.toLowerCase()) {
+        setPoolDirectionalTax(null)
+        return
+      }
+      setPoolDirectionalTax(config)
+    })
+    return () => { cancelled = true }
+  }, [chainId, pool?.hooks, pool?.poolId, pool?.version])
   useEffect(() => {
     tabRef.current = tab
   }, [tab])
@@ -1178,6 +1207,7 @@ export default function App() {
       setChainId(nextId)
       setTokenA(cfg.defaultTokenA)
       setTokenB(cfg.defaultTokenB)
+      if (!supportsDirectionalTax(nextId)) setDirectionalTaxBps(0)
       setTokenMetaCache({})
       balanceRefreshGenRef.current += 1
       setEthBal(0n)
@@ -2192,6 +2222,8 @@ export default function App() {
     const quoteIsA = ethA && !ethB
     return { coin: quoteIsA ? tokenB : tokenA, quote: quoteIsA ? tokenA : tokenB }
   }, [tokenA, tokenB])
+  const directionalTaxEnabled = mintProtocol === 'v4' && directionalTaxBps > 0
+  const directionalTaxToken = directionalTaxTokenSide === 'coin' ? createSides.coin : createSides.quote
 
   /** 拉报价代币的 USD 单价，用来把 U 本位输入换算成链上要的「报价 per 币」 */
   useEffect(() => {
@@ -2231,8 +2263,8 @@ export default function App() {
     else if (ethB && !ethA) initialPriceBPerA = price
     if (!(initialPriceBPerA > 0) || !Number.isFinite(initialPriceBPerA)) return null
 
-    let useFee = fee
-    if (mintProtocol === 'v4' && customFeeInput.trim()) {
+    let useFee = directionalTaxEnabled ? 0 : fee
+    if (mintProtocol === 'v4' && !directionalTaxEnabled && customFeeInput.trim()) {
       const pct = Number(customFeeInput.replace(/%/g, '').trim())
       if (pct > 0 && Number.isFinite(pct)) useFee = Math.round(pct * 10000)
     }
@@ -2313,6 +2345,7 @@ export default function App() {
     mintProtocol,
     v4TickSpacing,
     customFeeInput,
+    directionalTaxEnabled,
     useNativeEth,
     createRangePreset,
     createUsdLo,
@@ -2581,7 +2614,11 @@ export default function App() {
       tickUpper = createSynth.range.tickUpper
     }
 
-    if (mintProtocol === 'v4' && customFeeInput.trim()) {
+    if (directionalTaxEnabled && !supportsDirectionalTax(chainId)) {
+      setStatus('买卖税 Hook 首批仅支持 Base、BSC、Robinhood 和 Ethereum')
+      return
+    }
+    if (mintProtocol === 'v4' && !directionalTaxEnabled && customFeeInput.trim()) {
       const pct = Number(customFeeInput.replace(/%/g, '').trim())
       if (!(pct > 0) || !Number.isFinite(pct)) {
         setStatus('自定义费率无效，例如填 0.3 表示 0.30%')
@@ -2632,39 +2669,89 @@ export default function App() {
           taxA = isHoneypotWhitelisted(chainId, tokenA) || isEthLikeCurrency(tokenA) ? 0 : transferTaxBps
           taxB = isHoneypotWhitelisted(chainId, tokenB) || isEthLikeCurrency(tokenB) ? 0 : transferTaxBps
         }
-        const { pool: info, hash, seeded } = await createV4PoolAndSeed({
-          walletClient: wallet,
-          owner: address,
-          tokenA,
-          tokenB,
-          fee: useFee,
-          tickSpacing: v4TickSpacing,
-          initialPriceBPerA,
-          amountA: seedOnCreate ? amountA : undefined,
-          amountB: seedOnCreate ? amountB : undefined,
-          tickLower,
-          tickUpper,
-          // 非 ETH 对绝不走原生/Wrap 路径（避免误弹换 WETH）
-          useNativeEth: useNativeEth && (ethA || ethB),
-          slippageBps,
-          transferTaxBpsA: taxA,
-          transferTaxBpsB: taxB,
-          onStatus: setStatus,
-        })
-        setPool(info)
-        setFee(useFee)
-        setShowCreatePool(false)
-        const q = getCoinQuote(info)
-        setStatusHash(hash)
-        setTxHistory(pushTxHistory({
-          label: seeded ? '创建 V4 池+初仓' : '创建 V4 池',
-          hash,
-          pair: `${q.coin.symbol}/${q.quote.symbol}`,
-        }))
-        setStatus(
-          `V4 池已就绪 · fee ${(useFee / 10000).toFixed(2)}% · spacing ${v4TickSpacing} · 币价 ${formatPrice(q.spot)}`,
-        )
-        void refreshPositions({ silent: true })
+        if (directionalTaxEnabled) {
+          const result = await createV4DirectionalTaxPoolAndSeed({
+            walletClient: wallet,
+            owner: address,
+            tokenA,
+            tokenB,
+            tickSpacing: v4TickSpacing,
+            initialPriceBPerA,
+            taxToken: directionalTaxToken,
+            buyTaxBps: directionalTaxBps,
+            sellTaxBps: directionalTaxBps,
+            amountA: seedOnCreate ? amountA : undefined,
+            amountB: seedOnCreate ? amountB : undefined,
+            tickLower,
+            tickUpper,
+            useNativeEth: useNativeEth && (ethA || ethB),
+            slippageBps,
+            transferTaxBpsA: taxA,
+            transferTaxBpsB: taxB,
+            onStatus: setStatus,
+          })
+          const info = result.pool
+          const q = getCoinQuote(info)
+          const pair = `${q.coin.symbol}/${q.quote.symbol}`
+          if (result.factoryHash) {
+            pushTxHistory({ label: '部署 V4 税率 Hook 工厂', hash: result.factoryHash, pair })
+          }
+          pushTxHistory({ label: `创建 V4 ${directionalTaxBps / 100}% 税率池`, hash: result.hash, pair })
+          if (result.seedHash) {
+            pushTxHistory({ label: '税率池注入初仓', hash: result.seedHash, pair })
+          }
+          setTxHistory(loadTxHistory())
+          setPool(info)
+          setFee(0)
+          setShowCreatePool(false)
+          setStatusHash(result.seedHash ?? result.hash)
+          if (result.seedError) {
+            setStatus(
+              `税率池已创建（Hook ${shortAddr(result.hook)}），但初仓未注入：${result.seedError}。` +
+              '池不会丢失，可在当前页面重新 Mint。',
+            )
+          } else {
+            setStatus(
+              `V4 税率池已就绪 · LP fee 0% · 买卖税 ${directionalTaxBps / 100}% · ` +
+              `收款 ${shortAddr(address)} · Hook ${shortAddr(result.hook)}`,
+            )
+          }
+          if (result.seeded) void refreshPositions({ silent: true })
+        } else {
+          const { pool: info, hash, seeded } = await createV4PoolAndSeed({
+            walletClient: wallet,
+            owner: address,
+            tokenA,
+            tokenB,
+            fee: useFee,
+            tickSpacing: v4TickSpacing,
+            initialPriceBPerA,
+            amountA: seedOnCreate ? amountA : undefined,
+            amountB: seedOnCreate ? amountB : undefined,
+            tickLower,
+            tickUpper,
+            // 非 ETH 对绝不走原生/Wrap 路径（避免误弹换 WETH）
+            useNativeEth: useNativeEth && (ethA || ethB),
+            slippageBps,
+            transferTaxBpsA: taxA,
+            transferTaxBpsB: taxB,
+            onStatus: setStatus,
+          })
+          setPool(info)
+          setFee(useFee)
+          setShowCreatePool(false)
+          const q = getCoinQuote(info)
+          setStatusHash(hash)
+          setTxHistory(pushTxHistory({
+            label: seeded ? '创建 V4 池+初仓' : '创建 V4 池',
+            hash,
+            pair: `${q.coin.symbol}/${q.quote.symbol}`,
+          }))
+          setStatus(
+            `V4 池已就绪 · fee ${(useFee / 10000).toFixed(2)}% · spacing ${v4TickSpacing} · 币价 ${formatPrice(q.spot)}`,
+          )
+          void refreshPositions({ silent: true })
+        }
       } else {
         const { pool: info, hash, created, seeded } = await createV3PoolAndSeed({
           walletClient: wallet,
@@ -2702,6 +2789,30 @@ export default function App() {
     } finally {
       setBusy(false)
     }
+  }
+
+  const requestCreatePool = () => {
+    if (!directionalTaxEnabled) {
+      void createPool()
+      return
+    }
+    const pct = directionalTaxBps / 100
+    confirmThen({
+      title: `确认创建买卖税 ${pct}% 的 V4 池？`,
+      lines: [
+        `LP 手续费：0% · 项目币：${tokenLabel(directionalTaxToken)}`,
+        `买入税 ${pct}% · 卖出税 ${pct}% · 税款进入 ${address ? shortAddr(address) : '建池钱包'}`,
+        '项目币、税率和收款地址会在初始化时永久冻结，之后任何人都不能修改。',
+        seedOnCreate
+          ? '创建池与注入初仓分成两笔核心交易；本链首次使用还会先部署一次公共工厂。'
+          : '本链首次使用会先部署一次公共工厂，然后再创建池。',
+        directionalTaxBps >= 5000
+          ? `高税警告：精确输入交易中，${pct}% 会被扣除，用户约只收到剩余 ${100 - pct}%。`
+          : '这是自定义 Hook 池，第三方界面可能不会自动展示或路由。',
+      ],
+      confirmLabel: directionalTaxBps >= 3000 ? `我了解风险，创建 ${pct}% 税率池` : '确认并创建',
+      danger: directionalTaxBps >= 3000,
+    }, () => void createPool())
   }
 
   const poolSpotUsd = pool
@@ -4923,7 +5034,13 @@ export default function App() {
                   type="button"
                   aria-pressed={mintProtocol === v}
                   className={`filter-chip ${mintProtocol === v ? 'active' : ''}`}
-                  onClick={() => { setMintProtocol(v); setPool(null); setScannedPools([]); setShowCreatePool(false) }}
+                  onClick={() => {
+                    setMintProtocol(v)
+                    setPool(null)
+                    setScannedPools([])
+                    setShowCreatePool(false)
+                    if (v === 'v3') setDirectionalTaxBps(0)
+                  }}
                 >
                   {v.toUpperCase()}
                 </button>
@@ -4975,7 +5092,10 @@ export default function App() {
                   className={`filter-chip mono ${fee === f ? 'active' : ''}`}
                   onClick={() => {
                     setFee(f)
-                    if (mintProtocol === 'v4') setV4TickSpacing(suggestV4TickSpacing(f))
+                    if (mintProtocol === 'v4') {
+                      setDirectionalTaxBps(0)
+                      setV4TickSpacing(suggestV4TickSpacing(f))
+                    }
                   }}
                 >
                   {(f / 10000).toFixed(2)}%
@@ -5012,10 +5132,14 @@ export default function App() {
                 setShowCreatePool(true)
                 setPool(null)
                 if (mintProtocol === 'v4') {
-                  setV4TickSpacing(suggestV4TickSpacing(fee))
+                  setV4TickSpacing(directionalTaxEnabled ? 1 : suggestV4TickSpacing(fee))
                   setCustomFeeInput('')
                 }
-                setStatus(`填写初始价后创建 ${mintProtocol.toUpperCase()} 池（可同笔注入初仓）`)
+                setStatus(
+                  directionalTaxEnabled
+                    ? `填写初始价后创建 V4 0% LP 费率 + ${directionalTaxBps / 100}% 买卖税池`
+                    : `填写初始价后创建 ${mintProtocol.toUpperCase()} 池（可同笔注入初仓）`,
+                )
               }}
             >
               找不到？创建新池
@@ -5026,7 +5150,11 @@ export default function App() {
             <div className="mint-create">
               <div className="mint-create-title">
                 创建 {mintProtocol.toUpperCase()} 池
-                {seedOnCreate ? ' + 注入初仓（同笔交易）' : '（仅初始化）'}
+                {seedOnCreate
+                  ? directionalTaxEnabled
+                    ? ' + 注入初仓（Hook 池分两笔）'
+                    : ' + 注入初仓（同笔交易）'
+                  : '（仅初始化）'}
               </div>
               <p className="muted mint-create-lead">
                 自选交易对并设定初始价（<strong>USD / {tokenLabel(createSides.coin)}</strong>），系统会自动换算成链上需要的
@@ -5053,56 +5181,165 @@ export default function App() {
               </div>
 
               {mintProtocol === 'v4' && (
-                <div className="grid2" style={{ marginBottom: 8 }}>
-                  <label>
-                    V4 费率
-                    <select
-                      value={
-                        (V4_FEE_PRESETS as readonly number[]).includes(fee) && !customFeeInput
-                          ? fee
-                          : -1
-                      }
-                      onChange={(e) => {
-                        const v = Number(e.target.value)
-                        if (v < 0) return
-                        setFee(v)
-                        setCustomFeeInput('')
-                        setV4TickSpacing(suggestV4TickSpacing(v))
-                      }}
-                    >
-                      {V4_FEE_PRESETS.map((f) => (
-                        <option key={f} value={f}>{(f / 10000).toFixed(2)}%</option>
-                      ))}
-                      <option value={-1}>自定义…</option>
-                    </select>
-                  </label>
-                  <label>
-                    自定义费率 %
-                    <input
-                      value={customFeeInput}
-                      onChange={(e) => {
-                        setCustomFeeInput(e.target.value)
-                        const pct = Number(e.target.value.replace(/%/g, '').trim())
-                        if (pct > 0 && Number.isFinite(pct)) {
-                          const f = Math.round(pct * 10000)
-                          setFee(f)
-                          setV4TickSpacing(suggestV4TickSpacing(f))
-                        }
-                      }}
-                      placeholder="如 0.25 → 0.25%"
-                      inputMode="decimal"
-                    />
-                  </label>
-                  <label>
-                    tickSpacing
-                    <input
-                      type="number"
-                      value={v4TickSpacing}
-                      min={1}
-                      max={16384}
-                      onChange={(e) => setV4TickSpacing(Math.max(1, Number(e.target.value) || 1))}
-                    />
-                  </label>
+                <div className="v4-charge-builder">
+                  <div className="v4-charge-head">
+                    <span className="lbl">收费方式</span>
+                    <div className="seg" role="group" aria-label="V4 收费方式">
+                      <button
+                        type="button"
+                        className={`filter-chip ${!directionalTaxEnabled ? 'active' : ''}`}
+                        aria-pressed={!directionalTaxEnabled}
+                        onClick={() => {
+                          setDirectionalTaxBps(0)
+                          if (fee === 0) {
+                            setFee(500)
+                            setV4TickSpacing(suggestV4TickSpacing(500))
+                          }
+                        }}
+                      >
+                        普通 LP 手续费
+                      </button>
+                      <button
+                        type="button"
+                        className={`filter-chip ${directionalTaxEnabled ? 'active' : ''}`}
+                        aria-pressed={directionalTaxEnabled}
+                        disabled={!supportsDirectionalTax(chainId)}
+                        title={supportsDirectionalTax(chainId) ? 'LP fee 0%，买卖税直接进入建池钱包' : '首批仅支持 ETH / Base / BSC / Robinhood'}
+                        onClick={() => {
+                          setDirectionalTaxBps((prev) => prev > 0 ? prev : 100)
+                          setCustomFeeInput('')
+                          setV4TickSpacing(1)
+                          setStatus('已选择 0% LP 费率 + 买卖税 Hook；参数将在建池时永久冻结')
+                        }}
+                      >
+                        0% + 买卖税 Hook
+                      </button>
+                    </div>
+                  </div>
+
+                  {!directionalTaxEnabled ? (
+                    <div className="grid2" style={{ marginBottom: 8 }}>
+                      <label>
+                        V4 LP 费率
+                        <select
+                          value={
+                            (V4_FEE_PRESETS as readonly number[]).includes(fee) && !customFeeInput
+                              ? fee
+                              : -1
+                          }
+                          onChange={(e) => {
+                            const v = Number(e.target.value)
+                            if (v < 0) return
+                            setDirectionalTaxBps(0)
+                            setFee(v)
+                            setCustomFeeInput('')
+                            setV4TickSpacing(suggestV4TickSpacing(v))
+                          }}
+                        >
+                          {V4_FEE_PRESETS.map((f) => (
+                            <option key={f} value={f}>{(f / 10000).toFixed(2)}%</option>
+                          ))}
+                          <option value={-1}>自定义…</option>
+                        </select>
+                      </label>
+                      <label>
+                        自定义 LP 费率 %
+                        <input
+                          value={customFeeInput}
+                          onChange={(e) => {
+                            setDirectionalTaxBps(0)
+                            setCustomFeeInput(e.target.value)
+                            const pct = Number(e.target.value.replace(/%/g, '').trim())
+                            if (pct > 0 && Number.isFinite(pct)) {
+                              const f = Math.round(pct * 10000)
+                              setFee(f)
+                              setV4TickSpacing(suggestV4TickSpacing(f))
+                            }
+                          }}
+                          placeholder="如 0.25 → 0.25%"
+                          inputMode="decimal"
+                        />
+                      </label>
+                      <label>
+                        tickSpacing
+                        <input
+                          type="number"
+                          value={v4TickSpacing}
+                          min={1}
+                          max={16384}
+                          onChange={(e) => setV4TickSpacing(Math.max(1, Number(e.target.value) || 1))}
+                        />
+                      </label>
+                    </div>
+                  ) : (
+                    <div className={`directional-tax-box ${directionalTaxBps >= 5000 ? 'extreme' : directionalTaxBps >= 3000 ? 'high' : ''}`}>
+                      <div className="directional-tax-title">
+                        <div>
+                          <strong>LP 手续费固定 0%</strong>
+                          <span>税率由每个池的专属 Hook 结算</span>
+                        </div>
+                        <span className="tag warn">不可修改</span>
+                      </div>
+                      <span className="lbl">买入与卖出税率</span>
+                      <div className="tax-rate-grid" role="group" aria-label="买卖税率">
+                        {DIRECTIONAL_TAX_PRESETS_BPS.filter((bps) => bps > 0).map((bps) => (
+                          <button
+                            key={`hook-tax-${bps}`}
+                            type="button"
+                            aria-pressed={directionalTaxBps === bps}
+                            className={`tax-rate-chip ${directionalTaxBps === bps ? 'active' : ''} ${bps >= 5000 ? 'extreme' : bps >= 3000 ? 'high' : ''}`}
+                            onClick={() => setDirectionalTaxBps(bps)}
+                          >
+                            {bps / 100}%
+                          </button>
+                        ))}
+                      </div>
+                      <div className="grid2 directional-tax-config">
+                        <div className="tax-project-field">
+                          <span className="lbl">哪个是项目币</span>
+                          <div className="seg">
+                            <button
+                              type="button"
+                              className={`filter-chip ${directionalTaxTokenSide === 'coin' ? 'active' : ''}`}
+                              aria-pressed={directionalTaxTokenSide === 'coin'}
+                              onClick={() => setDirectionalTaxTokenSide('coin')}
+                            >
+                              {tokenLabel(createSides.coin)}
+                            </button>
+                            <button
+                              type="button"
+                              className={`filter-chip ${directionalTaxTokenSide === 'quote' ? 'active' : ''}`}
+                              aria-pressed={directionalTaxTokenSide === 'quote'}
+                              onClick={() => setDirectionalTaxTokenSide('quote')}
+                            >
+                              {tokenLabel(createSides.quote)}
+                            </button>
+                          </div>
+                        </div>
+                        <label>
+                          税款收款地址（永久）
+                          <input value={address ?? '连接钱包后显示'} disabled className="mono" />
+                        </label>
+                        <label>
+                          tickSpacing
+                          <input
+                            type="number"
+                            value={v4TickSpacing}
+                            min={1}
+                            max={16384}
+                            onChange={(e) => setV4TickSpacing(Math.max(1, Number(e.target.value) || 1))}
+                          />
+                        </label>
+                      </div>
+                      <p className="directional-tax-warning">
+                        {directionalTaxBps >= 5000
+                          ? `极高税率：精确输入交易约只剩 ${100 - directionalTaxBps / 100}% 到达交易者；多数聚合器可能拒绝路由。`
+                          : directionalTaxBps >= 3000
+                            ? '高税率会显著降低成交与路由成功率，创建前必须再次确认。'
+                            : '项目币、买卖税率和收款钱包会在建池时冻结；第三方界面可能只显示 LP fee 0%，请主动披露 Hook 税率。'}
+                      </p>
+                    </div>
+                  )}
                 </div>
               )}
               {createHasEthLike && (
@@ -5161,11 +5398,13 @@ export default function App() {
 
               <label className="inline-setting check" style={{ margin: '12px 0 8px' }}>
                 <input type="checkbox" checked={seedOnCreate} onChange={(e) => setSeedOnCreate(e.target.checked)} />
-                同时注入初仓（与创建同笔发送）
+                {directionalTaxEnabled ? '创建后继续注入初仓（分两笔核心交易）' : '同时注入初仓（与创建同笔发送）'}
               </label>
               {mintProtocol === 'v4' && seedOnCreate && (
                 <p className="muted small" style={{ marginTop: -4, marginBottom: 8 }}>
-                  上方费率档是池手续费。注入时山寨币转账扣费会自动垫付；仍失败可先取消本勾选，只建空池再 Mint。
+                  {directionalTaxEnabled
+                    ? '税率 Hook 必须先原子创建并初始化，随后再注入 NFT 初仓；若注入失败，已创建的池仍会保留并自动加载。'
+                    : '上方费率档是池手续费。注入时山寨币转账扣费会自动垫付；仍失败可先取消本勾选，只建空池再 Mint。'}
                 </p>
               )}
 
@@ -5351,8 +5590,16 @@ export default function App() {
               )}
 
               <div className="btn-row" style={{ marginTop: 10 }}>
-                <button className="btn primary" disabled={busy || !address} onClick={() => void createPool()}>
-                  {!address ? '先连接钱包' : seedOnCreate ? '创建并注入流动性' : '创建并初始化'}
+                <button className="btn primary" disabled={busy || !address} onClick={requestCreatePool}>
+                  {!address
+                    ? '先连接钱包'
+                    : directionalTaxEnabled
+                      ? seedOnCreate
+                        ? `创建 ${directionalTaxBps / 100}% 税率池并注入`
+                        : `创建 ${directionalTaxBps / 100}% 税率池`
+                      : seedOnCreate
+                        ? '创建并注入流动性'
+                        : '创建并初始化'}
                 </button>
                 <button className="btn" type="button" disabled={busy} onClick={() => setShowCreatePool(false)}>取消</button>
               </div>
@@ -5527,9 +5774,25 @@ export default function App() {
                   </span>
                 </div>
                 {pool.version === 'v4' && pool.hooks && pool.hooks.toLowerCase() !== '0x0000000000000000000000000000000000000000' && (
-                  <p className="hook-warn">
-                    含自定义 Hook（{shortAddr(pool.hooks)}），可能拒绝外部流动性或改变费用逻辑，开仓前请确认。
-                  </p>
+                  poolDirectionalTax ? (
+                    <div className={`hook-tax-summary ${Math.max(poolDirectionalTax.buyTaxBps, poolDirectionalTax.sellTaxBps) >= 5000 ? 'extreme' : Math.max(poolDirectionalTax.buyTaxBps, poolDirectionalTax.sellTaxBps) >= 3000 ? 'high' : ''}`}>
+                      <div>
+                        <strong>RangeDesk 买卖税 Hook</strong>
+                        <span className="tag warn">LP fee 0%</span>
+                      </div>
+                      <div className="hook-tax-summary-grid">
+                        <span>项目币 <b>{pool.token0.address.toLowerCase() === poolDirectionalTax.taxToken.toLowerCase() ? pool.token0.symbol : pool.token1.symbol}</b></span>
+                        <span>买入税 <b>{poolDirectionalTax.buyTaxBps / 100}%</b></span>
+                        <span>卖出税 <b>{poolDirectionalTax.sellTaxBps / 100}%</b></span>
+                        <span>收款 <b className="mono">{shortAddr(poolDirectionalTax.collector)}</b></span>
+                      </div>
+                      <p>Hook {shortAddr(pool.hooks)} · 参数已永久冻结，第三方界面不一定自动展示税率。</p>
+                    </div>
+                  ) : (
+                    <p className="hook-warn">
+                      含自定义 Hook（{shortAddr(pool.hooks)}），可能拒绝外部流动性或改变费用逻辑，开仓前请确认。
+                    </p>
+                  )
                 )}
                 {mintSwapOpen && (
                   <div className="mint-pool-swap op-block">

@@ -13,6 +13,11 @@ dist-ssr
 .index-cache
 *.local
 
+# Foundry smart-contract build output
+contracts/cache/
+contracts/out/
+contracts/broadcast/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -201,6 +201,13 @@ export async function quotePoolSwap(opts: {
   if (amountOut != null && amountOut > 0n) {
     quoted = true
   } else {
+    if (
+      position.version === 'v4'
+      && position.hooks
+      && position.hooks.toLowerCase() !== zeroAddress.toLowerCase()
+    ) {
+      throw new Error('自定义 Hook 池报价失败：为避免漏算买卖税，已拒绝使用不含 Hook 的现价估算')
+    }
     amountOut = estimateOutMid(amountIn, position.sqrtPriceX96, zeroForOne, position.fee)
     if (amountOut <= 0n) throw new Error('报价失败：池价或流动性异常')
   }

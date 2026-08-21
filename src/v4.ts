@@ -24,6 +24,7 @@ import {
 } from './math'
 import type { PoolInfo, PositionRow } from './lp'
 import { publicClient } from './wallet'
+import { createDirectionalTaxPool } from './directionalTaxHook'
 
 export const NATIVE_ETH = zeroAddress
 
@@ -43,6 +44,7 @@ export const V4_ACTIONS = {
 const OPEN_DELTA = 0n
 
 const FEE_SPACINGS: Record<number, number[]> = {
+  0: [1],
   100: [1],
   500: [10],
   3000: [60],
@@ -1494,6 +1496,156 @@ export async function mintV4DlmmPositions(opts: {
   return { hash, pool: live, bands: prepared, amount0: totalNeed0, amount1: totalNeed1 }
 }
 
+export async function createV4DirectionalTaxPoolAndSeed(opts: {
+  walletClient: WalletClient
+  owner: Address
+  tokenA: Address
+  tokenB: Address
+  tickSpacing: number
+  /** 人类价：tokenB per tokenA */
+  initialPriceBPerA: number
+  /** 与 tokenA / tokenB 中的一侧相同；ETH/WETH 会按 useNativeEth 映射 */
+  taxToken: Address
+  buyTaxBps: number
+  sellTaxBps: number
+  amountA?: bigint
+  amountB?: bigint
+  tickLower?: number
+  tickUpper?: number
+  useNativeEth?: boolean
+  slippageBps?: number
+  transferTaxBpsA?: number
+  transferTaxBpsB?: number
+  onStatus?: (msg: string) => void
+}): Promise<{
+  pool: PoolInfo
+  hash: `0x${string}`
+  factoryHash?: `0x${string}`
+  seedHash?: `0x${string}`
+  hook: Address
+  seeded: boolean
+  seedError?: string
+}> {
+  const {
+    walletClient,
+    owner,
+    tokenA,
+    tokenB,
+    tickSpacing,
+    initialPriceBPerA,
+    taxToken,
+    buyTaxBps,
+    sellTaxBps,
+    onStatus,
+  } = opts
+  if (!(tickSpacing > 0) || tickSpacing > 16_384) throw new Error('tickSpacing 无效')
+  if (!(initialPriceBPerA > 0)) throw new Error('初始价格必须 > 0')
+
+  const useNative = opts.useNativeEth !== false
+  const resolveSide = (token: Address): Address => {
+    if (!isEthLikeCurrency(token)) return token
+    return useNative ? NATIVE_ETH : CONTRACTS.weth
+  }
+  const rawA = resolveSide(tokenA)
+  const rawB = resolveSide(tokenB)
+  if (rawA.toLowerCase() === rawB.toLowerCase()) throw new Error('两个 Currency 不能相同')
+  if (taxToken.toLowerCase() !== tokenA.toLowerCase() && taxToken.toLowerCase() !== tokenB.toLowerCase()) {
+    throw new Error('项目币必须是当前交易对中的一侧')
+  }
+  const rawTaxToken = resolveSide(taxToken)
+  const [currency0, currency1] = sortCurrencies(rawA, rawB)
+  const mapAbTo01 = (amountA: bigint, amountB: bigint) => (
+    currency0.toLowerCase() === rawA.toLowerCase()
+      ? { amount0: amountA, amount1: amountB }
+      : { amount0: amountB, amount1: amountA }
+  )
+  const seed = mapAbTo01(opts.amountA ?? 0n, opts.amountB ?? 0n)
+  const taxes = mapAbTo01(
+    BigInt(Math.max(0, opts.transferTaxBpsA ?? 0)),
+    BigInt(Math.max(0, opts.transferTaxBpsB ?? 0)),
+  )
+
+  const decimalsOf = async (currency: Address) => {
+    if (isNativeCurrency(currency)) return 18
+    return Number(await withTimeout(
+      publicClient.readContract({ address: currency, abi: erc20Abi, functionName: 'decimals' }),
+      15_000,
+      '读取 decimals',
+    ))
+  }
+  onStatus?.('计算 0% LP 费率池初始价格…')
+  const [dec0, dec1] = await Promise.all([decimalsOf(currency0), decimalsOf(currency1)])
+  const sortedPrice = currency0.toLowerCase() === rawA.toLowerCase()
+    ? initialPriceBPerA
+    : 1 / initialPriceBPerA
+  const sqrtPriceX96 = priceToSqrtPriceX96(sortedPrice, dec0, dec1)
+
+  const deployment = await createDirectionalTaxPool({
+    walletClient,
+    owner,
+    currency0,
+    currency1,
+    tickSpacing,
+    sqrtPriceX96,
+    taxToken: rawTaxToken,
+    buyTaxBps,
+    sellTaxBps,
+    onStatus,
+  })
+  const key: V4PoolKey = {
+    currency0,
+    currency1,
+    fee: 0,
+    tickSpacing,
+    hooks: deployment.hook,
+  }
+  const pool = await loadV4Pool(key)
+  const wantsSeed = seed.amount0 > 0n || seed.amount1 > 0n
+  if (!wantsSeed) {
+    return {
+      pool,
+      hash: deployment.poolHash,
+      factoryHash: deployment.factoryHash,
+      hook: deployment.hook,
+      seeded: false,
+    }
+  }
+
+  onStatus?.('税率池已创建；准备第二笔交易注入初仓…')
+  try {
+    const seedHash = await mintV4Position({
+      walletClient,
+      owner,
+      pool,
+      amount0: seed.amount0,
+      amount1: seed.amount1,
+      tickLower: opts.tickLower,
+      tickUpper: opts.tickUpper,
+      useNativeEth: useNative,
+      slippageBps: opts.slippageBps,
+      transferTaxBps0: Number(taxes.amount0),
+      transferTaxBps1: Number(taxes.amount1),
+      onStatus,
+    })
+    return {
+      pool: await loadV4Pool(key),
+      hash: deployment.poolHash,
+      factoryHash: deployment.factoryHash,
+      seedHash,
+      hook: deployment.hook,
+      seeded: true,
+    }
+  } catch (error) {
+    return {
+      pool,
+      hash: deployment.poolHash,
+      factoryHash: deployment.factoryHash,
+      hook: deployment.hook,
+      seeded: false,
+      seedError: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
 
 /**
  * 创建并初始化 V4 池；若提供 amount0/amount1 则同笔 multicall 注入首仓。
@@ -1538,7 +1690,7 @@ export async function createV4PoolAndSeed(opts: {
   const slippageBps = opts.slippageBps ?? 300
   const taxA = Math.max(0, opts.transferTaxBpsA ?? 0)
   const taxB = Math.max(0, opts.transferTaxBpsB ?? 0)
-  if (!(fee > 0) || fee > 1_000_000) throw new Error('V4 费率无效（单位：百分之一 bp，如 3000=0.30%）')
+  if (fee < 0 || fee > 1_000_000) throw new Error('V4 费率无效（单位：百分之一 bp，如 3000=0.30%）')
   if (!(tickSpacing > 0) || tickSpacing > 16384) throw new Error('tickSpacing 无效')
   if (!(initialPriceBPerA > 0)) throw new Error('初始价格必须 > 0')
 

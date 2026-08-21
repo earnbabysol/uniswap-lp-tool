@@ -78,6 +78,7 @@ import {
   isEthLikeCurrency,
   isNativeCurrency,
   createV4PoolAndSeed,
+  createV4DirectionalTaxPoolAndSeed,
   suggestV4TickSpacing,
   v4SpacingsForFee,
 } from './v4'
@@ -95,6 +96,7 @@ export {
   isEthLikeCurrency,
   isNativeCurrency,
   createV4PoolAndSeed,
+  createV4DirectionalTaxPoolAndSeed,
   suggestV4TickSpacing,
   v4SpacingsForFee,
 }

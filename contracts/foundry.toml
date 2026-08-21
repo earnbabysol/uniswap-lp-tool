@@ -1,0 +1,22 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+cache_path = "cache"
+libs = ["../node_modules"]
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 44444444
+via_ir = true
+bytecode_hash = "none"
+gas_limit = "300000000"
+allow_internal_expect_revert = true
+
+[profile.default.fuzz]
+runs = 256
+seed = "0x52414e47454445534b"
+
+[profile.ci.fuzz]
+runs = 2500

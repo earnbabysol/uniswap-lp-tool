@@ -2836,6 +2836,92 @@ input:focus-visible, select:focus-visible, select:focus {
   font-weight: 650;
   margin-bottom: 6px;
 }
+.v4-charge-builder {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.v4-charge-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.directional-tax-box {
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--accent) 5%, var(--card-2));
+}
+.directional-tax-box.high {
+  border-color: color-mix(in srgb, var(--warn) 55%, var(--line));
+  background: color-mix(in srgb, var(--warn-soft) 58%, var(--card));
+}
+.directional-tax-box.extreme {
+  border-color: color-mix(in srgb, var(--out) 60%, var(--line));
+  background: color-mix(in srgb, var(--out-soft) 72%, var(--card));
+}
+.directional-tax-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.directional-tax-title > div {
+  display: grid;
+  gap: 3px;
+}
+.directional-tax-title strong { font-size: 15px; }
+.directional-tax-title div span { color: var(--muted); font-size: 13px; }
+.tax-rate-grid {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(48px, 1fr));
+  gap: 7px;
+  margin-top: 7px;
+}
+.tax-rate-chip {
+  min-height: 39px;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--btn-face);
+  color: var(--text);
+  font: 650 14px/1 var(--sans);
+  cursor: pointer;
+}
+.tax-rate-chip:hover {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+}
+.tax-rate-chip.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--btn-face));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.tax-rate-chip.high { color: var(--warn); }
+.tax-rate-chip.extreme { color: var(--out); }
+.tax-rate-chip.high.active { border-color: var(--warn); background: var(--warn-soft); }
+.tax-rate-chip.extreme.active { border-color: var(--out); background: var(--out-soft); }
+.directional-tax-config {
+  margin-top: 12px;
+  align-items: end;
+}
+.tax-project-field {
+  display: grid;
+  gap: 6px;
+}
+.tax-project-field .seg { width: 100%; }
+.tax-project-field .filter-chip { flex: 1; }
+.directional-tax-warning {
+  margin: 10px 0 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.directional-tax-box.high .directional-tax-warning { color: var(--warn); }
+.directional-tax-box.extreme .directional-tax-warning { color: var(--out); font-weight: 600; }
 .mint-presets {
   display: flex;
   flex-direction: column;
@@ -3303,6 +3389,36 @@ input:focus-visible, select:focus-visible, select:focus {
   border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--card));
   color: var(--warn);
   font-size: 13.5px;
+  line-height: 1.4;
+}
+.hook-tax-summary {
+  margin-top: 10px;
+  padding: 11px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--line));
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--accent) 7%, var(--card));
+}
+.hook-tax-summary.high { border-color: var(--warn); background: var(--warn-soft); }
+.hook-tax-summary.extreme { border-color: var(--out); background: var(--out-soft); }
+.hook-tax-summary > div:first-child {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.hook-tax-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px 14px;
+  margin-top: 9px;
+  font-size: 13.5px;
+  color: var(--muted);
+}
+.hook-tax-summary-grid b { color: var(--text); }
+.hook-tax-summary > p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12.5px;
   line-height: 1.4;
 }
 .rebalance-hint {
@@ -3841,6 +3957,10 @@ input:focus-visible, select:focus-visible, select:focus {
   .pos-page-actions .btn { flex: 1; }
   .mint-token-row { grid-template-columns: 1fr; }
   .mint-swap { justify-self: center; margin: 0; }
+  .tax-rate-grid { grid-template-columns: repeat(4, minmax(52px, 1fr)); }
+  .v4-charge-head .seg { width: 100%; }
+  .v4-charge-head .filter-chip { flex: 1; }
+  .hook-tax-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .summary-strip { grid-template-columns: 1fr; }
   .summary-strip > div { border-left: 0; }
   .summary-strip > div + div { border-top: 1px solid var(--line-soft); }
