@@ -24,7 +24,10 @@ import {
 } from './math'
 import type { PoolInfo, PositionRow } from './lp'
 import { publicClient } from './wallet'
-import { createDirectionalTaxPool } from './directionalTaxHook'
+import {
+  createDirectionalTaxPool,
+  type DirectionalTaxPoolSubmission,
+} from './directionalTaxHook'
 
 export const NATIVE_ETH = zeroAddress
 
@@ -1526,14 +1529,17 @@ export async function createV4DirectionalTaxPoolAndSeed(opts: {
   transferTaxBpsA?: number
   transferTaxBpsB?: number
   onStatus?: (msg: string) => void
+  onSubmitted?: (submission: DirectionalTaxPoolSubmission) => void
 }): Promise<{
   pool: PoolInfo
   hash: `0x${string}`
   factoryHash?: `0x${string}`
   seedHash?: `0x${string}`
   hook: Address
+  poolId: `0x${string}`
   seeded: boolean
   seedError?: string
+  verificationWarning?: string
 }> {
   const {
     walletClient,
@@ -1605,6 +1611,7 @@ export async function createV4DirectionalTaxPoolAndSeed(opts: {
     buyTaxBps,
     sellTaxBps,
     onStatus,
+    onSubmitted: opts.onSubmitted,
   })
   const key: V4PoolKey = {
     currency0,
@@ -1613,7 +1620,31 @@ export async function createV4DirectionalTaxPoolAndSeed(opts: {
     tickSpacing,
     hooks: deployment.hook,
   }
-  const pool = await loadV4Pool(key)
+  let pool: PoolInfo | null = null
+  let poolReadError: unknown = null
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (attempt > 0) {
+      onStatus?.(`PoolId 已保存 · ${deployment.poolId} · RPC 尚未同步，正在第 ${attempt + 1} 次读取…`)
+      await new Promise<void>((resolve) => setTimeout(resolve, 700 * attempt))
+    }
+    try {
+      const candidate = await withTimeout(loadV4Pool(key), 8_000, '读取新建 V4 Hook 池')
+      if (candidate.poolId?.toLowerCase() !== deployment.poolId.toLowerCase() || candidate.sqrtPriceX96 <= 0n) {
+        throw new Error('StateView 尚未同步新池')
+      }
+      pool = candidate
+      break
+    } catch (error) {
+      poolReadError = error
+    }
+  }
+  if (!pool) {
+    const detail = poolReadError instanceof Error ? poolReadError.message : String(poolReadError ?? '未知 RPC 错误')
+    throw new Error(
+      `税率池交易已成功，PoolId ${deployment.poolId}，Hook ${deployment.hook}。`
+      + `RPC 暂未同步，初仓尚未执行；请勿重新建池，稍后用该 PoolId 加载。${detail ? `（${detail}）` : ''}`,
+    )
+  }
   const wantsSeed = seed.amount0 > 0n || seed.amount1 > 0n
   if (!wantsSeed) {
     return {
@@ -1621,7 +1652,9 @@ export async function createV4DirectionalTaxPoolAndSeed(opts: {
       hash: deployment.poolHash,
       factoryHash: deployment.factoryHash,
       hook: deployment.hook,
+      poolId: deployment.poolId,
       seeded: false,
+      verificationWarning: deployment.verificationWarning,
     }
   }
 
@@ -1647,7 +1680,9 @@ export async function createV4DirectionalTaxPoolAndSeed(opts: {
       factoryHash: deployment.factoryHash,
       seedHash,
       hook: deployment.hook,
+      poolId: deployment.poolId,
       seeded: true,
+      verificationWarning: deployment.verificationWarning,
     }
   } catch (error) {
     return {
@@ -1655,8 +1690,10 @@ export async function createV4DirectionalTaxPoolAndSeed(opts: {
       hash: deployment.poolHash,
       factoryHash: deployment.factoryHash,
       hook: deployment.hook,
+      poolId: deployment.poolId,
       seeded: false,
       seedError: error instanceof Error ? error.message : String(error),
+      verificationWarning: deployment.verificationWarning,
     }
   }
 }

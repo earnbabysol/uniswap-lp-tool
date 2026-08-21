@@ -1,8 +1,10 @@
 import {
   concatHex,
+  createPublicClient,
   encodeDeployData,
   getAddress,
   getCreate2Address,
+  http,
   keccak256,
   padHex,
   stringToHex,
@@ -12,8 +14,14 @@ import {
   type Hex,
   type WalletClient,
 } from 'viem'
-import { CONTRACTS, getActiveChainId, type SupportedChainId } from './chain'
+import {
+  CONTRACTS,
+  getActiveChainConfig,
+  getActiveChainId,
+  type SupportedChainId,
+} from './chain'
 import { withTimeout } from './async'
+import { loadCustomRpcUrl } from './rpcSettings'
 import { publicClient } from './wallet'
 import { CONFIGURABLE_TAX_FACTORY_V2_BYTECODE } from './generated/configurableTaxFactoryV2Bytecode'
 import { DIRECTIONAL_TAX_FACTORY_BYTECODE } from './generated/directionalTaxFactoryBytecode'
@@ -208,12 +216,22 @@ export type DirectionalTaxFactoryStatus = {
   reason?: string
 }
 
-export type DirectionalTaxPoolDeployment = {
+export type DirectionalTaxPoolSubmission = {
   factory: Address
   hook: Address
+  poolId: Hex
+  currency0: Address
+  currency1: Address
+  lpFee: number
+  tickSpacing: number
   userSalt: Hex
   factoryHash?: Hash
   poolHash: Hash
+}
+
+export type DirectionalTaxPoolDeployment = DirectionalTaxPoolSubmission & {
+  /** 交易已成功，但公共 RPC 尚未完成 config() 复检时给 UI 的非阻断提示。 */
+  verificationWarning?: string
 }
 
 export type DirectionalTaxHookConfig = {
@@ -388,6 +406,56 @@ async function waitForHash(hash: Hash, action: string) {
   )
   if (receipt.status !== 'success') throw new Error(`${action}失败（交易已回滚）`)
   return receipt
+}
+
+/**
+ * 建池回执刚确认时，不同公共 RPC 的最新状态可能相差数秒。viem fallback 只会在
+ * transport error 时切节点；某节点把新合约错误地返回成 `0x` 时不会继续 fallback。
+ * 这里仅在建池后做一次并行复检：任意一个配置正确的节点成功即可，避免把已成功
+ * 的建池交易误报成失败。
+ */
+async function readConfigurableTaxHookV2AfterReceipt(
+  hook: Address,
+  implementation: Address,
+) {
+  const chain = getActiveChainConfig()
+  const customRpc = loadCustomRpcUrl(chain.id)
+  const urls = [...new Set([...(customRpc ? [customRpc] : []), ...chain.defaultRpcUrls])]
+  const expectedRuntime = cloneRuntimeCode(implementation).toLowerCase()
+  let lastError: unknown = null
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await withTimeout(
+        Promise.any(urls.map(async (url) => {
+          const client = createPublicClient({
+            chain: chain.chain,
+            transport: http(url, { batch: false, retryCount: 0, timeout: 5_000 }),
+          })
+          const [code, config] = await Promise.all([
+            client.getBytecode({ address: hook }),
+            client.readContract({
+              address: hook,
+              abi: configurableTaxHookV2Abi,
+              functionName: 'config',
+            }),
+          ])
+          if (!code || code === '0x') throw new Error('Hook 字节码尚未同步')
+          if (code.toLowerCase() !== expectedRuntime) throw new Error('Hook 字节码版本不匹配')
+          if (!config[6]) throw new Error('Hook config 尚未初始化')
+          return config
+        })),
+        6_500,
+        '多节点复检 Hook 配置',
+      )
+    } catch (error) {
+      lastError = error
+      if (attempt < 2) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 700 * (attempt + 1)))
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('公共 RPC 暂未同步 Hook 配置')
 }
 
 export async function getDirectionalTaxFactoryStatus(): Promise<DirectionalTaxFactoryStatus> {
@@ -622,6 +690,8 @@ export async function createDirectionalTaxPool(opts: {
   buyTaxBps: number
   sellTaxBps: number
   onStatus?: (message: string) => void
+  /** 钱包已接受建池交易后立即触发；此时 PoolId 已确定，不依赖后续 RPC 复检。 */
+  onSubmitted?: (submission: DirectionalTaxPoolSubmission) => void
 }): Promise<DirectionalTaxPoolDeployment> {
   if (!Number.isInteger(opts.lpFee) || opts.lpFee < 0 || opts.lpFee > V4_MAX_LP_FEE) {
     throw new Error('V4 LP 手续费无效')
@@ -647,7 +717,7 @@ export async function createDirectionalTaxPool(opts: {
   const existingCode = await publicClient.getBytecode({ address: mined.hook })
   if (existingCode && existingCode !== '0x') throw new Error('专属 Hook 地址已占用，请重试')
 
-  const { request } = await publicClient.simulateContract({
+  const { request, result: simulated } = await publicClient.simulateContract({
     account: opts.owner,
     address: status.factory,
     abi: configurableTaxFactoryV2Abi,
@@ -664,6 +734,11 @@ export async function createDirectionalTaxPool(opts: {
       mined.userSalt,
     ],
   })
+  const simulatedHook = getAddress(simulated[0])
+  const poolId = simulated[1]
+  if (simulatedHook.toLowerCase() !== mined.hook.toLowerCase()) {
+    throw new Error('模拟返回的 Hook 地址与本地预测不一致')
+  }
   opts.onStatus?.(
     `请确认创建 V2 池 · LP fee ${(opts.lpFee / 10000).toFixed(2)}% · `
     + `买入税 ${opts.buyTaxBps / 100}% · 卖出税 ${opts.sellTaxBps / 100}%（永久冻结）…`,
@@ -673,28 +748,47 @@ export async function createDirectionalTaxPool(opts: {
     chain: opts.walletClient.chain,
     account: opts.owner,
   })
-  opts.onStatus?.(`税率池已提交 ${poolHash.slice(0, 10)}…，等待确认`)
-  await waitForHash(poolHash, '创建税率 Hook 池')
-
-  const [hookCode, cfg] = await Promise.all([
-    publicClient.getBytecode({ address: mined.hook }),
-    publicClient.readContract({
-      address: mined.hook,
-      abi: configurableTaxHookV2Abi,
-      functionName: 'config',
-    }),
-  ])
-  if (!hookCode || hookCode === '0x' || !cfg[6]) throw new Error('池已上链但 V2 Hook 配置校验失败')
-  if (cfg[1].toLowerCase() !== opts.owner.toLowerCase()) throw new Error('Hook 收款地址校验失败')
-  if (cfg[3] !== opts.lpFee || cfg[4] !== opts.buyTaxBps || cfg[5] !== opts.sellTaxBps) {
-    throw new Error('V2 Hook 费率配置校验失败')
-  }
-
-  return {
+  const submission: DirectionalTaxPoolSubmission = {
     factory: status.factory,
     hook: mined.hook,
+    poolId,
+    currency0: opts.currency0,
+    currency1: opts.currency1,
+    lpFee: opts.lpFee,
+    tickSpacing: opts.tickSpacing,
     userSalt: mined.userSalt,
     factoryHash: ensured.hash,
     poolHash,
+  }
+  // 先交给 UI 保存。即使回执轮询或 config() 复检遇到 RPC 故障，用户仍能看到
+  // PoolId、Hook 和交易哈希，不会因为误以为失败而重复建池。
+  try {
+    opts.onSubmitted?.(submission)
+  } catch {
+    // UI 本地存储不可用不应中断已经提交的链上交易；下面的状态仍会完整显示 PoolId。
+  }
+  opts.onStatus?.(`税率池已提交 ${poolHash.slice(0, 10)}… · PoolId ${poolId} · 等待确认`)
+  await waitForHash(poolHash, '创建税率 Hook 池')
+
+  let verificationWarning: string | undefined
+  const cfg = await readConfigurableTaxHookV2AfterReceipt(
+    mined.hook,
+    status.implementation,
+  ).catch(() => null)
+  if (cfg) {
+    if (cfg[0].toLowerCase() !== poolId.toLowerCase()) throw new Error(`Hook PoolId 校验失败：${poolId}`)
+    if (cfg[1].toLowerCase() !== opts.owner.toLowerCase()) throw new Error(`Hook 收款地址校验失败 · PoolId ${poolId}`)
+    if (cfg[2].toLowerCase() !== opts.taxToken.toLowerCase()) throw new Error(`Hook 项目币校验失败 · PoolId ${poolId}`)
+    if (cfg[3] !== opts.lpFee || cfg[4] !== opts.buyTaxBps || cfg[5] !== opts.sellTaxBps) {
+      throw new Error(`V2 Hook 费率配置校验失败 · PoolId ${poolId}`)
+    }
+  } else {
+    verificationWarning = '建池交易已成功；公共 RPC 暂未同步 config()，已保留 PoolId 并继续加载'
+    opts.onStatus?.(`${verificationWarning} · ${poolId}`)
+  }
+
+  return {
+    ...submission,
+    verificationWarning,
   }
 }

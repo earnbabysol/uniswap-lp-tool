@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Address, WalletClient } from 'viem'
-import { isAddress } from 'viem'
+import { isAddress, zeroAddress } from 'viem'
 import {
   CONTRACTS,
   FEE_TIERS,
@@ -55,6 +55,7 @@ import {
   enrichPositionsLifetimeFees,
   isOneSidedRangeStale,
   reanchorRangeToLiveSpot,
+  recoverV4PoolKeyFromCandidates,
   remapMintAmountsForRange,
   mintV3Position,
   mintV3DlmmPositions,
@@ -290,6 +291,39 @@ function copyText(text: string) {
   void navigator.clipboard?.writeText(text)
 }
 
+type TaxPoolRecoveryRecord = {
+  chainId: SupportedChainId
+  poolId: `0x${string}`
+  hook: Address
+  hash: `0x${string}`
+  currency0: Address
+  currency1: Address
+  lpFee: number
+  tickSpacing: number
+  buyTaxBps: number
+  sellTaxBps: number
+  confirmed: boolean
+  at: number
+}
+
+type TaxPoolRecoveryMap = Partial<Record<SupportedChainId, TaxPoolRecoveryRecord>>
+
+/** 仅供 `?design=1` 检查长 PoolId 在桌面/窄屏的恢复卡布局。 */
+const DESIGN_TAX_POOL_RECOVERY: TaxPoolRecoveryRecord = {
+  chainId: 8453,
+  poolId: '0xcc2244880a575e8cc67744fd4cb6e628203dd00a1b9d0fb8bca92e59ac475270',
+  hook: '0xe56151A5B5909C731fb5A93c46F97EC8a7662044',
+  hash: '0xb4edd9633d6860abe279ef2bd4c089c9be08e9d3c0bfbdde4caecad31cef1cdd',
+  currency0: '0x0000000000000000000000000000000000000000',
+  currency1: '0xb2000000000000000000004c27f6523082f41d01',
+  lpFee: 2900,
+  tickSpacing: 60,
+  buyTaxBps: 100,
+  sellTaxBps: 100,
+  confirmed: false,
+  at: Date.now(),
+}
+
 function positionPoolRef(p: { poolAddress?: string | null; poolId?: string | null }): string | null {
   if (p.poolAddress) return p.poolAddress
   if (p.poolId) return p.poolId
@@ -453,6 +487,10 @@ export default function App() {
   const { toasts, push: pushToast, update: updateToast, dismiss: dismissToast } = useToasts()
   const searchRef = useRef<HTMLInputElement | null>(null)
   const [txHistory, setTxHistory] = useState<TxRecord[]>(() => loadTxHistory())
+  const [taxPoolRecoveries, setTaxPoolRecoveries] = usePersistentState<TaxPoolRecoveryMap>(
+    'taxPoolRecoveries',
+    {},
+  )
   const [rpcInput, setRpcInput] = useState(() => loadCustomRpcUrl() ?? '')
   const [activeRpcLabel, setActiveRpcLabel] = useState(() => describeActiveRpc())
   const [rpcLatency, setRpcLatency] = useState<number | null>(null)
@@ -462,6 +500,8 @@ export default function App() {
   const [graphKeyLabel, setGraphKeyLabel] = useState(() => describeGraphApiKey())
   const [chainId, setChainId] = useState<SupportedChainId>(() => getActiveChainId())
   const chainCfg = getActiveChainConfig()
+  const recentTaxPool = taxPoolRecoveries[chainId]
+    ?? (import.meta.env.DEV && designMode() && chainId === 8453 ? DESIGN_TAX_POOL_RECOVERY : null)
 
   const [tokenA, setTokenA] = useState<Address>(() => getActiveChainConfig().defaultTokenA)
   const [tokenB, setTokenB] = useState<Address>(() => getActiveChainConfig().defaultTokenB)
@@ -1837,7 +1877,67 @@ export default function App() {
         )
         return
       } catch {
-        // 不是池子地址，走代币发现
+        // 旧版本若在建池后的 config() 复检报错，用户通常只拿得到错误里的 Hook
+        // 地址。先识别税率 Hook 并把 PoolId 救回来；不是 Hook 才继续当代币发现。
+        const hookConfig = await readDirectionalTaxHookConfig(raw as Address)
+        if (hookConfig) {
+          setPoolInput(hookConfig.poolId)
+          setStatus(`已从 Hook ${shortAddr(raw)} 找回 PoolId：${hookConfig.poolId} · 正在本地还原 PoolKey…`)
+          try {
+            const asCreatedCurrency = (token: Address) => (
+              useNativeEth && isEthLikeCurrency(token) ? zeroAddress : token
+            )
+            const recoveredKey = await recoverV4PoolKeyFromCandidates({
+              poolId: hookConfig.poolId,
+              hook: raw as Address,
+              fee: hookConfig.lpFee,
+              taxToken: hookConfig.taxToken,
+              partnerCandidates: [
+                asCreatedCurrency(tokenA),
+                asCreatedCurrency(tokenB),
+                zeroAddress,
+                CONTRACTS.weth,
+                CONTRACTS.stable,
+                ...listKnownTokens().map((token) => token.address),
+              ],
+              preferredTickSpacings: [
+                v4TickSpacing,
+                suggestV4TickSpacing(hookConfig.lpFee),
+                1,
+                10,
+                60,
+                200,
+                300,
+                500,
+                3000,
+              ],
+            })
+            const info = recoveredKey
+              ? await loadV4Pool(recoveredKey)
+              : await loadV4PoolById(hookConfig.poolId)
+            const q = getCoinQuote(info)
+            setPool(info)
+            setPoolDirectionalTax(hookConfig)
+            setMintProtocol('v4')
+            setTokenA(q.coin.address)
+            setTokenB(q.quote.address)
+            setFee(info.fee)
+            setV4TickSpacing(info.tickSpacing)
+            setShowCreatePool(false)
+            setDiscovered(null)
+            setStatus(
+              `已从 Hook 恢复 V4 税率池 · PoolId ${hookConfig.poolId} · `
+              + `${q.coin.symbol}/${q.quote.symbol} · LP fee ${(info.fee / 10000).toFixed(2)}%`,
+            )
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error)
+            setStatus(
+              `已从 Hook 找回 PoolId：${hookConfig.poolId}。RPC 暂未完成池信息加载，`
+              + `PoolId 已放入输入框，可稍后重试；不要重新建池。（${detail}）`,
+            )
+          }
+          return
+        }
       } finally {
         setBusy(false)
       }
@@ -1925,6 +2025,49 @@ export default function App() {
       } finally {
         setDiscovering(false)
       }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const loadRecoveredTaxPool = async (record: TaxPoolRecoveryRecord) => {
+    setPoolInput(record.poolId)
+    setBusy(true)
+    setStatus(`使用已保存的 PoolKey 加载 ${record.poolId}…`)
+    try {
+      const info = await withTimeout(
+        loadV4Pool({
+          currency0: record.currency0,
+          currency1: record.currency1,
+          fee: record.lpFee,
+          tickSpacing: record.tickSpacing,
+          hooks: record.hook,
+        }),
+        12_000,
+        '加载最近创建的 Hook 池',
+      )
+      if (info.poolId?.toLowerCase() !== record.poolId.toLowerCase() || info.sqrtPriceX96 <= 0n) {
+        throw new Error('StateView 暂未同步该池')
+      }
+      const q = getCoinQuote(info)
+      setPool(info)
+      setMintProtocol('v4')
+      setTokenA(q.coin.address)
+      setTokenB(q.quote.address)
+      setFee(info.fee)
+      setV4TickSpacing(info.tickSpacing)
+      setShowCreatePool(false)
+      setTaxPoolRecoveries((prev) => ({
+        ...prev,
+        [record.chainId]: { ...record, confirmed: true },
+      }))
+      setStatus(
+        `已加载最近创建的 V4 Hook 池 · PoolId ${record.poolId} · `
+        + `${q.coin.symbol}/${q.quote.symbol} · LP fee ${(info.fee / 10000).toFixed(2)}%`,
+      )
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      setStatus(`PoolId 已安全保留：${record.poolId} · RPC 暂未读到池子，请稍后再点加载（${detail}）`)
     } finally {
       setBusy(false)
     }
@@ -2745,36 +2888,70 @@ export default function App() {
             transferTaxBpsA: taxA,
             transferTaxBpsB: taxB,
             onStatus: setStatus,
+            onSubmitted: (submission) => {
+              const recovery: TaxPoolRecoveryRecord = {
+                chainId,
+                poolId: submission.poolId,
+                hook: submission.hook,
+                hash: submission.poolHash,
+                currency0: submission.currency0,
+                currency1: submission.currency1,
+                lpFee: submission.lpFee,
+                tickSpacing: submission.tickSpacing,
+                buyTaxBps: directionalBuyTaxBps,
+                sellTaxBps: directionalSellTaxBps,
+                confirmed: false,
+                at: Date.now(),
+              }
+              setTaxPoolRecoveries((prev) => ({ ...prev, [chainId]: recovery }))
+              // 直接填入加载框并持久化独立恢复记录；后续任何 RPC 报错都不会再丢 PoolId。
+              setPoolInput(submission.poolId)
+              setStatusHash(submission.poolHash)
+              if (submission.factoryHash) {
+                pushTxHistory({
+                  label: '部署 V2 自定义税 Hook 工厂',
+                  hash: submission.factoryHash,
+                  pair: `${tokenLabel(tokenA)}/${tokenLabel(tokenB)}`,
+                })
+              }
+              pushTxHistory({
+                label: `提交 V4 Hook 池（买 ${directionalBuyTaxBps / 100}% / 卖 ${directionalSellTaxBps / 100}%）`,
+                hash: submission.poolHash,
+                pair: `${tokenLabel(tokenA)}/${tokenLabel(tokenB)}`,
+              })
+              setTxHistory(loadTxHistory())
+              setStatus(`建池交易已提交 · PoolId 已自动保存：${submission.poolId}`)
+            },
           })
           const info = result.pool
           const q = getCoinQuote(info)
           const pair = `${q.coin.symbol}/${q.quote.symbol}`
-          if (result.factoryHash) {
-            pushTxHistory({ label: '部署 V2 自定义税 Hook 工厂', hash: result.factoryHash, pair })
-          }
-          pushTxHistory({
-            label: `创建 V4 Hook 池（买 ${directionalBuyTaxBps / 100}% / 卖 ${directionalSellTaxBps / 100}%）`,
-            hash: result.hash,
-            pair,
-          })
           if (result.seedHash) {
             pushTxHistory({ label: '税率池注入初仓', hash: result.seedHash, pair })
           }
           setTxHistory(loadTxHistory())
+          setTaxPoolRecoveries((prev) => {
+            const current = prev[chainId]
+            if (!current || current.hash.toLowerCase() !== result.hash.toLowerCase()) return prev
+            return { ...prev, [chainId]: { ...current, confirmed: true } }
+          })
+          setPoolInput(result.poolId)
           setPool(info)
           setFee(useFee)
           setShowCreatePool(false)
           setStatusHash(result.seedHash ?? result.hash)
           if (result.seedError) {
             setStatus(
-              `税率池已创建（Hook ${shortAddr(result.hook)}），但初仓未注入：${result.seedError}。` +
+              `税率池已创建 · PoolId ${result.poolId} · Hook ${shortAddr(result.hook)}，` +
+              `但初仓未注入：${result.seedError}。` +
               '池不会丢失，可在当前页面重新 Mint。',
             )
           } else {
             setStatus(
-              `V4 V2 税率池已就绪 · LP fee ${(useFee / 10000).toFixed(2)}% · ` +
+              `V4 V2 税率池已就绪 · PoolId ${result.poolId} · LP fee ${(useFee / 10000).toFixed(2)}% · ` +
               `买入税 ${directionalBuyTaxBps / 100}% · 卖出税 ${directionalSellTaxBps / 100}% · ` +
-              `收款 ${shortAddr(address)} · Hook ${shortAddr(result.hook)}`,
+              `收款 ${shortAddr(address)} · Hook ${shortAddr(result.hook)}` +
+              (result.verificationWarning ? ' · RPC config 复检已延后，PoolId 已保存' : ''),
             )
           }
           if (result.seeded) void refreshPositions({ silent: true })
@@ -5705,6 +5882,63 @@ export default function App() {
             </div>
           )}
 
+          {recentTaxPool && (
+            <div className={`tax-pool-recovery ${recentTaxPool.confirmed ? 'confirmed' : ''}`}>
+              <div className="tax-pool-recovery-head">
+                <div>
+                  <strong>最近的 V4 Hook 建池记录</strong>
+                  <span>
+                    {recentTaxPool.confirmed ? '链上池已读取' : '交易已提交；即使 RPC 报错也可从这里恢复'}
+                    {' · '}{new Date(recentTaxPool.at).toLocaleTimeString()}
+                  </span>
+                </div>
+                <a className="btn ghost" href={explorerTx(recentTaxPool.hash)} target="_blank" rel="noreferrer">
+                  查看交易 ↗
+                </a>
+              </div>
+              <div className="tax-pool-recovery-id">
+                <span>PoolId（已自动保存）</span>
+                <code>{recentTaxPool.poolId}</code>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => {
+                    copyText(recentTaxPool.poolId)
+                    pushToast({ kind: 'success', title: 'PoolId 已复制', detail: recentTaxPool.poolId })
+                  }}
+                >
+                  复制 PoolId
+                </button>
+              </div>
+              <div className="tax-pool-recovery-foot">
+                <span>
+                  Hook {shortAddr(recentTaxPool.hook)} · LP fee {(recentTaxPool.lpFee / 10000).toFixed(2)}% ·
+                  {' '}买 {recentTaxPool.buyTaxBps / 100}% / 卖 {recentTaxPool.sellTaxBps / 100}%
+                </span>
+                <div className="btn-row">
+                  <button
+                    type="button"
+                    className="btn primary"
+                    disabled={busy}
+                    onClick={() => void loadRecoveredTaxPool(recentTaxPool)}
+                  >
+                    加载这个池
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => {
+                      copyText(recentTaxPool.hook)
+                      pushToast({ kind: 'success', title: 'Hook 地址已复制', detail: recentTaxPool.hook })
+                    }}
+                  >
+                    复制 Hook
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
           {scannedPools.length > 1 && (
             <div className="chip-row">
               {scannedPools.map((p) => (
@@ -5728,14 +5962,14 @@ export default function App() {
 
           <label className="full">
             <span className="lbl">
-              代币合约 / 池地址 / poolId / 池子链接
-              <InfoHint text="贴代币合约（比如某个 memecoin 地址）会扫出它和 WETH / 稳定币 / 原生 ETH 的所有 V3+V4 池，按深度排序供你挑。贴池地址或 Uniswap 链接则直接加载那一个池。" />
+              代币合约 / Hook / 池地址 / poolId / 池子链接
+              <InfoHint text="贴税率 Hook 地址可找回建池时的完整 PoolId；贴代币合约会扫出它和 WETH / 稳定币 / 原生 ETH 的所有 V3+V4 池。贴池地址、poolId 或链接则直接加载。" />
             </span>
             <div className="inline">
               <input
                 value={poolInput}
                 onChange={(e) => setPoolInput(e.target.value)}
-                placeholder="0x… 代币合约会列出全部池子；池地址 / 链接直接加载"
+                placeholder="0x… 支持代币、Hook、池地址、poolId 或池子链接"
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') void loadPoolByAddress()
                 }}

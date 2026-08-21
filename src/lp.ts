@@ -1281,7 +1281,7 @@ const V4_INITIALIZE = parseAbiItem(
   'event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)',
 )
 
-type ResolvedV4PoolKey = {
+export type ResolvedV4PoolKey = {
   currency0: Address
   currency1: Address
   fee: number
@@ -1338,6 +1338,58 @@ function rememberV4PoolKey(poolId: `0x${string}`, key: ResolvedV4PoolKey): Resol
     }
   }
   return key
+}
+
+/**
+ * 税率 Hook 的 config() 保存了 poolId、项目币和 fee，但旧版 UI 报错时没有保存
+ * 完整 PoolKey。配对侧通常是当前选择币、原生币、WETH 或稳定币；给出这些候选后，
+ * 可在本地枚举 tickSpacing 并用 canonical poolId 哈希反推出精确 PoolKey，全程不扫日志。
+ */
+export async function recoverV4PoolKeyFromCandidates(opts: {
+  poolId: `0x${string}`
+  hook: Address
+  fee: number
+  taxToken: Address
+  partnerCandidates: Address[]
+  preferredTickSpacings?: number[]
+  maxTickSpacing?: number
+}): Promise<ResolvedV4PoolKey | null> {
+  const target = opts.poolId.toLowerCase()
+  const maxTickSpacing = Math.max(1, Math.min(16_384, opts.maxTickSpacing ?? 16_384))
+  const partners = [...new Map(opts.partnerCandidates
+    .filter((address) => isAddress(address) && address.toLowerCase() !== opts.taxToken.toLowerCase())
+    .map((address) => [address.toLowerCase(), address] as const)).values()]
+  const preferred = [...new Set(opts.preferredTickSpacings ?? [])]
+    .filter((spacing) => Number.isInteger(spacing) && spacing > 0 && spacing <= maxTickSpacing)
+  const preferredSet = new Set(preferred)
+  let attempts = 0
+
+  const matches = (partner: Address, tickSpacing: number): ResolvedV4PoolKey | null => {
+    const [currency0, currency1] = opts.taxToken.toLowerCase() < partner.toLowerCase()
+      ? [opts.taxToken, partner]
+      : [partner, opts.taxToken]
+    const key = { currency0, currency1, fee: opts.fee, tickSpacing, hooks: opts.hook }
+    return v4PoolId(key).toLowerCase() === target ? key : null
+  }
+
+  for (const partner of partners) {
+    for (const tickSpacing of preferred) {
+      const key = matches(partner, tickSpacing)
+      if (key) return rememberV4PoolKey(opts.poolId, key)
+    }
+  }
+  for (const partner of partners) {
+    for (let tickSpacing = 1; tickSpacing <= maxTickSpacing; tickSpacing += 1) {
+      if (preferredSet.has(tickSpacing)) continue
+      const key = matches(partner, tickSpacing)
+      if (key) return rememberV4PoolKey(opts.poolId, key)
+      attempts += 1
+      if (attempts % 2048 === 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      }
+    }
+  }
+  return null
 }
 
 async function resolveV4PoolKeyFromId(poolId: `0x${string}`): Promise<ResolvedV4PoolKey> {
@@ -1544,6 +1596,8 @@ export async function loadV4Pool(key: {
   const [token0, token1] = await Promise.all([resolveToken(c0), resolveToken(c1)])
   const sqrtPriceX96 = slot0[0]
   const tick = slot0[1]
+  // 只要完整 PoolKey 成功读过一次就持久化；之后直接粘贴 poolId 不再依赖全历史日志。
+  rememberV4PoolKey(poolId, sorted)
   return {
     version: 'v4',
     poolId,
