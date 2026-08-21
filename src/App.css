@@ -1712,12 +1712,30 @@ input:focus-visible, select:focus-visible, select:focus {
   gap: 8px;
 }
 .pc-meta-line {
+  flex: 1;
+  min-width: 0;
   font-size: 11.5px;
   color: var(--muted);
   letter-spacing: 0.01em;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.pc-hook-badge {
+  flex: none;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--warn) 55%, var(--line));
+  border-radius: 999px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 10.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.pc-hook-badge.tax {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: color-mix(in srgb, var(--accent) 12%, var(--card-2));
+  color: var(--accent);
 }
 .pc-state {
   flex: none;
@@ -2395,6 +2413,30 @@ input:focus-visible, select:focus-visible, select:focus {
   text-transform: lowercase;
   font-weight: 600;
 }
+.pdc-pill.hook {
+  border-color: color-mix(in srgb, var(--accent) 58%, var(--line));
+  background: color-mix(in srgb, var(--accent) 12%, var(--card-2));
+  color: var(--accent);
+  font-weight: 700;
+}
+.pdc-hook-lock {
+  display: grid;
+  gap: 4px;
+  margin-top: 10px;
+  padding: 11px 12px;
+  border: 1px solid color-mix(in srgb, var(--warn) 55%, var(--line));
+  border-radius: var(--r-sm);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.pdc-hook-lock.known {
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--line));
+  background: color-mix(in srgb, var(--accent) 8%, var(--card));
+  color: var(--muted);
+}
+.pdc-hook-lock strong { color: var(--ink); font-size: 13.5px; }
 .pdc-head-actions {
   display: flex;
   gap: 6px;
@@ -2908,6 +2950,7 @@ input:focus-visible, select:focus-visible, select:focus {
   margin-top: 12px;
   align-items: end;
 }
+.directional-tax-rates { margin-top: 12px; }
 .tax-project-field {
   display: grid;
   gap: 6px;

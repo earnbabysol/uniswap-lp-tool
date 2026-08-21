@@ -16,11 +16,12 @@
     "test:usd-range": "tsx scripts/usd-range.test.mjs",
     "test:chains": "tsx scripts/chain-config.test.mjs",
     "test:tax-hook-ui": "tsx scripts/directional-tax-hook.test.mjs",
+    "test:v4-hook-position": "tsx scripts/v4-hook-position.test.mjs",
     "contracts:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-forge.ps1 build",
     "contracts:test": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-forge.ps1 test -vv",
     "contracts:artifact": "node scripts/export-directional-tax-artifact.mjs",
     "index:flow": "tsx scripts/build-flow-index.mjs",
-    "test": "npm run test:pnl && npm run test:rpc && npm run test:flow && npm run test:dlmm && npm run test:dlmm-layout && npm run test:dlmm-groups && npm run test:mint-payment && npm run test:usd-range && npm run test:chains && npm run test:tax-hook-ui",
+    "test": "npm run test:pnl && npm run test:rpc && npm run test:flow && npm run test:dlmm && npm run test:dlmm-layout && npm run test:dlmm-groups && npm run test:mint-payment && npm run test:usd-range && npm run test:chains && npm run test:tax-hook-ui && npm run test:v4-hook-position",
     "typecheck": "tsc -b",
     "lint": "oxlint",
     "preview": "vite preview"

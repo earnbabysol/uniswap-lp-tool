@@ -2,6 +2,7 @@ import { useMemo, type ReactNode } from 'react'
 import { getPositionCoinPrices, getPositionUsdRange, type PositionRow } from './lp'
 import { formatAge, formatPrice, formatUsd } from './math'
 import { PositionLegs } from './PositionLegs'
+import type { DirectionalTaxHookConfig } from './directionalTaxHook'
 
 function formatPnlAmount(n: number): string {
   if (!Number.isFinite(n) || Math.abs(n) > 1e11) return '—'
@@ -33,6 +34,7 @@ export type PositionDetailCardProps = {
   poolRef?: string | null
   onCopyPool?: () => void
   poolHref?: string | null
+  hookConfig?: DirectionalTaxHookConfig | null
 }
 
 function shortPoolRef(ref: string): string {
@@ -52,6 +54,7 @@ export function PositionDetailCard({
   poolRef,
   onCopyPool,
   poolHref,
+  hookConfig,
 }: PositionDetailCardProps) {
   const cq = useMemo(() => getPositionCoinPrices(p), [p])
   const usdRange = useMemo(() => getPositionUsdRange(p), [p])
@@ -68,6 +71,9 @@ export function PositionDetailCard({
   const pnlReady = Boolean(p.pnlReady)
   const pnlPct = pnlReady ? formatPnlPct(p.pnlUsd, pnlBasis) : ''
   const pnlUp = p.pnlUsd >= 0
+  const hasHook = p.version === 'v4'
+    && Boolean(p.hooks)
+    && p.hooks!.toLowerCase() !== '0x0000000000000000000000000000000000000000'
 
   const lo = cq.coinPriceLower
   const hi = cq.coinPriceUpper
@@ -101,6 +107,9 @@ export function PositionDetailCard({
           </h3>
           <span className={`pdc-pill ver`}>{p.version}</span>
           <span className="pdc-pill">{(p.fee / 10000).toFixed(2)}%</span>
+          {hasHook && (
+            <span className="pdc-pill hook">{hookConfig ? `${hookConfig.version.toUpperCase()} 税 Hook` : '自定义 Hook'}</span>
+          )}
           <span className="pdc-pill">#{p.tokenId.toString()}</span>
         </div>
         <div className="pdc-head-actions">
@@ -126,6 +135,21 @@ export function PositionDetailCard({
               浏览器 ↗
             </a>
           )}
+        </div>
+      )}
+
+      {hasHook && (
+        <div className={`pdc-hook-lock ${hookConfig ? 'known' : ''}`}>
+          <strong>{hookConfig ? '买卖税 Hook 仓位' : '自定义 Hook 仓位'}</strong>
+          {hookConfig ? (
+            <span>
+              LP fee {(hookConfig.lpFee / 10000).toFixed(2)}% · 买入税 {hookConfig.buyTaxBps / 100}% ·
+              {' '}卖出税 {hookConfig.sellTaxBps / 100}% · 收款 {hookConfig.collector.slice(0, 8)}…{hookConfig.collector.slice(-6)}
+            </span>
+          ) : (
+            <span>该仓位绑定 Hook {p.hooks?.slice(0, 10)}…{p.hooks?.slice(-8)}</span>
+          )}
+          <span>加仓会按链上 NFT 复检并沿用同一 PoolKey / Hook，不会切成普通池。</span>
         </div>
       )}
 

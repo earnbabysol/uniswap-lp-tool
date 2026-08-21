@@ -15,6 +15,7 @@ import {
 import { CONTRACTS, getActiveChainId, type SupportedChainId } from './chain'
 import { withTimeout } from './async'
 import { publicClient } from './wallet'
+import { CONFIGURABLE_TAX_FACTORY_V2_BYTECODE } from './generated/configurableTaxFactoryV2Bytecode'
 import { DIRECTIONAL_TAX_FACTORY_BYTECODE } from './generated/directionalTaxFactoryBytecode'
 
 export const DIRECTIONAL_TAX_CHAIN_IDS = [1, 56, 4663, 8453] as const
@@ -26,8 +27,13 @@ export const DIRECTIONAL_TAX_CREATE2_PROXY = getAddress(
 export const DIRECTIONAL_TAX_FACTORY_SALT = keccak256(
   stringToHex('RangeDesk DirectionalTaxHookFactory v1'),
 )
+export const CONFIGURABLE_TAX_FACTORY_V2_SALT = keccak256(
+  stringToHex('RangeDesk ConfigurableTaxHookFactory v2'),
+)
 export const DIRECTIONAL_TAX_REQUIRED_FLAGS = 0x2044n
 export const DIRECTIONAL_TAX_ALL_FLAGS_MASK = 0x3fffn
+export const DIRECTIONAL_TAX_MAX_BPS = 8_000
+export const V4_MAX_LP_FEE = 1_000_000
 
 const CLONE_CREATION_PREFIX = '0x3d602d80600a3d3981f3' as const
 const CLONE_RUNTIME_PREFIX = '0x363d3d373d3d3d363d73' as const
@@ -99,6 +105,66 @@ export const directionalTaxFactoryAbi = [
   },
 ] as const
 
+export const configurableTaxFactoryV2Abi = [
+  {
+    type: 'constructor',
+    stateMutability: 'nonpayable',
+    inputs: [{ name: 'manager', type: 'address' }],
+  },
+  {
+    type: 'function',
+    name: 'poolManager',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ type: 'address' }],
+  },
+  {
+    type: 'function',
+    name: 'implementation',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ type: 'address' }],
+  },
+  {
+    type: 'function',
+    name: 'REQUIRED_FLAGS',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ type: 'uint160' }],
+  },
+  {
+    type: 'function',
+    name: 'predictHook',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'creator', type: 'address' },
+      { name: 'userSalt', type: 'bytes32' },
+    ],
+    outputs: [{ type: 'address' }],
+  },
+  {
+    type: 'function',
+    name: 'createPool',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'currency0', type: 'address' },
+      { name: 'currency1', type: 'address' },
+      { name: 'lpFee', type: 'uint24' },
+      { name: 'tickSpacing', type: 'int24' },
+      { name: 'sqrtPriceX96', type: 'uint160' },
+      { name: 'taxToken', type: 'address' },
+      { name: 'buyTaxBps', type: 'uint16' },
+      { name: 'sellTaxBps', type: 'uint16' },
+      { name: 'userSalt', type: 'bytes32' },
+    ],
+    outputs: [
+      { name: 'hook', type: 'address' },
+      { name: 'poolId', type: 'bytes32' },
+      { name: 'tick', type: 'int24' },
+    ],
+  },
+] as const
+
 export const directionalTaxHookAbi = [
   {
     type: 'function',
@@ -109,6 +175,24 @@ export const directionalTaxHookAbi = [
       { name: 'poolId', type: 'bytes32' },
       { name: 'collector', type: 'address' },
       { name: 'taxToken', type: 'address' },
+      { name: 'buyTaxBps', type: 'uint16' },
+      { name: 'sellTaxBps', type: 'uint16' },
+      { name: 'initialized', type: 'bool' },
+    ],
+  },
+] as const
+
+export const configurableTaxHookV2Abi = [
+  {
+    type: 'function',
+    name: 'config',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [
+      { name: 'poolId', type: 'bytes32' },
+      { name: 'collector', type: 'address' },
+      { name: 'taxToken', type: 'address' },
+      { name: 'lpFee', type: 'uint24' },
       { name: 'buyTaxBps', type: 'uint16' },
       { name: 'sellTaxBps', type: 'uint16' },
       { name: 'initialized', type: 'bool' },
@@ -133,11 +217,48 @@ export type DirectionalTaxPoolDeployment = {
 }
 
 export type DirectionalTaxHookConfig = {
+  version: 'v1' | 'v2'
   poolId: Hex
   collector: Address
   taxToken: Address
+  lpFee: number
   buyTaxBps: number
   sellTaxBps: number
+}
+
+type FactoryStatusCacheEntry = {
+  expiresAt: number
+  promise: Promise<DirectionalTaxFactoryStatus>
+}
+
+const factoryStatusCache = new Map<string, FactoryStatusCacheEntry>()
+const FACTORY_STATUS_CACHE_MS = 20_000
+
+function factoryStatusCacheKey(version: 'v1' | 'v2'): string {
+  return `${getActiveChainId()}:${CONTRACTS.v4PoolManager.toLowerCase()}:${version}`
+}
+
+function clearFactoryStatusCache(version?: 'v1' | 'v2'): void {
+  if (!version) {
+    factoryStatusCache.clear()
+    return
+  }
+  factoryStatusCache.delete(factoryStatusCacheKey(version))
+}
+
+function getCachedFactoryStatus(version: 'v1' | 'v2'): Promise<DirectionalTaxFactoryStatus> {
+  const key = factoryStatusCacheKey(version)
+  const cached = factoryStatusCache.get(key)
+  if (cached && cached.expiresAt > Date.now()) return cached.promise
+
+  const promise = version === 'v2'
+    ? getConfigurableTaxFactoryV2Status()
+    : getDirectionalTaxFactoryStatus()
+  factoryStatusCache.set(key, { expiresAt: Date.now() + FACTORY_STATUS_CACHE_MS, promise })
+  void promise.catch(() => {
+    if (factoryStatusCache.get(key)?.promise === promise) factoryStatusCache.delete(key)
+  })
+  return promise
 }
 
 export function supportsDirectionalTax(chainId: SupportedChainId = getActiveChainId()): boolean {
@@ -161,6 +282,26 @@ export function directionalTaxFactoryAddress(poolManager: Address = CONTRACTS.v4
     from: DIRECTIONAL_TAX_CREATE2_PROXY,
     salt: DIRECTIONAL_TAX_FACTORY_SALT,
     bytecodeHash: keccak256(directionalTaxFactoryInitCode(poolManager)),
+  })
+}
+
+export function configurableTaxFactoryV2InitCode(
+  poolManager: Address = CONTRACTS.v4PoolManager,
+): Hex {
+  return encodeDeployData({
+    abi: configurableTaxFactoryV2Abi,
+    bytecode: CONFIGURABLE_TAX_FACTORY_V2_BYTECODE,
+    args: [poolManager],
+  })
+}
+
+export function configurableTaxFactoryV2Address(
+  poolManager: Address = CONTRACTS.v4PoolManager,
+): Address {
+  return getCreate2Address({
+    from: DIRECTIONAL_TAX_CREATE2_PROXY,
+    salt: CONFIGURABLE_TAX_FACTORY_V2_SALT,
+    bytecodeHash: keccak256(configurableTaxFactoryV2InitCode(poolManager)),
   })
 }
 
@@ -293,16 +434,90 @@ export async function getDirectionalTaxFactoryStatus(): Promise<DirectionalTaxFa
   return { supported: true, factory, deployed: true, implementation }
 }
 
-/** Recognize only an exact clone produced by this app's deterministic factory. */
+export async function getConfigurableTaxFactoryV2Status(): Promise<DirectionalTaxFactoryStatus> {
+  const factory = configurableTaxFactoryV2Address()
+  if (!supportsDirectionalTax()) {
+    return { supported: false, factory, deployed: false, reason: '当前链暂未开放税率 Hook' }
+  }
+
+  const proxyCode = await publicClient.getBytecode({ address: DIRECTIONAL_TAX_CREATE2_PROXY })
+  if (!proxyCode || proxyCode === '0x') {
+    return { supported: false, factory, deployed: false, reason: '当前链缺少 CREATE2 部署器' }
+  }
+
+  const code = await publicClient.getBytecode({ address: factory })
+  if (!code || code === '0x') return { supported: true, factory, deployed: false }
+
+  const [manager, implementation, flags] = await Promise.all([
+    publicClient.readContract({
+      address: factory,
+      abi: configurableTaxFactoryV2Abi,
+      functionName: 'poolManager',
+    }),
+    publicClient.readContract({
+      address: factory,
+      abi: configurableTaxFactoryV2Abi,
+      functionName: 'implementation',
+    }),
+    publicClient.readContract({
+      address: factory,
+      abi: configurableTaxFactoryV2Abi,
+      functionName: 'REQUIRED_FLAGS',
+    }),
+  ])
+  if (manager.toLowerCase() !== CONTRACTS.v4PoolManager.toLowerCase()) {
+    throw new Error('V2 税率 Hook 工厂绑定了错误的 PoolManager')
+  }
+  if (flags !== DIRECTIONAL_TAX_REQUIRED_FLAGS) {
+    throw new Error('V2 税率 Hook 工厂权限位版本不匹配')
+  }
+  const implementationCode = await publicClient.getBytecode({ address: implementation })
+  if (!implementationCode || implementationCode === '0x') {
+    throw new Error('V2 税率 Hook 工厂缺少实现合约')
+  }
+  return { supported: true, factory, deployed: true, implementation }
+}
+
+/** Recognize exact v2 clones first, then the immutable v1 clones already deployed by users. */
 export async function readDirectionalTaxHookConfig(
   hook: Address,
 ): Promise<DirectionalTaxHookConfig | null> {
   if (!supportsDirectionalTax()) return null
   try {
-    const status = await getDirectionalTaxFactoryStatus()
-    if (!status.deployed || !status.implementation) return null
     const code = await publicClient.getBytecode({ address: hook })
-    if (!code || code.toLowerCase() !== cloneRuntimeCode(status.implementation).toLowerCase()) return null
+    if (!code || code === '0x') return null
+
+    // A position list may contain many Hook NFTs. Deduplicate the factory bytecode/config reads
+    // so showing badges does not create an RPC burst for every card.
+    const v2 = await getCachedFactoryStatus('v2')
+    if (
+      v2.deployed
+      && v2.implementation
+      && code.toLowerCase() === cloneRuntimeCode(v2.implementation).toLowerCase()
+    ) {
+      const cfg = await publicClient.readContract({
+        address: hook,
+        abi: configurableTaxHookV2Abi,
+        functionName: 'config',
+      })
+      if (!cfg[6]) return null
+      return {
+        version: 'v2',
+        poolId: cfg[0],
+        collector: cfg[1],
+        taxToken: cfg[2],
+        lpFee: cfg[3],
+        buyTaxBps: cfg[4],
+        sellTaxBps: cfg[5],
+      }
+    }
+
+    const v1 = await getCachedFactoryStatus('v1')
+    if (
+      !v1.deployed
+      || !v1.implementation
+      || code.toLowerCase() !== cloneRuntimeCode(v1.implementation).toLowerCase()
+    ) return null
     const cfg = await publicClient.readContract({
       address: hook,
       abi: directionalTaxHookAbi,
@@ -310,9 +525,11 @@ export async function readDirectionalTaxHookConfig(
     })
     if (!cfg[5]) return null
     return {
+      version: 'v1',
       poolId: cfg[0],
       collector: cfg[1],
       taxToken: cfg[2],
+      lpFee: 0,
       buyTaxBps: cfg[3],
       sellTaxBps: cfg[4],
     }
@@ -351,8 +568,45 @@ export async function ensureDirectionalTaxFactory(opts: {
   })
   opts.onStatus?.(`税率 Hook 工厂已提交 ${hash.slice(0, 10)}…，等待确认`)
   await waitForHash(hash, '部署税率 Hook 工厂')
+  clearFactoryStatusCache('v1')
   status = await getDirectionalTaxFactoryStatus()
   if (!status.deployed || !status.implementation) throw new Error('Hook 工厂部署后校验失败')
+  return { status, hash }
+}
+
+export async function ensureConfigurableTaxFactoryV2(opts: {
+  walletClient: WalletClient
+  owner: Address
+  onStatus?: (message: string) => void
+}): Promise<{ status: DirectionalTaxFactoryStatus; hash?: Hash }> {
+  let status = await getConfigurableTaxFactoryV2Status()
+  if (!status.supported) throw new Error(status.reason ?? '当前链不支持 V2 税率 Hook')
+  if (status.deployed) return { status }
+
+  const initCode = configurableTaxFactoryV2InitCode()
+  const data = concatHex([CONFIGURABLE_TAX_FACTORY_V2_SALT, initCode])
+  opts.onStatus?.('本链首次使用 V2：请确认部署公共自定义税率 Hook 工厂…')
+  const estimated = await withTimeout(
+    publicClient.estimateGas({
+      account: opts.owner,
+      to: DIRECTIONAL_TAX_CREATE2_PROXY,
+      data,
+    }),
+    20_000,
+    '估算 V2 Hook 工厂 Gas',
+  )
+  const hash = await opts.walletClient.sendTransaction({
+    account: opts.owner,
+    chain: opts.walletClient.chain,
+    to: DIRECTIONAL_TAX_CREATE2_PROXY,
+    data,
+    gas: (estimated * 130n) / 100n,
+  })
+  opts.onStatus?.(`V2 税率 Hook 工厂已提交 ${hash.slice(0, 10)}…，等待确认`)
+  await waitForHash(hash, '部署 V2 税率 Hook 工厂')
+  clearFactoryStatusCache('v2')
+  status = await getConfigurableTaxFactoryV2Status()
+  if (!status.deployed || !status.implementation) throw new Error('V2 Hook 工厂部署后校验失败')
   return { status, hash }
 }
 
@@ -361,6 +615,7 @@ export async function createDirectionalTaxPool(opts: {
   owner: Address
   currency0: Address
   currency1: Address
+  lpFee: number
   tickSpacing: number
   sqrtPriceX96: bigint
   taxToken: Address
@@ -368,12 +623,18 @@ export async function createDirectionalTaxPool(opts: {
   sellTaxBps: number
   onStatus?: (message: string) => void
 }): Promise<DirectionalTaxPoolDeployment> {
-  if (!isDirectionalTaxPreset(opts.buyTaxBps) || !isDirectionalTaxPreset(opts.sellTaxBps)) {
-    throw new Error('税率必须使用预设档位')
+  if (!Number.isInteger(opts.lpFee) || opts.lpFee < 0 || opts.lpFee > V4_MAX_LP_FEE) {
+    throw new Error('V4 LP 手续费无效')
+  }
+  if (!Number.isInteger(opts.buyTaxBps) || opts.buyTaxBps < 0 || opts.buyTaxBps > DIRECTIONAL_TAX_MAX_BPS) {
+    throw new Error('买入税必须在 0%–80% 之间，精度 0.01%')
+  }
+  if (!Number.isInteger(opts.sellTaxBps) || opts.sellTaxBps < 0 || opts.sellTaxBps > DIRECTIONAL_TAX_MAX_BPS) {
+    throw new Error('卖出税必须在 0%–80% 之间，精度 0.01%')
   }
   if (opts.buyTaxBps <= 0 && opts.sellTaxBps <= 0) throw new Error('税率 Hook 至少一侧必须大于 0')
 
-  const ensured = await ensureDirectionalTaxFactory(opts)
+  const ensured = await ensureConfigurableTaxFactoryV2(opts)
   const { status } = ensured
   if (!status.implementation) throw new Error('无法读取税率 Hook 实现地址')
 
@@ -389,11 +650,12 @@ export async function createDirectionalTaxPool(opts: {
   const { request } = await publicClient.simulateContract({
     account: opts.owner,
     address: status.factory,
-    abi: directionalTaxFactoryAbi,
+    abi: configurableTaxFactoryV2Abi,
     functionName: 'createPool',
     args: [
       opts.currency0,
       opts.currency1,
+      opts.lpFee,
       opts.tickSpacing,
       opts.sqrtPriceX96,
       opts.taxToken,
@@ -403,7 +665,8 @@ export async function createDirectionalTaxPool(opts: {
     ],
   })
   opts.onStatus?.(
-    `请确认创建 0% LP 费率池 · 买卖税 ${Math.max(opts.buyTaxBps, opts.sellTaxBps) / 100}%（永久冻结）…`,
+    `请确认创建 V2 池 · LP fee ${(opts.lpFee / 10000).toFixed(2)}% · `
+    + `买入税 ${opts.buyTaxBps / 100}% · 卖出税 ${opts.sellTaxBps / 100}%（永久冻结）…`,
   )
   const poolHash = await opts.walletClient.writeContract({
     ...request,
@@ -417,12 +680,15 @@ export async function createDirectionalTaxPool(opts: {
     publicClient.getBytecode({ address: mined.hook }),
     publicClient.readContract({
       address: mined.hook,
-      abi: directionalTaxHookAbi,
+      abi: configurableTaxHookV2Abi,
       functionName: 'config',
     }),
   ])
-  if (!hookCode || hookCode === '0x' || !cfg[5]) throw new Error('池已上链但 Hook 配置校验失败')
+  if (!hookCode || hookCode === '0x' || !cfg[6]) throw new Error('池已上链但 V2 Hook 配置校验失败')
   if (cfg[1].toLowerCase() !== opts.owner.toLowerCase()) throw new Error('Hook 收款地址校验失败')
+  if (cfg[3] !== opts.lpFee || cfg[4] !== opts.buyTaxBps || cfg[5] !== opts.sellTaxBps) {
+    throw new Error('V2 Hook 费率配置校验失败')
+  }
 
   return {
     factory: status.factory,

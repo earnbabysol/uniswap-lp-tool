@@ -143,6 +143,14 @@ export function poolKeyFromPosition(position: PositionRow): V4PoolKey {
   }
 }
 
+export function v4PoolKeysEqual(a: V4PoolKey, b: V4PoolKey): boolean {
+  return a.currency0.toLowerCase() === b.currency0.toLowerCase()
+    && a.currency1.toLowerCase() === b.currency1.toLowerCase()
+    && a.fee === b.fee
+    && a.tickSpacing === b.tickSpacing
+    && a.hooks.toLowerCase() === b.hooks.toLowerCase()
+}
+
 function encodeActions(actions: number[]): `0x${string}` {
   return encodePacked(
     actions.map(() => 'uint8' as const),
@@ -1501,6 +1509,7 @@ export async function createV4DirectionalTaxPoolAndSeed(opts: {
   owner: Address
   tokenA: Address
   tokenB: Address
+  lpFee: number
   tickSpacing: number
   /** 人类价：tokenB per tokenA */
   initialPriceBPerA: number
@@ -1531,6 +1540,7 @@ export async function createV4DirectionalTaxPoolAndSeed(opts: {
     owner,
     tokenA,
     tokenB,
+    lpFee,
     tickSpacing,
     initialPriceBPerA,
     taxToken,
@@ -1538,6 +1548,9 @@ export async function createV4DirectionalTaxPoolAndSeed(opts: {
     sellTaxBps,
     onStatus,
   } = opts
+  if (!Number.isInteger(lpFee) || lpFee < 0 || lpFee > 1_000_000) {
+    throw new Error('V4 LP 手续费无效')
+  }
   if (!(tickSpacing > 0) || tickSpacing > 16_384) throw new Error('tickSpacing 无效')
   if (!(initialPriceBPerA > 0)) throw new Error('初始价格必须 > 0')
 
@@ -1573,7 +1586,7 @@ export async function createV4DirectionalTaxPoolAndSeed(opts: {
       '读取 decimals',
     ))
   }
-  onStatus?.('计算 0% LP 费率池初始价格…')
+  onStatus?.(`计算 V2 Hook 池初始价格 · LP fee ${(lpFee / 10000).toFixed(2)}%…`)
   const [dec0, dec1] = await Promise.all([decimalsOf(currency0), decimalsOf(currency1)])
   const sortedPrice = currency0.toLowerCase() === rawA.toLowerCase()
     ? initialPriceBPerA
@@ -1585,6 +1598,7 @@ export async function createV4DirectionalTaxPoolAndSeed(opts: {
     owner,
     currency0,
     currency1,
+    lpFee,
     tickSpacing,
     sqrtPriceX96,
     taxToken: rawTaxToken,
@@ -1595,7 +1609,7 @@ export async function createV4DirectionalTaxPoolAndSeed(opts: {
   const key: V4PoolKey = {
     currency0,
     currency1,
-    fee: 0,
+    fee: lpFee,
     tickSpacing,
     hooks: deployment.hook,
   }
@@ -2012,6 +2026,23 @@ export async function increaseV4Liquidity(opts: {
   const slippageBps = opts.slippageBps ?? 300
   if (position.version !== 'v4') throw new Error('需要 V4 仓位')
   const key = poolKeyFromPosition(position)
+  onStatus?.('复检仓位 PoolKey 与 Hook…')
+  const [onchainPoolKey] = await publicClient.readContract({
+    address: CONTRACTS.v4PositionManager,
+    abi: v4PositionManagerAbi,
+    functionName: 'getPoolAndPositionInfo',
+    args: [position.tokenId],
+  })
+  const verifiedKey: V4PoolKey = {
+    currency0: onchainPoolKey.currency0,
+    currency1: onchainPoolKey.currency1,
+    fee: Number(onchainPoolKey.fee),
+    tickSpacing: Number(onchainPoolKey.tickSpacing),
+    hooks: onchainPoolKey.hooks,
+  }
+  if (!v4PoolKeysEqual(key, verifiedKey)) {
+    throw new Error('仓位 PoolKey / Hook 与链上 NFT 不一致，已拒绝加仓')
+  }
   const live = await loadV4Pool(key)
   const taxBps0 = isNativeCurrency(key.currency0) ? 0 : Math.max(0, opts.transferTaxBps0 ?? 0)
   const taxBps1 = isNativeCurrency(key.currency1) ? 0 : Math.max(0, opts.transferTaxBps1 ?? 0)
