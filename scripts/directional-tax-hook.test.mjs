@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {
   DIRECTIONAL_TAX_MAX_BPS,
+  DIRECTIONAL_TAX_CHAIN_IDS,
   DIRECTIONAL_TAX_PRESETS_BPS,
   DIRECTIONAL_TAX_REQUIRED_FLAGS,
   configurableTaxFactoryV2Address,
@@ -12,8 +13,9 @@ import {
   isDirectionalTaxPreset,
   mineDirectionalTaxHookSalt,
   predictDirectionalTaxHook,
+  supportsDirectionalTax,
 } from '../src/directionalTaxHook.ts'
-import { CHAIN_CONFIGS } from '../src/chain.ts'
+import { CHAIN_CONFIGS, SUPPORTED_CHAINS } from '../src/chain.ts'
 import { recoverV4PoolKeyFromCandidates, v4PoolId } from '../src/lp.ts'
 import { zeroAddress } from 'viem'
 
@@ -31,7 +33,14 @@ assert.match(factoryV2, /^0x[0-9a-fA-F]{40}$/)
 assert.notEqual(factoryV2, factory, 'v2 must not replace the v1 deterministic factory')
 
 const contractReadme = readFileSync(new URL('../contracts/README.md', import.meta.url), 'utf8')
-for (const chainId of [1, 56, 4663, 8453]) {
+const supportedChainIds = SUPPORTED_CHAINS.map(({ id }) => id).sort((a, b) => a - b)
+assert.deepEqual(
+  [...DIRECTIONAL_TAX_CHAIN_IDS].sort((a, b) => a - b),
+  supportedChainIds,
+  'every V4 chain exposed by the app must enable the tax Hook',
+)
+for (const chainId of supportedChainIds) {
+  assert.equal(supportsDirectionalTax(chainId), true)
   const predicted = directionalTaxFactoryAddress(CHAIN_CONFIGS[chainId].contracts.v4PoolManager)
   const predictedV2 = configurableTaxFactoryV2Address(CHAIN_CONFIGS[chainId].contracts.v4PoolManager)
   assert.ok(contractReadme.includes(predicted), `README must list chain ${chainId} v1 factory ${predicted}`)

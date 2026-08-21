@@ -2809,7 +2809,7 @@ export default function App() {
     }
 
     if (directionalTaxEnabled && !supportsDirectionalTax(chainId)) {
-      setStatus('买卖税 Hook 首批仅支持 Base、BSC、Robinhood 和 Ethereum')
+      setStatus('当前网络未配置 V4 买卖税 Hook')
       return
     }
     if (directionalTaxEnabled && directionalTaxInputError) {
@@ -5461,7 +5461,7 @@ export default function App() {
                         className={`filter-chip ${directionalTaxEnabled ? 'active' : ''}`}
                         aria-pressed={directionalTaxEnabled}
                         disabled={!supportsDirectionalTax(chainId)}
-                        title={supportsDirectionalTax(chainId) ? 'LP fee 与买卖税独立设置；Hook 税直接进入建池钱包' : '首批仅支持 ETH / Base / BSC / Robinhood'}
+                        title={supportsDirectionalTax(chainId) ? '支持当前全部 7 条 V4 网络；LP fee 与买卖税独立设置，Hook 税直接进入建池钱包' : '当前网络未配置 V4 买卖税 Hook'}
                         onClick={() => {
                           setDirectionalTaxMode(true)
                           setStatus('已选择 V2 自定义税 Hook；LP fee、买卖税和收款地址会永久冻结')

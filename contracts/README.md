@@ -23,8 +23,11 @@ The frontend derives the V2 factory from the canonical PoolManager and the fixed
 | --- | ---: | --- |
 | Ethereum | 1 | `0x30c17f3079a67Ccf0E75C6372B0005E247CA33dB` |
 | BNB Smart Chain | 56 | `0x131Cd87f4468BA29A6F9D4fadeB90CD3Eb60aF4F` |
+| X Layer | 196 | `0xce2385b89d3Ea67441856A4293c47948fC01F509` |
 | Robinhood Chain | 4663 | `0x81882996c992659cD0da22327A4D9E5F903210b2` |
+| Arc | 5042 | `0x81882996c992659cD0da22327A4D9E5F903210b2` |
 | Base | 8453 | `0x6045B0dd4531E6D43c21d2B529c27ebFeaC9cF10` |
+| Arbitrum One | 42161 | `0xce2385b89d3Ea67441856A4293c47948fC01F509` |
 
 ## V1 legacy mainnets
 
@@ -35,8 +38,14 @@ These addresses stay unchanged so all existing V1 hooks remain recognizable.
 | --- | ---: | --- |
 | Ethereum | 1 | `0xDf507a9D72375D0BD295C64ef3992bBe2613F096` |
 | BNB Smart Chain | 56 | `0x3f9c59deC3188cdbD29c273E3Bf864AecfE19DE8` |
+| X Layer | 196 | `0xEAEAADE0F5Ec93637905c3A09867739458AE49c7` |
 | Robinhood Chain | 4663 | `0x907e2B00a0963317d9D7E213631635A16E352bCB` |
+| Arc | 5042 | `0x907e2B00a0963317d9D7E213631635A16E352bCB` |
 | Base | 8453 | `0x4BB336620781024851e968bFA014feDf86271ca6` |
+| Arbitrum One | 42161 | `0xEAEAADE0F5Ec93637905c3A09867739458AE49c7` |
+
+Chains that share the same canonical PoolManager produce the same deterministic factory address.
+The deployments still live independently on each chain.
 
 ## Local verification
 

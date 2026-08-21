@@ -26,7 +26,8 @@ import { publicClient } from './wallet'
 import { CONFIGURABLE_TAX_FACTORY_V2_BYTECODE } from './generated/configurableTaxFactoryV2Bytecode'
 import { DIRECTIONAL_TAX_FACTORY_BYTECODE } from './generated/directionalTaxFactoryBytecode'
 
-export const DIRECTIONAL_TAX_CHAIN_IDS = [1, 56, 4663, 8453] as const
+/** Every V4 mainnet currently exposed by the app has the canonical CREATE2 deployer. */
+export const DIRECTIONAL_TAX_CHAIN_IDS = [1, 56, 196, 4663, 5042, 8453, 42161] as const satisfies readonly SupportedChainId[]
 export const DIRECTIONAL_TAX_PRESETS_BPS = [0, 100, 300, 500, 1000, 2000, 3000, 5000, 8000] as const
 
 export const DIRECTIONAL_TAX_CREATE2_PROXY = getAddress(
